@@ -110,4 +110,4 @@ if __name__ == "__main__":
                         help='Path to the output file containing segment and position data.')
 
     args = parser.parse_args()
-    main(args.json_file, args.gbz_file, args.threads)
+    main(args.json_file, args.gbz_file, args.threads, output_file=args.output_path)
