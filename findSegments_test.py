@@ -36,12 +36,12 @@ def extract_segments_from_json(gbz_file, path_range):
     return list(segment_info.values())
 
 
-def call_find_segments(gbz_file, chromosome, position, windowLength=100, ref="GRCh38#0"):
+def call_find_segments(gbz_file, chromosome, position, record, windowLength=100, ref="GRCh38#0"):
     """Call extract_segments_from_json with the given chromosome and position."""
     formatted_position = f"{ref}#{chromosome}:{position - windowLength}-{position + windowLength}"
     segments = extract_segments_from_json(gbz_file, formatted_position)
     print(f"Output for {formatted_position}: {segments}")
-    return {formatted_position: segments}
+    return {formatted_position: {"segments": segments, "variants": record}}
 
 
 def process_record(gbz_file, record):
@@ -52,7 +52,7 @@ def process_record(gbz_file, record):
         return None, f"Skipping record due to missing chromosome or position: {record}"
 
     print(f"Processing {chromosome}:{position}")
-    segment_data = call_find_segments(gbz_file, chromosome, position)
+    segment_data = call_find_segments(gbz_file, chromosome, position, record)
     return segment_data, None
 
 
