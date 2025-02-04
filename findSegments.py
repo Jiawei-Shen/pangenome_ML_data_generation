@@ -1,6 +1,7 @@
 import subprocess
 import json
 import sys
+import argparse
 
 
 def run_vg_find_position(position):
@@ -13,9 +14,10 @@ def run_vg_find_position(position):
     return json.loads(result.stdout)
 
 
-def run_vg_find_neighbors(node_id, context=5):
+def run_vg_find_neighbors(node_id, graph_path, context=5):
     """Find neighboring nodes within the given context range."""
-    cmd = f'/home/jiawei/anaconda3/envs/pange/bin/vg find -x ./Pangenome_Graph/hprc-v1.1-mc-grch38.d9.gbz -n {node_id} -c {context} | vg view -j -'
+    # cmd = f'/home/jiawei/anaconda3/envs/pange/bin/vg find -x {graph_path} -n {node_id} -c {context} | /home/jiawei/anaconda3/envs/pange/bin/vg view -j -'
+    cmd = f'vg find -x {graph_path} -n {node_id} -c {context} | vg view -j -'
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     if result.returncode != 0:
         print("Error running vg find for neighbors:", result.stderr)
@@ -24,12 +26,12 @@ def run_vg_find_neighbors(node_id, context=5):
 
 
 def main():
-    if len(sys.argv) != 2:
-        print("Usage: python findSegments.py <position>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Find segments in a graph based on a given position.")
+    parser.add_argument('position', type=str, help='Position to search in the graph')
+    parser.add_argument('graph_path', default="./Pangenome_Graph/hprc-v1.1-mc-grch38.d9.gbz", type=str, help='Path to the graph file')
+    args = parser.parse_args()
 
-    position = sys.argv[1]
-    position_data = run_vg_find_position(position)
+    position_data = run_vg_find_position(args.position)
     if not position_data or "node" not in position_data:
         print("No node found for given position.")
         sys.exit(1)
@@ -37,7 +39,7 @@ def main():
     node_id = position_data["node"][0]["id"]
     print(f"Found node ID: {node_id}")
 
-    neighbors_data = run_vg_find_neighbors(node_id)
+    neighbors_data = run_vg_find_neighbors(node_id, args.graph_path)
     if not neighbors_data:
         print("No neighboring nodes found.")
         sys.exit(1)
