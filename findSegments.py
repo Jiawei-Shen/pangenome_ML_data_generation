@@ -4,9 +4,10 @@ import sys
 import argparse
 
 
-def run_vg_find_position(position):
+def run_vg_find_position(position, graph_path):
     """Find the node corresponding to a given position."""
-    cmd = f'/home/jiawei/anaconda3/envs/pange/bin/vg find -x ./Pangenome_Graph/hprc-v1.1-mc-grch38.d9.gbz -p {position} | vg view -j -'
+    # cmd = f'/home/jiawei/anaconda3/envs/pange/bin/vg find -x ./Pangenome_Graph/hprc-v1.1-mc-grch38.d9.gbz -p {position} | vg view -j -'
+    cmd = f'vg find -x {graph_path} -p {position} | vg view -j -'
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     if result.returncode != 0:
         print("Error running vg find for position:", result.stderr)
@@ -31,7 +32,7 @@ def main():
     parser.add_argument('graph_path', default="./Pangenome_Graph/hprc-v1.1-mc-grch38.d9.gbz", type=str, help='Path to the graph file')
     args = parser.parse_args()
 
-    position_data = run_vg_find_position(args.position)
+    position_data = run_vg_find_position(args.position, args.graph_path)
     if not position_data or "node" not in position_data:
         print("No node found for given position.")
         sys.exit(1)
