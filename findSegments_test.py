@@ -2,6 +2,8 @@ import json
 import subprocess
 import argparse
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 
 def extract_segments_from_json(gbz_file, path_range):
     # Run vg find and pipe to vg view to get JSON output
@@ -33,6 +35,7 @@ def extract_segments_from_json(gbz_file, path_range):
 
     return list(segment_info.values())
 
+
 def call_find_segments(gbz_file, chromosome, position, windowLength=100, ref="GRCh38#0"):
     """Call extract_segments_from_json with the given chromosome and position."""
     formatted_position = f"{ref}#{chromosome}:{position - windowLength}-{position + windowLength}"
@@ -40,7 +43,20 @@ def call_find_segments(gbz_file, chromosome, position, windowLength=100, ref="GR
     print(f"Output for {formatted_position}: {segments}")
     return {formatted_position: segments}
 
-def main(json_file, gbz_file):
+
+def process_record(gbz_file, record):
+    chromosome = record.get('chromosome')
+    position = record.get('position')
+
+    if not chromosome or not position:
+        return None, f"Skipping record due to missing chromosome or position: {record}"
+
+    print(f"Processing {chromosome}:{position}")
+    segment_data = call_find_segments(gbz_file, chromosome, position)
+    return segment_data, None
+
+
+def main(json_file, gbz_file, threads):
     # Load JSON data
     try:
         with open(json_file, 'r') as file:
@@ -52,27 +68,28 @@ def main(json_file, gbz_file):
     results = {}
     output_file = "segments_output.json"
 
-    # Process each entry in the JSON
-    for key, record in enumerate(data):
-        chromosome = record.get('chromosome')
-        position = record.get('position')
+    with ThreadPoolExecutor(max_workers=threads) as executor:
+        future_to_record = {executor.submit(process_record, gbz_file, record): record for record in data}
 
-        if not chromosome or not position:
-            print(f"Skipping record {key} due to missing chromosome or position.")
-            continue
-
-        print(f"\nProcessing {chromosome}:{position}")
-        segment_data = call_find_segments(gbz_file, chromosome, position)
-        results.update(segment_data)
-
-        # Save results every 10 iterations
-        if (key + 1) % 10 == 0:
+        for i, future in enumerate(as_completed(future_to_record)):
+            record = future_to_record[future]
             try:
-                with open(output_file, 'w') as outfile:
-                    json.dump(results, outfile, indent=4)
-                print(f"Intermediate results saved to {output_file} after {key + 1} records.")
+                segment_data, error = future.result()
+                if error:
+                    print(error)
+                    continue
+                results.update(segment_data)
             except Exception as e:
-                print(f"Error saving intermediate results: {e}")
+                print(f"Error processing record {record}: {e}")
+
+            # Save results every 10 iterations
+            if (i + 1) % 8 == 0:
+                try:
+                    with open(output_file, 'w') as outfile:
+                        json.dump(results, outfile, indent=4)
+                    print(f"Intermediate results saved to {output_file} after {i + 1} records.")
+                except Exception as e:
+                    print(f"Error saving intermediate results: {e}")
 
     # Save final results
     try:
@@ -82,10 +99,14 @@ def main(json_file, gbz_file):
     except Exception as e:
         print(f"Error saving final results: {e}")
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Process JSON file to extract segment IDs and paths.')
-    parser.add_argument('-j', '--json_file', type=str, help='Path to the JSON file containing chromosome and position data.')
+    parser.add_argument('-j', '--json_file', type=str,
+                        help='Path to the JSON file containing chromosome and position data.')
     parser.add_argument('-x', '--gbz_file', type=str, required=True, help='Path to the GBZ index or graph file.')
+    parser.add_argument('-t', '--threads', type=int, default=4,
+                        help='Number of threads to use for parallel processing.')
 
     args = parser.parse_args()
-    main(args.json_file, args.gbz_file)
+    main(args.json_file, args.gbz_file, args.threads)
