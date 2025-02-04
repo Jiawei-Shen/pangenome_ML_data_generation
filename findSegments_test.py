@@ -3,7 +3,6 @@ import subprocess
 import argparse
 import sys
 
-
 def extract_segments_from_json(gbz_file, path_range):
     # Run vg find and pipe to vg view to get JSON output
     cmd = f"vg find -x {gbz_file} -p {path_range} | vg view -v -j -"
@@ -34,13 +33,12 @@ def extract_segments_from_json(gbz_file, path_range):
 
     return list(segment_info.values())
 
-
 def call_find_segments(gbz_file, chromosome, position, windowLength=100, ref="GRCh38#0"):
     """Call extract_segments_from_json with the given chromosome and position."""
     formatted_position = f"{ref}#{chromosome}:{position - windowLength}-{position + windowLength}"
     segments = extract_segments_from_json(gbz_file, formatted_position)
     print(f"Output for {formatted_position}: {segments}")
-
+    return {formatted_position: segments}
 
 def main(json_file, gbz_file):
     # Load JSON data
@@ -50,6 +48,9 @@ def main(json_file, gbz_file):
     except Exception as e:
         print(f"Error reading JSON file: {e}")
         sys.exit(1)
+
+    results = {}
+    output_file = "segments_output.json"
 
     # Process each entry in the JSON
     for key, record in enumerate(data):
@@ -61,12 +62,29 @@ def main(json_file, gbz_file):
             continue
 
         print(f"\nProcessing {chromosome}:{position}")
-        call_find_segments(gbz_file, chromosome, position)
+        segment_data = call_find_segments(gbz_file, chromosome, position)
+        results.update(segment_data)
 
+        # Save results every 10 iterations
+        if (key + 1) % 10 == 0:
+            try:
+                with open(output_file, 'w') as outfile:
+                    json.dump(results, outfile, indent=4)
+                print(f"Intermediate results saved to {output_file} after {key + 1} records.")
+            except Exception as e:
+                print(f"Error saving intermediate results: {e}")
+
+    # Save final results
+    try:
+        with open(output_file, 'w') as outfile:
+            json.dump(results, outfile, indent=4)
+        print(f"Final results saved to {output_file}.")
+    except Exception as e:
+        print(f"Error saving final results: {e}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Process JSON file to extract segment IDs and paths.')
-    parser.add_argument('json_file', type=str, help='Path to the JSON file containing chromosome and position data.')
+    parser.add_argument('-j', '--json_file', type=str, help='Path to the JSON file containing chromosome and position data.')
     parser.add_argument('-x', '--gbz_file', type=str, required=True, help='Path to the GBZ index or graph file.')
 
     args = parser.parse_args()
