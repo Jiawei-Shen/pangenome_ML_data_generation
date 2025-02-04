@@ -56,7 +56,7 @@ def process_record(gbz_file, record):
     return segment_data, None
 
 
-def main(json_file, gbz_file, threads):
+def main(json_file, gbz_file, threads, output_file):
     # Load JSON data
     try:
         with open(json_file, 'r') as file:
@@ -66,7 +66,6 @@ def main(json_file, gbz_file, threads):
         sys.exit(1)
 
     results = {}
-    output_file = "segments_output.json"
 
     with ThreadPoolExecutor(max_workers=threads) as executor:
         future_to_record = {executor.submit(process_record, gbz_file, record): record for record in data}
@@ -107,6 +106,8 @@ if __name__ == "__main__":
     parser.add_argument('-x', '--gbz_file', type=str, required=True, help='Path to the GBZ index or graph file.')
     parser.add_argument('-t', '--threads', type=int, default=4,
                         help='Number of threads to use for parallel processing.')
+    parser.add_argument('-o', '--output_path', default="output_seg.json", type=str,
+                        help='Path to the output file containing segment and position data.')
 
     args = parser.parse_args()
     main(args.json_file, args.gbz_file, args.threads)
