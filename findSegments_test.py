@@ -81,8 +81,8 @@ def main(json_file, gbz_file, threads, output_file):
             except Exception as e:
                 print(f"Error processing record {record}: {e}")
 
-            # Save results every 10 iterations
-            if (i + 1) % 8 == 0:
+            # Save results every 80 iterations
+            if (i + 1) % 80 == 0:
                 try:
                     with open(output_file, 'w') as outfile:
                         json.dump(results, outfile, indent=4)
