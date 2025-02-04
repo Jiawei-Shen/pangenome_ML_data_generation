@@ -4,3 +4,4 @@ Qichen_trueset_VCF/
 .idea/
 ./HG005_variants.json
 ./.gitignore
+./git_push_bash.sh
