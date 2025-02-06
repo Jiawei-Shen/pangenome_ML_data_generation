@@ -23,12 +23,13 @@ def load_json(json_file):
     return data, segment_to_region
 
 def process_gam_worker(read_queue, segment_to_region, json_data, lock, processed_count):
-    """Worker thread to process reads from the queue."""
+    """Worker thread to process reads from the queue as soon as they arrive."""
     while True:
         try:
-            read = read_queue.get(timeout=3)  # Get a read from the queue, timeout to avoid infinite wait
+            read = read_queue.get(timeout=3)  # Get a read from the queue
         except queue.Empty:
-            break
+            break  # Exit when no more reads are being added
+
         processed = False  # Track if the read was assigned to any region
         if 'path' in read:
             for mapping in read['path']['mapping']:
@@ -55,32 +56,34 @@ def process_gam_worker(read_queue, segment_to_region, json_data, lock, processed
         if processed:
             with lock:
                 processed_count[0] += 1
-                # if processed_count[0] % 10 == 0:
-                #     print(f"Processed {processed_count[0]} reads...")
-                print(f"Processed {processed_count[0]} reads...")
+                if processed_count[0] % 1000 == 0:
+                    print(f"Processed {processed_count[0]} reads...")
 
         read_queue.task_done()
 
 def process_gam_file(gam_file, segment_to_region, json_data, num_threads):
-    """Reads GAM file and distributes processing across multiple threads."""
+    """Reads GAM file, adds reads to queue, and processes them in parallel."""
     read_queue = queue.Queue()
     lock = threading.Lock()
     processed_count = [0]  # Shared counter for processed reads
 
-    # Stream the GAM file as JSON
-    process = subprocess.Popen(['vg', 'view', '-a', gam_file], stdout=subprocess.PIPE, text=True)
-    print("Done with reading the GAM!")
-
-    for line in process.stdout:
-        read = json.loads(line.strip())
-        read_queue.put(read)
-    print("Done read queue!")
-    # Start worker threads
+    # Start worker threads **before** reading the GAM file
     threads = []
     for _ in range(num_threads):
         thread = threading.Thread(target=process_gam_worker, args=(read_queue, segment_to_region, json_data, lock, processed_count))
         thread.start()
         threads.append(thread)
+
+    # Stream the GAM file as JSON **while workers are running**
+    process = subprocess.Popen(['vg', 'view', '-a', gam_file], stdout=subprocess.PIPE, text=True)
+    print("Started processing GAM file...")
+
+    for line in process.stdout:
+        try:
+            read = json.loads(line.strip())  # Read and parse JSON line by line
+            read_queue.put(read)  # Add to queue while workers are processing
+        except json.JSONDecodeError as e:
+            print(f"⚠️ Skipping invalid JSON read: {e}")
 
     # Wait for all threads to finish
     read_queue.join()
