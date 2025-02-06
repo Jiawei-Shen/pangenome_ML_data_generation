@@ -65,19 +65,28 @@ def iterate_gam_binary(gam_file, read_queue):
         while True:
             try:
                 read = vg_pb2.Alignment()
-                print(read)
+
+                # Read the size of the next message (4 bytes)
                 size_bytes = f.read(4)
                 if not size_bytes:
-                    break
+                    break  # End of file
 
+                # Convert the 4-byte size header to an integer
                 size = int.from_bytes(size_bytes, "little")
-                read.ParseFromString(f.read(size))
 
-                read_queue.put(read)  # Add read to queue
+                # Read the exact number of bytes expected for the message
+                message_data = f.read(size)
+                if len(message_data) != size:
+                    print(f"⚠️ Skipping corrupted read (expected {size} bytes, got {len(message_data)})")
+                    continue  # Skip to the next read
+
+                # Parse the protobuf message
+                read.ParseFromString(message_data)
+                read_queue.put(read)  # Add valid read to the queue
 
             except Exception as e:
                 print(f"⚠️ Skipping a corrupted read: {e}")
-                continue  # Skip problematic read and keep processing
+                continue  # Skip the problematic read and move to the next one
 
 
 def process_gam_file(gam_file, segment_to_region, json_data, num_threads):
