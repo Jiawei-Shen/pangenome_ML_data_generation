@@ -72,7 +72,7 @@ def process_gam_file(gam_file, segment_to_region, json_data, num_threads):
     print("Done with reading the GAM!")
 
     for line in process.stdout:
-        print(line.strip())
+        print(line.strip() + "\n" + "\n")
         read = json.loads(line.strip())
         read_queue.put(read)
 
