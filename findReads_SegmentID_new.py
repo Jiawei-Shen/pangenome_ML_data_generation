@@ -29,7 +29,7 @@ def process_gam_worker(read_queue, segment_to_region, json_data, lock, processed
             read = read_queue.get(timeout=3)  # Get a read from the queue, timeout to avoid infinite wait
         except queue.Empty:
             break
-
+        print(read)
         processed = False  # Track if the read was assigned to any region
         if 'path' in read:
             for mapping in read['path']['mapping']:
