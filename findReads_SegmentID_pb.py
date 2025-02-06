@@ -64,7 +64,7 @@ def iterate_gam_binary(gam_file, read_queue):
     with open(gam_file, "rb") as f:
         while True:
             try:
-                read = vg_pb2.Alignment()
+                read = vg_pb2.MultipathAlignment()
                 print(read)
                 size_bytes = f.read(4)
                 if not size_bytes:
