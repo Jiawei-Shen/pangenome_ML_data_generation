@@ -1,8 +1,8 @@
 import json
 import argparse
-import subprocess
 import threading
 import queue
+import vg_pb2  # Import VG's Protobuf schema
 
 def load_json(json_file):
     """Loads the JSON file and maps segment IDs to regions."""
@@ -26,55 +26,66 @@ def process_gam_worker(read_queue, segment_to_region, json_data, lock, processed
     """Worker thread to process reads from the queue."""
     while True:
         try:
-            read = read_queue.get(timeout=3)  # Get a read from the queue, timeout to avoid infinite wait
+            read = read_queue.get(timeout=3)  # Get a read from the queue
         except queue.Empty:
             break
-        processed = False  # Track if the read was assigned to any region
-        if 'path' in read:
-            for mapping in read['path']['mapping']:
-                if 'position' in mapping and 'node_id' in mapping['position']:
-                    segment_id = str(mapping['position']['node_id'])
 
-                    if segment_id in segment_to_region:
-                        region = segment_to_region[segment_id]
+        processed = False
+        for mapping in read.path.mapping:
+            segment_id = str(mapping.position.node_id)
 
-                        # Construct read details
-                        read_info = {
-                            "read_name": read['name'],
-                            "sequence_length": len(read["sequence"]),
-                            "mapping_position": mapping["position"]["offset"]
-                        }
+            if segment_id in segment_to_region:
+                region = segment_to_region[segment_id]
 
-                        # Lock required for safe multi-threaded dictionary updates
-                        with lock:
-                            json_data[region]["aligned_reads"].append(read_info)
-                        processed = True
-                        break  # Avoid duplicate reads in the same region
+                # Construct read details
+                read_info = {
+                    "read_name": read.name,
+                    "sequence_length": len(read.sequence),
+                    "mapping_position": mapping.position.offset
+                }
+
+                # Lock required for safe multi-threaded dictionary updates
+                with lock:
+                    json_data[region]["aligned_reads"].append(read_info)
+                processed = True
+                break  # Avoid duplicate reads in the same region
 
         # Update and print progress every 1000 reads
         if processed:
             with lock:
                 processed_count[0] += 1
-                # if processed_count[0] % 10 == 0:
-                #     print(f"Processed {processed_count[0]} reads...")
-                print(f"Processed {processed_count[0]} reads...")
+                if processed_count[0] % 1000 == 0:
+                    print(f"Processed {processed_count[0]} reads...")
 
         read_queue.task_done()
 
+def iterate_gam_binary(gam_file, read_queue):
+    """Reads a GAM file in binary format and adds reads to a queue."""
+    with open(gam_file, "rb") as f:
+        while True:
+            try:
+                read = vg_pb2.Alignment()
+                size_bytes = f.read(4)
+                if not size_bytes:
+                    break
+
+                size = int.from_bytes(size_bytes, "little")
+                read.ParseFromString(f.read(size))
+                read_queue.put(read)  # Add read to queue
+
+            except Exception as e:
+                print(f"Error parsing GAM file: {e}")
+                break
+
 def process_gam_file(gam_file, segment_to_region, json_data, num_threads):
-    """Reads GAM file and distributes processing across multiple threads."""
+    """Distributes binary GAM parsing across multiple threads."""
     read_queue = queue.Queue()
     lock = threading.Lock()
     processed_count = [0]  # Shared counter for processed reads
 
-    # Stream the GAM file as JSON
-    process = subprocess.Popen(['vg', 'view', '-a', gam_file], stdout=subprocess.PIPE, text=True)
-    print("Done with reading the GAM!")
-
-    for line in process.stdout:
-        print(line.strip())
-        read = json.loads(line.strip())
-        read_queue.put(read)
+    # Start a thread to read the GAM file
+    reader_thread = threading.Thread(target=iterate_gam_binary, args=(gam_file, read_queue))
+    reader_thread.start()
 
     # Start worker threads
     threads = []
@@ -84,6 +95,7 @@ def process_gam_file(gam_file, segment_to_region, json_data, num_threads):
         threads.append(thread)
 
     # Wait for all threads to finish
+    reader_thread.join()
     read_queue.join()
     for thread in threads:
         thread.join()
@@ -91,7 +103,7 @@ def process_gam_file(gam_file, segment_to_region, json_data, num_threads):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Find reads mapped to segments from a JSON file and update the JSON with aligned reads.")
     parser.add_argument("json_file", type=str, help="Input JSON file containing segment IDs.")
-    parser.add_argument("gam_file", type=str, help="Input GAM file.")
+    parser.add_argument("gam_file", type=str, help="Input GAM file (binary).")
     parser.add_argument("output_json", type=str, help="Output JSON file with updated aligned reads.")
     parser.add_argument("--threads", type=int, default=4, help="Number of threads to use (default: 4)")
 
