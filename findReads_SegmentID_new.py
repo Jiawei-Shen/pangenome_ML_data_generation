@@ -56,8 +56,9 @@ def process_gam_worker(read_queue, segment_to_region, json_data, lock, processed
         if processed:
             with lock:
                 processed_count[0] += 1
-                if processed_count[0] % 10 == 0:
-                    print(f"Processed {processed_count[0]} reads...")
+                # if processed_count[0] % 10 == 0:
+                #     print(f"Processed {processed_count[0]} reads...")
+                print(f"Processed {processed_count[0]} reads...")
 
         read_queue.task_done()
 
