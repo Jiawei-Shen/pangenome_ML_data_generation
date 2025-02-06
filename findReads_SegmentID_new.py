@@ -69,6 +69,7 @@ def process_gam_file(gam_file, segment_to_region, json_data, num_threads):
 
     # Stream the GAM file as JSON
     process = subprocess.Popen(['vg', 'view', '-a', gam_file], stdout=subprocess.PIPE, text=True)
+    print("Done with reading the GAM!")
 
     for line in process.stdout:
         read = json.loads(line.strip())
