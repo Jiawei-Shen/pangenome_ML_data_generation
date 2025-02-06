@@ -22,14 +22,15 @@ def load_json(json_file):
 
     return data, segment_to_region
 
-def process_gam_worker(read_queue, segment_to_region, json_data, lock):
+def process_gam_worker(read_queue, segment_to_region, json_data, lock, processed_count):
     """Worker thread to process reads from the queue."""
     while True:
         try:
-            read = read_queue.get(timeout=10)  # Get a read from the queue, timeout to avoid infinite wait
+            read = read_queue.get(timeout=3)  # Get a read from the queue, timeout to avoid infinite wait
         except queue.Empty:
             break
 
+        processed = False  # Track if the read was assigned to any region
         if 'path' in read:
             for mapping in read['path']['mapping']:
                 if 'position' in mapping and 'node_id' in mapping['position']:
@@ -48,7 +49,15 @@ def process_gam_worker(read_queue, segment_to_region, json_data, lock):
                         # Lock required for safe multi-threaded dictionary updates
                         with lock:
                             json_data[region]["aligned_reads"].append(read_info)
+                        processed = True
                         break  # Avoid duplicate reads in the same region
+
+        # Update and print progress every 1000 reads
+        if processed:
+            with lock:
+                processed_count[0] += 1
+                if processed_count[0] % 1000 == 0:
+                    print(f"Processed {processed_count[0]} reads...")
 
         read_queue.task_done()
 
@@ -56,6 +65,7 @@ def process_gam_file(gam_file, segment_to_region, json_data, num_threads):
     """Reads GAM file and distributes processing across multiple threads."""
     read_queue = queue.Queue()
     lock = threading.Lock()
+    processed_count = [0]  # Shared counter for processed reads
 
     # Stream the GAM file as JSON
     process = subprocess.Popen(['vg', 'view', '-a', gam_file], stdout=subprocess.PIPE, text=True)
@@ -67,7 +77,7 @@ def process_gam_file(gam_file, segment_to_region, json_data, num_threads):
     # Start worker threads
     threads = []
     for _ in range(num_threads):
-        thread = threading.Thread(target=process_gam_worker, args=(read_queue, segment_to_region, json_data, lock))
+        thread = threading.Thread(target=process_gam_worker, args=(read_queue, segment_to_region, json_data, lock, processed_count))
         thread.start()
         threads.append(thread)
 
