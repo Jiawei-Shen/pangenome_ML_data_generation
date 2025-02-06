@@ -74,6 +74,7 @@ def process_gam_file(gam_file, segment_to_region, json_data, num_threads):
 
     for line in process.stdout:
         read = json.loads(line.strip())
+        print(read)
         read_queue.put(read)
 
     # Start worker threads
