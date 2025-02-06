@@ -71,11 +71,13 @@ def iterate_gam_binary(gam_file, read_queue):
 
                 size = int.from_bytes(size_bytes, "little")
                 read.ParseFromString(f.read(size))
+
                 read_queue.put(read)  # Add read to queue
 
             except Exception as e:
-                print(f"Error parsing GAM file: {e}")
-                break
+                print(f"⚠️ Skipping a corrupted read: {e}")
+                continue  # Skip problematic read and keep processing
+
 
 def process_gam_file(gam_file, segment_to_region, json_data, num_threads):
     """Distributes binary GAM parsing across multiple threads."""
