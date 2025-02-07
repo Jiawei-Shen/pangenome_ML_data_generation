@@ -39,11 +39,14 @@ def process_gam_worker(read_queue, segment_to_region, json_data, lock, processed
                     if segment_id in segment_to_region:
                         region = segment_to_region[segment_id]
 
+                        # Check if 'offset' exists in position, otherwise default to 0
+                        mapping_position = mapping["position"].get("offset", 0)
+
                         # Construct read details
                         read_info = {
                             "read_name": read['name'],
                             "sequence_length": len(read["sequence"]),
-                            "mapping_position": mapping["position"]["offset"]
+                            "mapping_position": mapping_position
                         }
 
                         # Lock required for safe multi-threaded dictionary updates
@@ -59,8 +62,8 @@ def process_gam_worker(read_queue, segment_to_region, json_data, lock, processed
                 # if processed_count[0] % 1000 == 0:
                 #     print(f"Processed {processed_count[0]} reads...")
                 print(f"Processed {processed_count[0]} reads...")
-
         read_queue.task_done()
+
 
 def process_gam_file(gam_file, segment_to_region, json_data, num_threads):
     """Reads GAM file, adds reads to queue, and processes them in parallel."""
