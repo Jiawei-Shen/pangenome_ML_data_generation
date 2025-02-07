@@ -59,9 +59,10 @@ def process_gam_worker(read_queue, segment_to_region, json_data, lock, processed
         if processed:
             with lock:
                 processed_count[0] += 1
-                # if processed_count[0] % 1000 == 0:
-                #     print(f"Processed {processed_count[0]} reads...")
-                print(f"Processed {processed_count[0]} reads...")
+                if processed_count[0] % 1000 == 0:
+                    print(f"Processed {processed_count[0]} reads...")
+                # print(f"Processed {processed_count[0]} reads...")
+
         read_queue.task_done()
 
 
@@ -99,7 +100,7 @@ if __name__ == "__main__":
     parser.add_argument("json_file", type=str, help="Input JSON file containing segment IDs.")
     parser.add_argument("gam_file", type=str, help="Input GAM file.")
     parser.add_argument("output_json", type=str, help="Output JSON file with updated aligned reads.")
-    parser.add_argument("--threads", type=int, default=4, help="Number of threads to use (default: 4)")
+    parser.add_argument("-t", "--threads", type=int, default=4, help="Number of threads to use (default: 4)")
 
     args = parser.parse_args()
 
