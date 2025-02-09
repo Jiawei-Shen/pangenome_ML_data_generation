@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 def extract_nodes(graph_xg, path_name, output_nodes="nodes_in_path.txt"):
     """Extract node IDs belonging to a given path using vg paths and vg convert."""
-    cmd = f"vg paths -x {graph_xg} -p {path_name} -V | vg convert -v - | jq -r '.node[].id' > {output_nodes}"
+    cmd = f"vg paths -x {graph_xg} -p {path_name} -V | vg convert -p - | jq -r '.node[].id' > {output_nodes}"
     subprocess.run(cmd, shell=True, check=True)
     print(f"[✔] Extracted node IDs for path '{path_name}' into {output_nodes}")
 
