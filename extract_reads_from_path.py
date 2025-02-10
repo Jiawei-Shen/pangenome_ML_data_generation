@@ -76,7 +76,7 @@ def filter_reads(input_gam, nodes_file, output_json, threads=4):
     with ThreadPoolExecutor(max_workers=threads) as executor:
         for _ in executor.map(lambda line: process_read(line, node_info, node_read_map, lock), process.stdout):
             processed_count += 1
-            if processed_count % 1000 == 0:
+            if processed_count % 5000 == 0:
                 print(f"[INFO] Processed {processed_count} reads...")
                 with lock:
                     save_json(node_read_map, output_json)
