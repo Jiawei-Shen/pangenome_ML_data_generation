@@ -1,7 +1,8 @@
 Genome_Bottle_VCF/
 Pangenome_Graph/
 Qichen_trueset_VCF/
+scripts_sh/
 .idea/
 ./HG005_variants.json
 ./.gitignore
-./git_push_bash.sh
+scripts_sh/git_push_bash.sh
