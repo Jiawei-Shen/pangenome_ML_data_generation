@@ -1,19 +1,37 @@
 import subprocess
 import json
 import argparse
+import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
+def extract_nodes(graph_xg, path_name, output_json="nodes.json"):
+    """Extract nodes with ID, sequence, and length from a given path."""
+    path_vg = "path_nodes.vg"
 
-def extract_nodes(graph_xg, path_name, output_nodes="nodes_in_path.txt"):
-    """Extract node IDs belonging to a given path using vg paths and vg convert."""
-    cmd = f"vg paths -x {graph_xg} -p {path_name} -V | vg convert -p - | jq -r '.node[].id' > {output_nodes}"
-    subprocess.run(cmd, shell=True, check=True)
-    print(f"[✔] Extracted node IDs for path '{path_name}' into {output_nodes}")
+    # Run vg find to extract nodes from the path
+    subprocess.run(f"vg find -x {graph_xg} -p {path_name} > {path_vg}", shell=True, check=True)
 
+    # Convert nodes to JSON format including sequence
+    subprocess.run(f"vg view -v {path_vg} | jq -c '{{nodes: [.node[] | {{id: .id, sequence: .sequence}}]}}' > {output_json}", shell=True, check=True)
 
-def process_read(line, node_ids):
-    """Check if the read aligns to any of the extracted node IDs and group by node."""
+    print(f"[✔] Extracted node IDs, sequences, and saved to {output_json}")
+
+def load_nodes(nodes_json):
+    """Load node IDs, sequences, and compute their lengths."""
+    with open(nodes_json, "r") as f:
+        data = json.load(f)
+
+    node_info = {}
+    for node in data["nodes"]:
+        node_id = str(node["id"])
+        sequence = node["sequence"]
+        node_info[node_id] = {"sequence": sequence, "length": len(sequence)}
+
+    return node_info
+
+def process_read(line, node_info, node_read_map, lock):
+    """Check if the read aligns to any node and store it grouped by node."""
     try:
         read = json.loads(line)
         read_info = {
@@ -25,69 +43,75 @@ def process_read(line, node_ids):
         mapped_nodes = set()  # Store unique node IDs the read maps to
         for mapping in read.get("path", {}).get("mapping", []):
             node_id = str(mapping["position"].get("node_id", ""))
-            if node_id in node_ids:
+            if node_id in node_info:
                 mapped_nodes.add(node_id)
 
-        return [(node_id, read_info) for node_id in mapped_nodes] if mapped_nodes else None
+        # Immediately store the read into the dictionary
+        with lock:
+            for node_id in mapped_nodes:
+                if node_id not in node_read_map:
+                    node_read_map[node_id] = {
+                        "sequence": node_info[node_id]["sequence"],
+                        "length": node_info[node_id]["length"],
+                        "reads": []
+                    }
+                node_read_map[node_id]["reads"].append(read_info)
 
     except json.JSONDecodeError:
-        return None  # Return None if no match is found
-
+        return  # Skip invalid JSON reads
 
 def filter_reads(input_gam, nodes_file, output_json, threads=4):
-    """Filter reads from GAM that align to the extracted nodes and group by node."""
-    # Load node IDs into a set
-    with open(nodes_file, "r") as f:
-        node_ids = {line.strip() for line in f}
+    """Filter reads from GAM that align to extracted nodes and group them by node in real-time."""
+    # Load node information (id, sequence, length)
+    node_info = load_nodes(nodes_file)
 
-    # Process GAM file with multi-threading
-    node_read_map = defaultdict(list)  # Dictionary to store reads grouped by node
+    # Shared data structure for storing grouped reads
+    node_read_map = {}
+    lock = threading.Lock()  # Ensures thread-safe writing to the dictionary
+
+    # Start GAM file processing
     process = subprocess.Popen(["vg", "view", "-a", input_gam], stdout=subprocess.PIPE, text=True)
 
-    processed_count = 0  # Counter for processed reads
+    processed_count = 0
     with ThreadPoolExecutor(max_workers=threads) as executor:
-        results = []
-        for result in executor.map(lambda line: process_read(line, node_ids), process.stdout):
-            if result:
-                results.append(result)
-
-            # Print progress every 1000 reads
+        for _ in executor.map(lambda line: process_read(line, node_info, node_read_map, lock), process.stdout):
             processed_count += 1
             if processed_count % 1000 == 0:
                 print(f"[INFO] Processed {processed_count} reads...")
+                with lock:
+                    save_json(node_read_map, output_json)
 
-    # Collect results and group reads by node
-    for result in results:
-        for node_id, read_info in result:
-            node_read_map[node_id].append(read_info)
-
-    # Save to JSON
-    with open(output_json, "w") as f:
-        json.dump(node_read_map, f, indent=2)
-
+    # Final save
+    save_json(node_read_map, output_json)
     print(f"[✔] Filtered reads grouped by node saved to {output_json}")
     return output_json
 
+def save_json(data, output_file):
+    """Saves the current JSON state to a file atomically."""
+    temp_file = output_file + ".tmp"
+    with open(temp_file, "w") as f:
+        json.dump(data, f, indent=2)
+    subprocess.run(["mv", temp_file, output_file])  # Atomic move
+    print(f"[✔] Saved progress to {output_file}")
 
 def main():
     """Main function with argument parsing."""
-    parser = argparse.ArgumentParser(
-        description="Extract reads from a GAM file that align to a specific path and group them by node.")
+    parser = argparse.ArgumentParser(description="Extract reads from a GAM file that align to a specific path and group them by node.")
 
     parser.add_argument("-x", "--xg", required=True, help="Graph XG file")
     parser.add_argument("-g", "--gam", required=True, help="Input GAM file")
     parser.add_argument("-p", "--path", required=True, help="Path name to filter reads")
-    parser.add_argument("-n", "--nodes", default="nodes_in_path.txt", help="Output file for extracted node IDs")
-    parser.add_argument("-j", "--json", default="filtered_reads_by_node.json",
-                        help="Output JSON file grouping reads by node")
+    parser.add_argument("-n", "--nodes", default="nodes.json", help="Output JSON file for extracted node data")
+    parser.add_argument("-j", "--json", default="filtered_reads_by_node.json", help="Output JSON file grouping reads by node")
     parser.add_argument("-t", "--threads", type=int, default=4, help="Number of threads for processing")
 
     args = parser.parse_args()
 
-    # Run the extraction pipeline
+    # Extract node data (ID, sequence, length)
     extract_nodes(args.xg, args.path, args.nodes)
-    filter_reads(args.gam, args.nodes, args.json, args.threads)
 
+    # Process reads from GAM and group them by node
+    filter_reads(args.gam, args.nodes, args.json, args.threads)
 
 if __name__ == "__main__":
     main()
