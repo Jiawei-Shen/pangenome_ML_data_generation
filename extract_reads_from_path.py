@@ -101,8 +101,8 @@ def main():
     parser.add_argument("-x", "--xg", required=True, help="Graph XG file")
     parser.add_argument("-g", "--gam", required=True, help="Input GAM file")
     parser.add_argument("-p", "--path", required=True, help="Path name to filter reads")
-    parser.add_argument("-n", "--nodes", default="nodes.json", help="Output JSON file for extracted node data")
-    parser.add_argument("-j", "--json", default="filtered_reads_by_node.json", help="Output JSON file grouping reads by node")
+    parser.add_argument("-n", "--nodes", default="hg38_chr5_nodes.json", help="Output JSON file for extracted node data")
+    parser.add_argument("-j", "--json", default="grouped_reads_by_hg38_chr5_nodes.json", help="Output JSON file grouping reads by node")
     parser.add_argument("-t", "--threads", type=int, default=4, help="Number of threads for processing")
 
     args = parser.parse_args()
