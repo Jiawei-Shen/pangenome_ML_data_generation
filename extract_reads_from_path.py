@@ -37,7 +37,10 @@ def process_read(line, node_info, node_read_map, lock):
         read_info = {
             "read_name": read["name"],
             "sequence": read["sequence"],
-            "mapping_quality": read.get("mapping_quality", 0)
+            "mapping_quality": read.get("mapping_quality", 0),
+            "score": read.get("score", None),
+            "quality": read.get("quality", ""),
+            "path": read.get("path", {})
         }
 
         mapped_nodes = set()  # Store unique node IDs the read maps to
