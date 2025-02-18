@@ -120,7 +120,7 @@ def process_read(line, node_info, node_read_map, lock, processed_count):
                 node_read_map[node_id]["reads"].append(read_info)
 
             processed_count[0] += 1
-            if processed_count[0] % 10000 == 0:
+            if processed_count[0] % 100000 == 0:
                 print(f"[INFO] Processed {processed_count[0]} reads...")
 
     except json.JSONDecodeError:
