@@ -121,8 +121,9 @@ def process_read(line, node_info, node_read_map, lock, processed_count, output_j
             processed_count[0] += 1
             if processed_count[0] % 10000 == 0:
                 print(f"[INFO] Processed {processed_count[0]} reads...")
+                print(node_read_map)
                 save_json(node_read_map, f"./tmp/{output_json}_batch_{processed_count[0]}.json")
-                node_read_map.clear()  # Clear memory after saving each batch
+                # node_read_map.clear()  # Clear memory after saving each batch
 
     except json.JSONDecodeError:
         return  # Skip invalid JSON reads
