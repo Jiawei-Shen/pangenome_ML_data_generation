@@ -90,7 +90,6 @@ def load_nodes(nodes_json):
 
 def process_read(line, node_info, node_read_map, lock, processed_count, output_json):
     """Check if the read aligns to any node and store it grouped by node."""
-    print("start!")
     try:
         read = json.loads(line)
         read_info = {
@@ -101,7 +100,6 @@ def process_read(line, node_info, node_read_map, lock, processed_count, output_j
             "quality": read.get("quality", ""),
             "path": read.get("path", {})
         }
-        print(line, read_info, "\n\n")
         mapped_nodes = set()
         for mapping in read.get("path", {}).get("mapping", []):
             node_id = str(mapping["position"].get("node_id", ""))
