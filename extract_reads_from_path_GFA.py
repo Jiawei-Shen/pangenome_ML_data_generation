@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 def extract_nodes_from_gfa(gfa_file, reference_name, chromosome, output_json="nodes.json", threads=4):
     """Extract nodes from GFA path and directly assign node information if available using multi-threading."""
     # Extract path nodes with strands
-    command = f"grep '^W' {gfa_file} | grep -w '{reference_name}' | grep -w '{chromosome}'"
+    command = f"grep '^W' {gfa_file} | grep '{reference_name}' | grep '{chromosome}'"
     result = subprocess.run(command, shell=True, capture_output=True, text=True)
 
     path_nodes = {}
@@ -24,14 +24,14 @@ def extract_nodes_from_gfa(gfa_file, reference_name, chromosome, output_json="no
                 path_nodes[node_id] = {"strand": strand}
 
     path_node_ids = set(path_nodes.keys())
-    print(f"The path: '{reference_name}' | '{chromosome} is parsed and nodes are collected.")
 
-    # Multi-threaded processing of GFA 'S' lines
     lock = threading.Lock()
     node_data = {}
+    processed_count = 0
 
     def process_chunk(chunk):
         local_data = {}
+        nonlocal processed_count
         for line in chunk:
             if line.startswith('S'):
                 parts = line.strip().split('\t')
@@ -43,12 +43,13 @@ def extract_nodes_from_gfa(gfa_file, reference_name, chromosome, output_json="no
                             "sequence": sequence,
                             "length": len(sequence)
                         }
-                else:
-                    print(f"Segment: {line} is corrupted")
+                        processed_count += 1
+                        if processed_count % 2000 == 0:
+                            print(f"[INFO] Processed {processed_count} nodes...")
+
         with lock:
             node_data.update(local_data)
 
-    # Read the GFA file and split it into chunks
     with open(gfa_file, 'r') as gfa:
         lines = gfa.readlines()
         chunk_size = len(lines) // threads
@@ -59,7 +60,6 @@ def extract_nodes_from_gfa(gfa_file, reference_name, chromosome, output_json="no
         for future in as_completed(futures):
             future.result()
 
-    # Update path_nodes with node information
     for node_id in path_nodes.keys():
         if node_id in node_data:
             path_nodes[node_id].update(node_data[node_id])
@@ -67,7 +67,7 @@ def extract_nodes_from_gfa(gfa_file, reference_name, chromosome, output_json="no
     with open(output_json, 'w') as f:
         json.dump({"nodes": path_nodes}, f, indent=2)
 
-    print(f"[✔] Extracted nodes with IDs, strands, sequences, and lengths using {threads} threads, and saved to {output_json}")
+    print(f"[✔] Extracted {processed_count} nodes with IDs, strands, sequences, and lengths using {threads} threads, and saved to {output_json}")
 
 
 def load_nodes(nodes_json):
