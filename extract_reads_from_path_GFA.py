@@ -123,7 +123,7 @@ def process_read(line, node_info, node_read_map, lock, processed_count, output_j
                 print(f"[INFO] Processed {processed_count[0]} reads...")
                 print(node_read_map)
                 save_json(node_read_map, f"./tmp/{output_json}_batch_{processed_count[0]}.json")
-                # node_read_map.clear()  # Clear memory after saving each batch
+                node_read_map.clear()  # Clear memory after saving each batch
 
     except json.JSONDecodeError:
         return  # Skip invalid JSON reads
@@ -155,6 +155,7 @@ def save_json(data, output_file):
     """Saves the current JSON state to a file atomically."""
     temp_file = output_file + ".tmp"
     os.makedirs(os.path.dirname(temp_file), exist_ok=True)
+    print(temp_file)
     with open(temp_file, "w") as f:
         json.dump(data, f, indent=2)
     os.replace(temp_file, output_file)
