@@ -24,7 +24,7 @@ def extract_nodes_from_gfa(gfa_file, reference_name, chromosome, output_json="no
                 node_id = n[1:]
                 path_nodes[node_id] = {"strand": strand}
                 processed_count += 1
-                if processed_count % 10000 == 0:
+                if processed_count % 2000 == 0:
                     print(f"[INFO] Extracted {processed_count} nodes from paths...")
 
     print(f"[✔] Path extraction complete. {processed_count} nodes extracted.")
@@ -40,13 +40,15 @@ def extract_nodes_from_gfa(gfa_file, reference_name, chromosome, output_json="no
         for line in chunk:
             if line.startswith('S'):
                 parts = line.strip().split('\t')
-                if len(parts) >= 3:
+                if len(parts) >= 6:
                     node_id = parts[1]
                     if node_id in path_node_ids:
                         sequence = parts[2]
+                        start_offset = int(parts[5].split(':')[2])  # Extract SO from parts[5]
                         local_data[node_id] = {
                             "sequence": sequence,
-                            "length": len(sequence)
+                            "length": len(sequence),
+                            "start_offset": start_offset
                         }
                         processed_count += 1
                         if processed_count % 2000 == 0:
@@ -75,7 +77,7 @@ def extract_nodes_from_gfa(gfa_file, reference_name, chromosome, output_json="no
     with open(output_json, 'w') as f:
         json.dump({"nodes": path_nodes}, f, indent=2)
 
-    print(f"[✔] Extracted nodes with IDs, strands, sequences, and lengths using {threads} threads, and saved to {output_json}")
+    print(f"[✔] Extracted nodes with IDs, strands, sequences, lengths, and start offsets using {threads} threads, and saved to {output_json}")
 
 
 def load_nodes(nodes_json):
@@ -112,6 +114,7 @@ def process_read(line, node_info, node_read_map, lock, processed_count):
                         "strand": node_info[node_id]["strand"],
                         "sequence": node_info[node_id]["sequence"],
                         "length": node_info[node_id]["length"],
+                        "start_offset": node_info[node_id]["start_offset"],
                         "reads": []
                     }
                 node_read_map[node_id]["reads"].append(read_info)
