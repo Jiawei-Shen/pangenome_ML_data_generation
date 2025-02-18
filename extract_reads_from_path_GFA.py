@@ -86,7 +86,7 @@ def load_nodes(nodes_json):
     with open(nodes_json, "r") as f:
         data = json.load(f)
     print("nodes")
-    print(data["nodes"])
+    print(data["nodes"].keys())
     return data["nodes"]
 
 
