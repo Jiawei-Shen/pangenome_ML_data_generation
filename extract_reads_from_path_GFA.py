@@ -28,6 +28,7 @@ def extract_nodes_from_gfa(gfa_file, reference_name, chromosome, output_json="no
                     "strand": strand,
                     "length": len(node_id)  # Adjust as needed
                 })
+                print(node_info)
 
     with open(output_json, 'w') as f:
         json.dump({"nodes": node_info}, f, indent=2)
