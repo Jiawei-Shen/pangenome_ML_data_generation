@@ -155,7 +155,6 @@ def save_json(data, output_file):
     """Saves the current JSON state to a file atomically."""
     temp_file = output_file + ".tmp"
     os.makedirs(os.path.dirname(temp_file), exist_ok=True)
-    print(os.path.dirname(temp_file))
     with open(temp_file, "w") as f:
         json.dump(data, f, indent=2)
     os.replace(temp_file, output_file)
