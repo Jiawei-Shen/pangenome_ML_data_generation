@@ -168,7 +168,7 @@ def main():
 
     args = parser.parse_args()
 
-    extract_nodes_from_gfa(args.gfa_file, args.reference, args.chromosome, args.nodes, args.threads)
+    # extract_nodes_from_gfa(args.gfa_file, args.reference, args.chromosome, args.nodes, args.threads)
     filter_reads(args.gam, args.nodes, args.json, args.threads)
 
 
