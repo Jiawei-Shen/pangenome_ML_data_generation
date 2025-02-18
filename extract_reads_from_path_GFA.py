@@ -24,7 +24,7 @@ def extract_nodes_from_gfa(gfa_file, reference_name, chromosome, output_json="no
                 node_id = n[1:]
                 path_nodes[node_id] = {"strand": strand}
                 processed_count += 1
-                if processed_count % 2000 == 0:
+                if processed_count % 10000 == 0:
                     print(f"[INFO] Extracted {processed_count} nodes from paths...")
 
     print(f"[✔] Path extraction complete. {processed_count} nodes extracted.")
