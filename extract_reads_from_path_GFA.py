@@ -121,9 +121,9 @@ def process_read(line, node_info, node_read_map, lock, processed_count, output_j
                 node_read_map[node_id]["reads"].append(read_info)
             print(node_read_map)
             processed_count[0] += 1
-            if processed_count[0] % 5000000 == 0:
+            if processed_count[0] % 10000 == 0:
                 print(f"[INFO] Processed {processed_count[0]} reads...")
-                save_json(node_read_map, f"tmp/{output_json}_batch_{processed_count[0]}.json")
+                save_json(node_read_map, f"./tmp/{output_json}_batch_{processed_count[0]}.json")
                 node_read_map.clear()  # Clear memory after saving each batch
 
     except json.JSONDecodeError:
@@ -146,7 +146,7 @@ def filter_reads(input_gam, nodes_file, output_json, threads=4):
 
     print(f"[✔] Read filtering complete. {processed_count[0]} reads processed.")
     if node_read_map:
-        save_json(node_read_map, f"tmp/{output_json}_batch_final.json")
+        save_json(node_read_map, f"./tmp/{output_json}_batch_final.json")
 
     merge_json_files("tmp", output_json)
     print(f"[✔] Filtered reads grouped by node saved to {output_json}")
