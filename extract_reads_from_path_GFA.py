@@ -102,6 +102,7 @@ def process_read(line, node_info, node_read_map, lock, processed_count, output_j
         }
         mapped_nodes = set()
         # print(read.get("path", {}).get("mapping", []))
+        print(node_info[0], type(node_info[0]))
         for mapping in read.get("path", {}).get("mapping", []):
             node_id = str(mapping["position"].get("node_id", ""))
             print("Hello: ", type(node_id), '\n', type(node_info[0]))
