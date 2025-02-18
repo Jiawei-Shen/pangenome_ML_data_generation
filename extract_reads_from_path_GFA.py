@@ -105,7 +105,7 @@ def process_read(line, node_info, node_read_map, lock, processed_count, output_j
 
         for mapping in read.get("path", {}).get("mapping", []):
             node_id = str(mapping["position"].get("node_id", ""))
-            print(node_id)
+            print(node_id, node_id in node_info)
             if node_id in node_info:
                 mapped_nodes.add(node_id)
 
