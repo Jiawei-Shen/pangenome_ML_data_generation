@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 def extract_nodes_from_gfa(gfa_file, reference_name, chromosome, output_json="nodes.json", threads=4):
     """Extract nodes from GFA path and directly assign node information if available using multi-threading."""
     # Extract path nodes with strands
-    command = f"grep '^W' {gfa_file} | grep '{reference_name}' | grep '{chromosome}'"
+    command = f"grep '^W' {gfa_file} | grep -w '{reference_name}' | grep -w '{chromosome}'"
     result = subprocess.run(command, shell=True, capture_output=True, text=True)
 
     path_nodes = {}
@@ -24,6 +24,7 @@ def extract_nodes_from_gfa(gfa_file, reference_name, chromosome, output_json="no
                 path_nodes[node_id] = {"strand": strand}
 
     path_node_ids = set(path_nodes.keys())
+    print(f"The path: '{reference_name}' | '{chromosome} is parsed and nodes are collected.")
 
     # Multi-threaded processing of GFA 'S' lines
     lock = threading.Lock()
@@ -42,6 +43,8 @@ def extract_nodes_from_gfa(gfa_file, reference_name, chromosome, output_json="no
                             "sequence": sequence,
                             "length": len(sequence)
                         }
+                else:
+                    print(f"Segment: {line} is corrupted")
         with lock:
             node_data.update(local_data)
 
