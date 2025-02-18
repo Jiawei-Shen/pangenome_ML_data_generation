@@ -119,7 +119,6 @@ def process_read(line, node_info, node_read_map, lock, processed_count, output_j
                         "reads": []
                     }
                 node_read_map[node_id]["reads"].append(read_info)
-            print(node_read_map)
             processed_count[0] += 1
             if processed_count[0] % 10000 == 0:
                 print(f"[INFO] Processed {processed_count[0]} reads...")
