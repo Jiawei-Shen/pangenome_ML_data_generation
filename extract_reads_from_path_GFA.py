@@ -24,7 +24,7 @@ def extract_nodes_from_gfa(gfa_file, reference_name, chromosome, output_json="no
                 node_id = n[1:]
                 path_nodes[node_id] = {"strand": strand}
                 processed_count += 1
-                if processed_count % 2000 == 0:
+                if processed_count % 10000 == 0:
                     print(f"[INFO] Extracted {processed_count} nodes from paths...")
 
     print(f"[✔] Path extraction complete. {processed_count} nodes extracted.")
@@ -80,15 +80,15 @@ def extract_nodes_from_gfa(gfa_file, reference_name, chromosome, output_json="no
     print(f"[✔] Extracted nodes with IDs, strands, sequences, lengths, and start offsets using {threads} threads, and saved to {output_json}")
 
 
+
 def load_nodes(nodes_json):
     """Load node IDs, strands, sequences, and lengths from JSON."""
     with open(nodes_json, "r") as f:
         data = json.load(f)
-
     return data["nodes"]
 
 
-def process_read(line, node_info, node_read_map, lock, processed_count):
+def process_read(line, node_info, node_read_map, lock, processed_count, output_json):
     """Check if the read aligns to any node and store it grouped by node."""
     try:
         read = json.loads(line)
@@ -120,8 +120,10 @@ def process_read(line, node_info, node_read_map, lock, processed_count):
                 node_read_map[node_id]["reads"].append(read_info)
 
             processed_count[0] += 1
-            if processed_count[0] % 100000 == 0:
+            if processed_count[0] % 5000000 == 0:
                 print(f"[INFO] Processed {processed_count[0]} reads...")
+                save_json(node_read_map, f"tmp/{output_json}_batch_{processed_count[0]}.json")
+                node_read_map.clear()  # Clear memory after saving each batch
 
     except json.JSONDecodeError:
         return  # Skip invalid JSON reads
@@ -138,29 +140,54 @@ def filter_reads(input_gam, nodes_file, output_json, threads=4):
     process = subprocess.Popen(["vg", "view", "-a", input_gam], stdout=subprocess.PIPE, text=True)
 
     with ThreadPoolExecutor(max_workers=threads) as executor:
-        for _ in executor.map(lambda line: process_read(line, node_info, node_read_map, lock, processed_count), process.stdout):
+        for _ in executor.map(lambda line: process_read(line, node_info, node_read_map, lock, processed_count, output_json), process.stdout):
             pass
 
     print(f"[✔] Read filtering complete. {processed_count[0]} reads processed.")
-    save_json(node_read_map, output_json)
+    if node_read_map:
+        save_json(node_read_map, f"tmp/{output_json}_batch_final.json")
+
+    merge_json_files("tmp", output_json)
     print(f"[✔] Filtered reads grouped by node saved to {output_json}")
-    return output_json
 
 
 def save_json(data, output_file):
     """Saves the current JSON state to a file atomically."""
     temp_file = output_file + ".tmp"
+    os.makedirs(os.path.dirname(temp_file), exist_ok=True)
     with open(temp_file, "w") as f:
         json.dump(data, f, indent=2)
-    subprocess.run(["mv", temp_file, output_file])  # Atomic move
+    os.replace(temp_file, output_file)
     print(f"[✔] Saved progress to {output_file}")
+
+
+def merge_json_files(temp_dir, output_file):
+    """Merge all batch JSON files into one final JSON file."""
+    print("[INFO] Merging all batch JSON files...")
+    merged_data = {}
+
+    batch_files = sorted(glob.glob(f"{temp_dir}/{output_file}_batch_*.json"))
+
+    for batch_file in batch_files:
+        print(f"  - Loading {batch_file}")
+        with open(batch_file, 'r') as f:
+            batch_data = json.load(f)
+            for node_id, node_data in batch_data.items():
+                if node_id not in merged_data:
+                    merged_data[node_id] = node_data
+                else:
+                    merged_data[node_id]["reads"].extend(node_data["reads"])
+
+    with open(output_file, 'w') as f:
+        json.dump(merged_data, f, indent=2)
+    print(f"[✔] Merged data saved to {output_file}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Extract reads from a GAM file that align to specific nodes from a GFA file and group them by node.")
-    parser.add_argument("-gfa", "--gfa_file", required=True, help="GFA graph file")
-    parser.add_argument("-r", "--reference", required=True, help="Reference name to filter (e.g., GRCh38)")
-    parser.add_argument("-c", "--chromosome", required=True, help="Chromosome name to filter (e.g., chr1)")
+    parser.add_argument("-gfa", "--gfa_file", required=False, help="GFA graph file")
+    parser.add_argument("-r", "--reference", required=False, help="Reference name to filter (e.g., GRCh38)")
+    parser.add_argument("-c", "--chromosome", required=False, help="Chromosome name to filter (e.g., chr1)")
     parser.add_argument("-gam", "--gam", required=True, help="Input GAM file")
     parser.add_argument("-n", "--nodes", default="nodes.json", help="Output JSON file for extracted node data")
     parser.add_argument("-j", "--json", default="grouped_reads.json", help="Output JSON file grouping reads by node")
