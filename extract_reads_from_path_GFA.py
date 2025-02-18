@@ -85,6 +85,7 @@ def load_nodes(nodes_json):
     """Load node IDs, strands, sequences, and lengths from JSON."""
     with open(nodes_json, "r") as f:
         data = json.load(f)
+    print(type(data[nodes]))
     return data["nodes"]
 
 
@@ -104,7 +105,7 @@ def process_read(line, node_info, node_read_map, lock, processed_count, output_j
         # print(read.get("path", {}).get("mapping", []))
         print(type(node_info))
         print(type(node_info.keys()[0]))
-        
+
         for mapping in read.get("path", {}).get("mapping", []):
             node_id = str(mapping["position"].get("node_id", ""))
             print("Hello: ", type(node_id), '\n', type(node_info[0]))
