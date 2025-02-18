@@ -85,8 +85,6 @@ def load_nodes(nodes_json):
     """Load node IDs, strands, sequences, and lengths from JSON."""
     with open(nodes_json, "r") as f:
         data = json.load(f)
-    print("nodes")
-    print(data["nodes"].keys())
     return data["nodes"]
 
 
