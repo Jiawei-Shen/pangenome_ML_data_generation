@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def extract_nodes_from_gfa(gfa_file, reference_name, chromosome, output_json="nodes.json", threads=4):
     """Extract nodes from GFA path and directly assign node information if available using multi-threading."""
-    # Extract path nodes with strands
+    print("[INFO] Starting path extraction...")
     command = f"grep '^W' {gfa_file} | grep '{reference_name}' | grep '{chromosome}'"
     result = subprocess.run(command, shell=True, capture_output=True, text=True)
 
@@ -26,6 +26,8 @@ def extract_nodes_from_gfa(gfa_file, reference_name, chromosome, output_json="no
                 processed_count += 1
                 if processed_count % 2000 == 0:
                     print(f"[INFO] Extracted {processed_count} nodes from paths...")
+
+    print(f"[✔] Path extraction complete. {processed_count} nodes extracted.")
 
     path_node_ids = set(path_nodes.keys())
     lock = threading.Lock()
@@ -53,6 +55,7 @@ def extract_nodes_from_gfa(gfa_file, reference_name, chromosome, output_json="no
         with lock:
             node_data.update(local_data)
 
+    print("[INFO] Starting segment processing...")
     with open(gfa_file, 'r') as gfa:
         lines = gfa.readlines()
         chunk_size = len(lines) // threads
@@ -62,6 +65,8 @@ def extract_nodes_from_gfa(gfa_file, reference_name, chromosome, output_json="no
         futures = [executor.submit(process_chunk, chunk) for chunk in chunks]
         for future in as_completed(futures):
             future.result()
+
+    print(f"[✔] Segment processing complete. {processed_count} nodes with sequences processed.")
 
     for node_id in path_nodes.keys():
         if node_id in node_data:
@@ -121,6 +126,7 @@ def process_read(line, node_info, node_read_map, lock, processed_count):
 
 def filter_reads(input_gam, nodes_file, output_json, threads=4):
     """Filter reads from GAM that align to extracted nodes and group them by node in real-time using multi-threading."""
+    print("[INFO] Starting read filtering...")
     node_info = load_nodes(nodes_file)
     node_read_map = {}
     lock = threading.Lock()
@@ -132,8 +138,9 @@ def filter_reads(input_gam, nodes_file, output_json, threads=4):
         for _ in executor.map(lambda line: process_read(line, node_info, node_read_map, lock, processed_count), process.stdout):
             pass
 
+    print(f"[✔] Read filtering complete. {processed_count[0]} reads processed.")
     save_json(node_read_map, output_json)
-    print(f"[✔] Filtered {processed_count[0]} reads grouped by node saved to {output_json}")
+    print(f"[✔] Filtered reads grouped by node saved to {output_json}")
     return output_json
 
 
