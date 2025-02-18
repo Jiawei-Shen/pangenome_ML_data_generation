@@ -153,8 +153,8 @@ def filter_reads(input_gam, nodes_file, output_json, threads=4):
 def save_json(data, output_file):
     """Saves the current JSON state to a file atomically."""
     temp_file = output_file + ".tmp"
-    os.makedirs(os.path.dirname(temp_file), exist_ok=True)
     print(temp_file)
+    os.makedirs(os.path.dirname(temp_file), exist_ok=True)
     with open(temp_file, "w") as f:
         json.dump(data, f, indent=2)
     os.replace(temp_file, output_file)
