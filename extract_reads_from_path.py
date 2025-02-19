@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 def extract_nodes(graph_xg, path_name, output_json="nodes.json"):
     """Extract nodes with ID, sequence, and length from a given path."""
-    path_vg = "path_nodes.vg"
+    path_vg = graph_xg.replace(".xg", ".vg")
 
     # Run vg find to extract nodes from the path
     subprocess.run(f"vg find -x {graph_xg} -p {path_name} > {path_vg}", shell=True, check=True)
