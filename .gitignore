@@ -7,4 +7,3 @@ GRCh38_references/
 .idea/
 ./HG005_variants.json
 ./.gitignore
-scripts_sh/git_push_bash.sh
