@@ -3,20 +3,21 @@ import os
 import json
 import argparse
 import re
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing
+import glob
+import gc
 
 
 def extract_nodes_from_gfa(gfa_file, reference_name, chromosome, output_json="nodes.json", threads=4):
-    """Extract nodes from GFA path and directly assign node information if available using multi-threading."""
+    """Extract nodes from GFA path and directly assign node information if available using multi-processing."""
     print("[INFO] Starting path extraction...")
     command = f"grep '^W' {gfa_file} | grep '{reference_name}' | grep '{chromosome}'"
-    result = subprocess.run(command, shell=True, capture_output=True, text=True)
+    process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, text=True)
 
     path_nodes = {}
     processed_count = 0
-    for line in result.stdout.strip().split('\n'):
-        parts = line.split('\t')
+    for line in process.stdout:
+        parts = line.strip().split('\t')
         if len(parts) >= 7:
             sequence = parts[6].strip()
             nodes = re.findall(r'[><][^><]+', sequence)
@@ -31,13 +32,11 @@ def extract_nodes_from_gfa(gfa_file, reference_name, chromosome, output_json="no
     print(f"[✔] Path extraction complete. {processed_count} nodes extracted.")
 
     path_node_ids = set(path_nodes.keys())
-    lock = threading.Lock()
-    node_data = {}
-    processed_count = 0
+    node_data = multiprocessing.Manager().dict()
+    processed_count = multiprocessing.Value("i", 0)
 
     def process_chunk(chunk):
         local_data = {}
-        nonlocal processed_count
         for line in chunk:
             if line.startswith('S'):
                 parts = line.strip().split('\t')
@@ -51,25 +50,26 @@ def extract_nodes_from_gfa(gfa_file, reference_name, chromosome, output_json="no
                             "length": len(sequence),
                             "start_offset": start_offset
                         }
-                        processed_count += 1
-                        if processed_count % 10000 == 0:
-                            print(f"[INFO] Processed {processed_count} nodes with sequence data...")
-
-        with lock:
-            node_data.update(local_data)
+        with processed_count.get_lock():
+            processed_count.value += len(local_data)
+            if processed_count.value % 10000 == 0:
+                print(f"[INFO] Processed {processed_count.value} nodes with sequence data...")
+        node_data.update(local_data)
 
     print("[INFO] Starting segment processing...")
     with open(gfa_file, 'r') as gfa:
-        lines = gfa.readlines()
-        chunk_size = len(lines) // threads
-        chunks = [lines[i:i + chunk_size] for i in range(0, len(lines), chunk_size)]
+        chunk_size = 10000  # Adjust chunk size
+        chunks = []
+        for line in gfa:
+            chunks.append(line)
+            if len(chunks) >= chunk_size:
+                process_chunk(chunks)
+                chunks.clear()
 
-    with ThreadPoolExecutor(max_workers=threads) as executor:
-        futures = [executor.submit(process_chunk, chunk) for chunk in chunks]
-        for future in as_completed(futures):
-            future.result()
+        if chunks:
+            process_chunk(chunks)
 
-    print(f"[✔] Segment processing complete. {processed_count} nodes with sequences processed.")
+    print(f"[✔] Segment processing complete. {processed_count.value} nodes with sequences processed.")
 
     for node_id in path_nodes.keys():
         if node_id in node_data:
@@ -81,7 +81,6 @@ def extract_nodes_from_gfa(gfa_file, reference_name, chromosome, output_json="no
     print(f"[✔] Extracted nodes with IDs, strands, sequences, lengths, and start offsets using {threads} threads, and saved to {output_json}")
 
 
-
 def load_nodes(nodes_json):
     """Load node IDs, strands, sequences, and lengths from JSON."""
     with open(nodes_json, "r") as f:
@@ -89,7 +88,7 @@ def load_nodes(nodes_json):
     return data["nodes"]
 
 
-def process_read(line, node_info, node_read_map, lock, processed_count, output_json):
+def process_read(line, node_info, node_read_map, processed_count, output_json):
     """Check if the read aligns to any node and store it grouped by node."""
     try:
         read = json.loads(line)
@@ -108,42 +107,45 @@ def process_read(line, node_info, node_read_map, lock, processed_count, output_j
             if node_id in node_info:
                 mapped_nodes.add(node_id)
 
-        with lock:
-            for node_id in mapped_nodes:
-                if node_id not in node_read_map:
-                    node_read_map[node_id] = {
-                        "strand": node_info[node_id]["strand"],
-                        "sequence": node_info[node_id]["sequence"],
-                        "length": node_info[node_id]["length"],
-                        "start_offset": node_info[node_id]["start_offset"],
-                        "reads": []
-                    }
-                node_read_map[node_id]["reads"].append(read_info)
-            processed_count[0] += 1
-            if processed_count[0] % 5000000 == 0:
-                print(f"[INFO] Processed {processed_count[0]} reads...")
-                save_json(node_read_map, f"./tmp/{output_json}_batch_{processed_count[0]}.json")
-                node_read_map.clear()  # Clear memory after saving each batch
+        for node_id in mapped_nodes:
+            if node_id not in node_read_map:
+                node_read_map[node_id] = {
+                    "strand": node_info[node_id]["strand"],
+                    "sequence": node_info[node_id]["sequence"],
+                    "length": node_info[node_id]["length"],
+                    "start_offset": node_info[node_id]["start_offset"],
+                    "reads": []
+                }
+            node_read_map[node_id]["reads"].append(read_info)
+
+        processed_count.value += 1
+        if processed_count.value % 5000000 == 0:
+            print(f"[INFO] Processed {processed_count.value} reads...")
+            save_json(node_read_map, f"./tmp/{output_json}_batch_{processed_count.value}.json")
+            node_read_map.clear()
 
     except json.JSONDecodeError:
         return  # Skip invalid JSON reads
 
 
 def filter_reads(input_gam, nodes_file, output_json, threads=4):
-    """Filter reads from GAM that align to extracted nodes and group them by node in real-time using multi-threading."""
+    """Filter reads from GAM that align to extracted nodes and group them by node using multiprocessing."""
     print("[INFO] Starting read filtering...")
     node_info = load_nodes(nodes_file)
-    node_read_map = {}
-    lock = threading.Lock()
-    processed_count = [0]
+    manager = multiprocessing.Manager()
+    node_read_map = manager.dict()
+    processed_count = multiprocessing.Value("i", 0)
 
     process = subprocess.Popen(["vg", "view", "-a", input_gam], stdout=subprocess.PIPE, text=True)
 
-    with ThreadPoolExecutor(max_workers=threads) as executor:
-        for _ in executor.map(lambda line: process_read(line, node_info, node_read_map, lock, processed_count, output_json), process.stdout):
+    with multiprocessing.Pool(processes=threads) as pool:
+        for _ in pool.imap_unordered(
+            lambda line: process_read(line, node_info, node_read_map, processed_count, output_json),
+            iter(process.stdout.readline, '')  # Stream line-by-line
+        ):
             pass
 
-    print(f"[✔] Read filtering complete. {processed_count[0]} reads processed.")
+    print(f"[✔] Read filtering complete. {processed_count.value} reads processed.")
     if node_read_map:
         save_json(node_read_map, f"./tmp/{output_json}_batch_final.json")
 
@@ -195,7 +197,7 @@ def main():
 
     args = parser.parse_args()
 
-    extract_nodes_from_gfa(args.gfa_file, args.reference, args.chromosome, args.nodes, args.threads)
+    # extract_nodes_from_gfa(args.gfa_file, args.reference, args.chromosome, args.nodes, args.threads)
     filter_reads(args.gam, args.nodes, args.json, args.threads)
 
 
