@@ -5,19 +5,21 @@ import argparse
 import re
 import multiprocessing
 import glob
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import gc
 
 
 def extract_nodes_from_gfa(gfa_file, reference_name, chromosome, output_json="nodes.json", threads=4):
-    """Extract nodes from GFA path and directly assign node information if available using multi-processing."""
+    """Extract nodes from GFA path and directly assign node information if available using multi-threading."""
     print("[INFO] Starting path extraction...")
     command = f"grep '^W' {gfa_file} | grep '{reference_name}' | grep '{chromosome}'"
-    process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, text=True)
+    result = subprocess.run(command, shell=True, capture_output=True, text=True)
 
     path_nodes = {}
     processed_count = 0
-    for line in process.stdout:
-        parts = line.strip().split('\t')
+    for line in result.stdout.strip().split('\n'):
+        parts = line.split('\t')
         if len(parts) >= 7:
             sequence = parts[6].strip()
             nodes = re.findall(r'[><][^><]+', sequence)
@@ -32,11 +34,13 @@ def extract_nodes_from_gfa(gfa_file, reference_name, chromosome, output_json="no
     print(f"[✔] Path extraction complete. {processed_count} nodes extracted.")
 
     path_node_ids = set(path_nodes.keys())
-    node_data = multiprocessing.Manager().dict()
-    processed_count = multiprocessing.Value("i", 0)
+    lock = threading.Lock()
+    node_data = {}
+    processed_count = 0
 
     def process_chunk(chunk):
         local_data = {}
+        nonlocal processed_count
         for line in chunk:
             if line.startswith('S'):
                 parts = line.strip().split('\t')
@@ -50,26 +54,25 @@ def extract_nodes_from_gfa(gfa_file, reference_name, chromosome, output_json="no
                             "length": len(sequence),
                             "start_offset": start_offset
                         }
-        with processed_count.get_lock():
-            processed_count.value += len(local_data)
-            if processed_count.value % 100000 == 0:
-                print(f"[INFO] Processed {processed_count.value} nodes with sequence data...")
-        node_data.update(local_data)
+                        processed_count += 1
+                        if processed_count % 100000 == 0:
+                            print(f"[INFO] Processed {processed_count} nodes with sequence data...")
+
+        with lock:
+            node_data.update(local_data)
 
     print("[INFO] Starting segment processing...")
     with open(gfa_file, 'r') as gfa:
-        chunk_size = 10000  # Adjust chunk size
-        chunks = []
-        for line in gfa:
-            chunks.append(line)
-            if len(chunks) >= chunk_size:
-                process_chunk(chunks)
-                chunks.clear()
+        lines = gfa.readlines()
+        chunk_size = len(lines) // threads
+        chunks = [lines[i:i + chunk_size] for i in range(0, len(lines), chunk_size)]
 
-        if chunks:
-            process_chunk(chunks)
+    with ThreadPoolExecutor(max_workers=threads) as executor:
+        futures = [executor.submit(process_chunk, chunk) for chunk in chunks]
+        for future in as_completed(futures):
+            future.result()
 
-    print(f"[✔] Segment processing complete. {processed_count.value} nodes with sequences processed.")
+    print(f"[✔] Segment processing complete. {processed_count} nodes with sequences processed.")
 
     for node_id in path_nodes.keys():
         if node_id in node_data:
@@ -79,7 +82,6 @@ def extract_nodes_from_gfa(gfa_file, reference_name, chromosome, output_json="no
         json.dump({"nodes": path_nodes}, f, indent=2)
 
     print(f"[✔] Extracted nodes with IDs, strands, sequences, lengths, and start offsets using {threads} threads, and saved to {output_json}")
-
 
 def load_nodes(nodes_json):
     """Load node IDs, strands, sequences, and lengths from JSON."""
