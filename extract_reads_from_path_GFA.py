@@ -120,7 +120,7 @@ def process_read(line, node_info, node_read_map, lock, processed_count, output_j
                     }
                 node_read_map[node_id]["reads"].append(read_info)
             processed_count[0] += 1
-            if processed_count[0] % 10000 == 0:
+            if processed_count[0] % 5000000 == 0:
                 print(f"[INFO] Processed {processed_count[0]} reads...")
                 save_json(node_read_map, f"./tmp/{output_json}_batch_{processed_count[0]}.json")
                 node_read_map.clear()  # Clear memory after saving each batch
