@@ -132,29 +132,39 @@ def process_read_wrapper(args):
 def filter_reads(input_gam, nodes_file, output_json, threads=4):
     """Filter reads from GAM that align to extracted nodes and group them by node using multiprocessing."""
     print("[INFO] Starting read filtering...")
-    node_info = load_nodes(nodes_file)  # Load once
+    node_info = load_nodes(nodes_file)  # Load node info once
 
     process = subprocess.Popen(["vg", "view", "-a", input_gam], stdout=subprocess.PIPE, text=True)
 
     results = []
+    processed_count = 0  # Track the number of processed reads
+    batch_index = 1  # Track batch index for JSON saving
+
     with multiprocessing.Pool(processes=threads) as pool:
         for mapped_nodes in pool.imap_unordered(
-            process_read_wrapper,  # Wrapper function to unpack arguments
+            process_read_wrapper,
             ((line, node_info) for line in iter(process.stdout.readline, ''))
         ):
             if mapped_nodes:
                 results.append(mapped_nodes)
+                processed_count += 1
 
-    # Merge all results
-    final_node_read_map = {}
-    for result in results:
-        for node_id, node_data in result.items():
-            if node_id not in final_node_read_map:
-                final_node_read_map[node_id] = node_data
-            else:
-                final_node_read_map[node_id]["reads"].extend(node_data["reads"])
+            # Save every 5,000,000 reads
+            if processed_count % 5000000 == 0:
+                batch_file = f"./tmp/{output_json}_batch_{batch_index}.json"
+                save_json(results, batch_file)
+                print(f"[INFO] Saved batch {batch_index} with {len(results)} records")
+                results.clear()  # Clear memory after saving
+                batch_index += 1
 
-    save_json(final_node_read_map, output_json)
+    # Save any remaining reads
+    if results:
+        batch_file = f"./tmp/{output_json}_batch_final.json"
+        save_json(results, batch_file)
+        print(f"[INFO] Saved final batch with {len(results)} records")
+
+    # Merge all JSON files
+    merge_json_files("tmp", output_json)
     print(f"[✔] Filtered reads grouped by node saved to {output_json}")
 
 
