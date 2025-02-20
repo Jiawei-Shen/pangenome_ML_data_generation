@@ -150,8 +150,8 @@ def filter_reads(input_gam, nodes_file, output_json, threads=4):
                 results.append(mapped_nodes)
                 processed_count += 1
 
-            # Save every 100,000 reads
-            if processed_count > 0 and processed_count % 100000 == 0 and results:
+            # Save every 10,000 reads
+            if processed_count > 0 and processed_count % 10000 == 0 and results:
                 batch_file = f"./tmp/{output_json}_batch_{batch_index}.json"
                 save_json(results, batch_file)
                 print(f"[INFO] Saved batch {batch_index} with {len(results)} records")
