@@ -99,7 +99,6 @@ def process_read(line, node_info):
         for mapping in read.get("path", {}).get("mapping", []):
             node_id = str(mapping["position"].get("node_id", ""))
             if node_id in node_info:
-                print(node_id, "length:", len(node_info), type(node_info), "YESSSSSSSSS!")
                 if node_id not in mapped_nodes:
                     mapped_nodes[node_id] = {
                         "strand": node_info[node_id]["strand"],
@@ -148,6 +147,7 @@ def filter_reads(input_gam, nodes_file, output_json, threads=4):
                 processed_count += 1
                 if processed_count % 100000 == 0:
                     print(f"[INFO] Processed {processed_count} reads...")
+                    print(len(future.result()))
 
             # Save and clear memory periodically
             if processed_count % batch_size == 0:
