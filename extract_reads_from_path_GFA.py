@@ -91,6 +91,17 @@ def load_nodes(nodes_json):
     return data["nodes"]
 
 
+import subprocess
+import os
+import json
+import argparse
+import re
+import multiprocessing
+import glob
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
 def load_nodes(nodes_json):
     """Load node IDs, strands, sequences, and lengths from JSON."""
     with open(nodes_json, "r") as f:
@@ -222,6 +233,9 @@ def merge_json_files(temp_dir, output_file):
 
 def main():
     parser = argparse.ArgumentParser(description="Extract reads from a GAM file that align to specific nodes from a GFA file and group them by node.")
+    parser.add_argument("-gfa", "--gfa_file", required=False, help="GFA graph file")
+    parser.add_argument("-r", "--reference", required=False, help="Reference name to filter (e.g., GRCh38)")
+    parser.add_argument("-c", "--chromosome", required=False, help="Chromosome name to filter (e.g., chr1)")
     parser.add_argument("-gam", "--gam", required=True, help="Input GAM file")
     parser.add_argument("-n", "--nodes", default="nodes.json", help="Output JSON file for extracted node data")
     parser.add_argument("-j", "--json", default="grouped_reads.json", help="Output JSON file grouping reads by node")
