@@ -131,7 +131,7 @@ def filter_reads(input_gam, nodes_file, output_json, threads=4):
     results = []
     processed_count = 0
     batch_index = 1
-    batch_size = 1000000  # Save every 1,000,000 reads
+    batch_size = 10000000  # Save every 1,000,000 reads
 
     lock = threading.Lock()  # Lock for thread safety
 
