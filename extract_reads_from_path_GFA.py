@@ -124,17 +124,22 @@ def process_read(line, node_info):
         return None  # Skip invalid JSON reads
 
 
+def process_read_wrapper(args):
+    """Wrapper function to unpack tuple arguments for multiprocessing."""
+    line, node_info = args
+    return process_read(line, node_info)
+
 def filter_reads(input_gam, nodes_file, output_json, threads=4):
     """Filter reads from GAM that align to extracted nodes and group them by node using multiprocessing."""
     print("[INFO] Starting read filtering...")
-    node_info = load_nodes(nodes_file)
+    node_info = load_nodes(nodes_file)  # Load once
 
     process = subprocess.Popen(["vg", "view", "-a", input_gam], stdout=subprocess.PIPE, text=True)
 
     results = []
     with multiprocessing.Pool(processes=threads) as pool:
         for mapped_nodes in pool.imap_unordered(
-            process_read,
+            process_read_wrapper,  # Wrapper function to unpack arguments
             ((line, node_info) for line in iter(process.stdout.readline, ''))
         ):
             if mapped_nodes:
