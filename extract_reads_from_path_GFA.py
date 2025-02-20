@@ -118,6 +118,7 @@ def process_read(line, node_info):
                         "reads": []
                     }
                 mapped_nodes[node_id]["reads"].append(read_info)
+                print(mapped_nodes)
         return mapped_nodes
 
     except json.JSONDecodeError:
