@@ -130,6 +130,11 @@ def process_read(line, node_info, node_read_map, processed_count, output_json):
         return  # Skip invalid JSON reads
 
 
+def process_read_wrapper(args):
+    """Wrapper function for processing a read with multiprocessing."""
+    line, node_info, node_read_map, processed_count, output_json = args
+    return process_read(line, node_info, node_read_map, processed_count, output_json)
+
 def filter_reads(input_gam, nodes_file, output_json, threads=4):
     """Filter reads from GAM that align to extracted nodes and group them by node using multiprocessing."""
     print("[INFO] Starting read filtering...")
@@ -142,8 +147,8 @@ def filter_reads(input_gam, nodes_file, output_json, threads=4):
 
     with multiprocessing.Pool(processes=threads) as pool:
         for _ in pool.imap_unordered(
-            lambda line: process_read(line, node_info, node_read_map, processed_count, output_json),
-            iter(process.stdout.readline, '')  # Stream line-by-line
+            process_read_wrapper,  # Use a named function instead of lambda
+            ((line, node_info, node_read_map, processed_count, output_json) for line in iter(process.stdout.readline, ''))
         ):
             pass
 
