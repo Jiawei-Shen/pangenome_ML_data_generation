@@ -142,6 +142,7 @@ def filter_reads(input_gam, nodes_file, output_json, threads=4):
         for line in iter(process.stdout.readline, ''):  # Stream lines one by one
             future = executor.submit(process_read, line, node_info)
             futures.append(future)
+            print(future)
 
             with lock:  # Ensure atomic update of shared variables
                 processed_count += 1
