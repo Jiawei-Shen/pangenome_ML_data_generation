@@ -144,7 +144,7 @@ def filter_reads(input_gam, nodes_file, output_json, threads=4):
 
             with lock:  # Ensure atomic update of shared variables
                 processed_count += 1
-                if processed_count % 100000 == 0:
+                if processed_count % 500000 == 0:
                     print(f"[INFO] Processed {processed_count} reads...")
 
             # Save and clear memory periodically
