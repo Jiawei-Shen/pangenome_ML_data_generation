@@ -87,24 +87,6 @@ def extract_nodes_from_gfa(gfa_file, reference_name, chromosome, output_json="no
 def load_nodes(nodes_json):
     """Load node IDs, strands, sequences, and lengths from JSON."""
     with open(nodes_json, "r") as f:
-        data = json.load(f)
-    return data["nodes"]
-
-
-import subprocess
-import os
-import json
-import argparse
-import re
-import multiprocessing
-import glob
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-
-def load_nodes(nodes_json):
-    """Load node IDs, strands, sequences, and lengths from JSON."""
-    with open(nodes_json, "r") as f:
         return json.load(f)["nodes"]
 
 
@@ -117,6 +99,7 @@ def process_read(line, node_info):
         for mapping in read.get("path", {}).get("mapping", []):
             node_id = str(mapping["position"].get("node_id", ""))
             if node_id in node_info:
+                print("YESSSSSSSSS!")
                 if node_id not in mapped_nodes:
                     mapped_nodes[node_id] = {
                         "strand": node_info[node_id]["strand"],
@@ -150,7 +133,7 @@ def filter_reads(input_gam, nodes_file, output_json, threads=4):
     results = []
     processed_count = 0
     batch_index = 1
-    batch_size = 10000  # Save every 10,000 reads
+    batch_size = 1000000  # Save every 1,000,000 reads
 
     lock = threading.Lock()  # Lock for thread safety
 
@@ -163,7 +146,7 @@ def filter_reads(input_gam, nodes_file, output_json, threads=4):
 
             with lock:  # Ensure atomic update of shared variables
                 processed_count += 1
-                if processed_count % 5000 == 0:
+                if processed_count % 100000 == 0:
                     print(f"[INFO] Processed {processed_count} reads...")
 
             # Save and clear memory periodically
@@ -242,6 +225,7 @@ def main():
     parser.add_argument("-t", "--threads", type=int, default=4, help="Number of threads for processing")
 
     args = parser.parse_args()
+
 
     filter_reads(args.gam, args.nodes, args.json, args.threads)
 
