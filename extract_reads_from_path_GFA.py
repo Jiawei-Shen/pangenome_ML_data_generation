@@ -129,6 +129,7 @@ def process_read_wrapper(args):
     line, node_info = args
     return process_read(line, node_info)
 
+
 def filter_reads(input_gam, nodes_file, output_json, threads=4):
     """Filter reads from GAM that align to extracted nodes and group them by node using multiprocessing."""
     print("[INFO] Starting read filtering...")
@@ -149,8 +150,8 @@ def filter_reads(input_gam, nodes_file, output_json, threads=4):
                 results.append(mapped_nodes)
                 processed_count += 1
 
-            # Save every 5,000,000 reads
-            if processed_count % 5000000 == 0:
+            # Save every 100,000 reads
+            if processed_count > 0 and processed_count % 100000 == 0 and results:
                 batch_file = f"./tmp/{output_json}_batch_{batch_index}.json"
                 save_json(results, batch_file)
                 print(f"[INFO] Saved batch {batch_index} with {len(results)} records")
