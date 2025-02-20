@@ -99,7 +99,7 @@ def process_read(line, node_info):
         for mapping in read.get("path", {}).get("mapping", []):
             node_id = str(mapping["position"].get("node_id", ""))
             if node_id in node_info:
-                print("YESSSSSSSSS!")
+                print(node_id, len(node_info), type(node_info), "YESSSSSSSSS!")
                 if node_id not in mapped_nodes:
                     mapped_nodes[node_id] = {
                         "strand": node_info[node_id]["strand"],
