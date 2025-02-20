@@ -117,7 +117,7 @@ def process_read(line, node_info):
                         "reads": []
                     }
                 mapped_nodes[node_id]["reads"].append(read_info)
-
+        print(mapped_nodes)
         return mapped_nodes
 
     except json.JSONDecodeError:
@@ -146,6 +146,7 @@ def filter_reads(input_gam, nodes_file, output_json, threads=4):
             process_read_wrapper,
             ((line, node_info) for line in iter(process.stdout.readline, ''))
         ):
+            print(mapped_nodes)
             if mapped_nodes:
                 results.append(mapped_nodes)
                 processed_count += 1
