@@ -109,6 +109,7 @@ def process_read(line, node_info):
             node_id = str(mapping["position"].get("node_id", ""))
             print(node_id, type(node_id))
             if node_id in node_info:
+                print("yes")
                 if node_id not in mapped_nodes:
                     mapped_nodes[node_id] = {
                         "strand": node_info[node_id]["strand"],
@@ -118,7 +119,7 @@ def process_read(line, node_info):
                         "reads": []
                     }
                 mapped_nodes[node_id]["reads"].append(read_info)
-                print(mapped_nodes)
+                # print(mapped_nodes)
         return mapped_nodes
 
     except json.JSONDecodeError:
