@@ -115,7 +115,6 @@ def process_read(line, node_info):
                     "quality": read.get("quality", ""),
                     "path": read.get("path", {})
                 })
-        print(f"mapped_nodes: {mapped_nodes}")  if mapped_nodes else None
         return mapped_nodes if mapped_nodes else None
 
     except json.JSONDecodeError:
@@ -147,7 +146,6 @@ def filter_reads(input_gam, nodes_file, output_json, threads=4):
                 processed_count += 1
                 if processed_count % 100000 == 0:
                     print(f"[INFO] Processed {processed_count} reads...")
-                    print(f"[INFO] Current: {len(futures)}")
 
             # Save and clear memory periodically
             if processed_count % batch_size == 0:
