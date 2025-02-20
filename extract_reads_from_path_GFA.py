@@ -83,6 +83,7 @@ def extract_nodes_from_gfa(gfa_file, reference_name, chromosome, output_json="no
 
     print(f"[✔] Extracted nodes with IDs, strands, sequences, lengths, and start offsets using {threads} threads, and saved to {output_json}")
 
+
 def load_nodes(nodes_json):
     """Load node IDs, strands, sequences, and lengths from JSON."""
     with open(nodes_json, "r") as f:
@@ -90,8 +91,8 @@ def load_nodes(nodes_json):
     return data["nodes"]
 
 
-def process_read(line, node_info, node_read_map, processed_count, output_json):
-    """Check if the read aligns to any node and store it grouped by node."""
+def process_read(line, node_info):
+    """Process a read and map it to a node."""
     try:
         read = json.loads(line)
         read_info = {
@@ -102,61 +103,53 @@ def process_read(line, node_info, node_read_map, processed_count, output_json):
             "quality": read.get("quality", ""),
             "path": read.get("path", {})
         }
-        mapped_nodes = set()
+        mapped_nodes = {}
 
         for mapping in read.get("path", {}).get("mapping", []):
             node_id = str(mapping["position"].get("node_id", ""))
             if node_id in node_info:
-                mapped_nodes.add(node_id)
+                if node_id not in mapped_nodes:
+                    mapped_nodes[node_id] = {
+                        "strand": node_info[node_id]["strand"],
+                        "sequence": node_info[node_id]["sequence"],
+                        "length": node_info[node_id]["length"],
+                        "start_offset": node_info[node_id]["start_offset"],
+                        "reads": []
+                    }
+                mapped_nodes[node_id]["reads"].append(read_info)
 
-        for node_id in mapped_nodes:
-            if node_id not in node_read_map:
-                node_read_map[node_id] = {
-                    "strand": node_info[node_id]["strand"],
-                    "sequence": node_info[node_id]["sequence"],
-                    "length": node_info[node_id]["length"],
-                    "start_offset": node_info[node_id]["start_offset"],
-                    "reads": []
-                }
-            node_read_map[node_id]["reads"].append(read_info)
-
-        processed_count.value += 1
-        if processed_count.value % 5000000 == 0:
-            print(f"[INFO] Processed {processed_count.value} reads...")
-            save_json(node_read_map, f"./tmp/{output_json}_batch_{processed_count.value}.json")
-            node_read_map.clear()
+        return mapped_nodes
 
     except json.JSONDecodeError:
-        return  # Skip invalid JSON reads
+        return None  # Skip invalid JSON reads
 
-
-def process_read_wrapper(args):
-    """Wrapper function for processing a read with multiprocessing."""
-    line, node_info, node_read_map, processed_count, output_json = args
-    return process_read(line, node_info, node_read_map, processed_count, output_json)
 
 def filter_reads(input_gam, nodes_file, output_json, threads=4):
     """Filter reads from GAM that align to extracted nodes and group them by node using multiprocessing."""
     print("[INFO] Starting read filtering...")
     node_info = load_nodes(nodes_file)
-    manager = multiprocessing.Manager()
-    node_read_map = manager.dict()
-    processed_count = multiprocessing.Value("i", 0)
 
     process = subprocess.Popen(["vg", "view", "-a", input_gam], stdout=subprocess.PIPE, text=True)
 
+    results = []
     with multiprocessing.Pool(processes=threads) as pool:
-        for _ in pool.imap_unordered(
-            process_read_wrapper,  # Use a named function instead of lambda
-            ((line, node_info, node_read_map, processed_count, output_json) for line in iter(process.stdout.readline, ''))
+        for mapped_nodes in pool.imap_unordered(
+            process_read,
+            ((line, node_info) for line in iter(process.stdout.readline, ''))
         ):
-            pass
+            if mapped_nodes:
+                results.append(mapped_nodes)
 
-    print(f"[✔] Read filtering complete. {processed_count.value} reads processed.")
-    if node_read_map:
-        save_json(node_read_map, f"./tmp/{output_json}_batch_final.json")
+    # Merge all results
+    final_node_read_map = {}
+    for result in results:
+        for node_id, node_data in result.items():
+            if node_id not in final_node_read_map:
+                final_node_read_map[node_id] = node_data
+            else:
+                final_node_read_map[node_id]["reads"].extend(node_data["reads"])
 
-    merge_json_files("tmp", output_json)
+    save_json(final_node_read_map, output_json)
     print(f"[✔] Filtered reads grouped by node saved to {output_json}")
 
 
@@ -204,7 +197,6 @@ def main():
 
     args = parser.parse_args()
 
-    # extract_nodes_from_gfa(args.gfa_file, args.reference, args.chromosome, args.nodes, args.threads)
     filter_reads(args.gam, args.nodes, args.json, args.threads)
 
 
