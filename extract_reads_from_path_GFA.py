@@ -121,7 +121,7 @@ def process_read(line, node_info):
         return None  # Skip invalid JSON reads
 
 
-def filter_reads(input_gam, nodes_file, output_json, threads=4):
+def filter_reads(input_gam, nodes_file, output_json, tmp_dir, threads=4):
     """Filter reads from GAM that align to extracted nodes and group them by node using threading."""
     print("[INFO] Starting read filtering...")
     node_info = load_nodes(nodes_file)  # Load node info once
@@ -131,7 +131,7 @@ def filter_reads(input_gam, nodes_file, output_json, threads=4):
     results = []
     processed_count = 0
     batch_index = 1
-    batch_size = 10000000  # Save every 1,000,000 reads
+    batch_size = 20000000  # Save every 2,000,000 reads
 
     lock = threading.Lock()  # Lock for thread safety
 
@@ -144,7 +144,7 @@ def filter_reads(input_gam, nodes_file, output_json, threads=4):
 
             with lock:  # Ensure atomic update of shared variables
                 processed_count += 1
-                if processed_count % 500000 == 0:
+                if processed_count % 1000000 == 0:
                     print(f"[INFO] Processed {processed_count} reads...")
 
             # Save and clear memory periodically
@@ -156,7 +156,7 @@ def filter_reads(input_gam, nodes_file, output_json, threads=4):
                             results.append(mapped_nodes)
 
                     if results:
-                        batch_file = f"./tmp/{output_json}_batch_{batch_index}.json"
+                        batch_file = f"./{tmp_dir}/{output_json}_batch_{batch_index}.json"
                         save_json(results, batch_file)
                         print(f"[INFO] Saved batch {batch_index} with {len(results)} records")
                         results.clear()  # Free memory
@@ -172,11 +172,11 @@ def filter_reads(input_gam, nodes_file, output_json, threads=4):
                 results.append(mapped_nodes)
 
         if results:
-            batch_file = f"./tmp/{output_json}_batch_final.json"
+            batch_file = f"./{tmp_dir}/{output_json}_batch_final.json"
             save_json(results, batch_file)
             print(f"[INFO] Saved final batch with {len(results)} records")
 
-    merge_json_files("tmp", output_json)
+    merge_json_files(tmp_dir, output_json)
     print(f"[✔] Filtered reads grouped by node saved to {output_json}")
 
 
@@ -221,11 +221,12 @@ def main():
     parser.add_argument("-n", "--nodes", default="nodes.json", help="Output JSON file for extracted node data")
     parser.add_argument("-j", "--json", default="grouped_reads.json", help="Output JSON file grouping reads by node")
     parser.add_argument("-t", "--threads", type=int, default=4, help="Number of threads for processing")
+    parser.add_argument("--tmp", default="tmp", help="The temporal directory of the output JSON files")
 
     args = parser.parse_args()
 
     # extract_nodes_from_gfa(args.gfa_file, args.reference, args.chromosome, args.nodes, args.threads)
-    filter_reads(args.gam, args.nodes, args.json, args.threads)
+    filter_reads(args.gam, args.nodes, args.json, args.threads, args.tmp)
 
 
 if __name__ == "__main__":
