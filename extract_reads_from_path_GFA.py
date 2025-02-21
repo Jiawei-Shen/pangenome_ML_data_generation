@@ -226,7 +226,7 @@ def main():
     args = parser.parse_args()
 
     # extract_nodes_from_gfa(args.gfa_file, args.reference, args.chromosome, args.nodes, args.threads)
-    filter_reads(args.gam, args.nodes, args.json, args.threads, args.tmp)
+    filter_reads(args.gam, args.nodes, args.json, args.tmp, args.threads)
 
 
 if __name__ == "__main__":
