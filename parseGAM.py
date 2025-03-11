@@ -10,21 +10,17 @@ def parse_gam(file_path):
         while True:
             aln = vg_pb2.Alignment()
             try:
-                # Read the first 4 bytes (length of next message in little-endian)
-                length_bytes = f.read(4)
+                length_bytes = f.read(4)  # Read length prefix
                 if not length_bytes:
-                    break  # End of file
+                    break
 
-                # Convert the 4-byte length into an integer
                 length = struct.unpack("<I", length_bytes)[0]
-
-                # Read 'length' bytes for the Protobuf message
                 data = f.read(length)
+
                 if len(data) != length:
                     print("Unexpected end of file while reading alignment.")
                     break
 
-                # Parse the Protobuf message
                 aln.ParseFromString(data)
                 alignments.append(aln)
 
@@ -35,7 +31,7 @@ def parse_gam(file_path):
     return alignments
 
 
-# Example usage
+# Use the original BGZF-compressed GAM file
 gam_file = "/scratch/jshen/Qichen_data/test_gam/LIB027514_223KKHLT4_S13_L006_001_hprc_hg38_v11.gam"
 alignments = parse_gam(gam_file)
 
