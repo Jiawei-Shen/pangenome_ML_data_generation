@@ -1,25 +1,31 @@
-import vg_pb2  # Import generated protobuf classes
-import pysam  # For reading BGZF files
+import vg_pb2
+import pysam
+import struct
 
 
 def parse_gam(file_path):
     alignments = []
-    with pysam.BGZFile(file_path, "rb") as f:  # Open BGZF-compressed GAM file
+
+    with pysam.BGZFile(file_path, "rb") as f:
         while True:
             aln = vg_pb2.Alignment()
             try:
-                # Read the 4-byte little-endian length prefix
+                # Read the first 4 bytes (length of next message in little-endian)
                 length_bytes = f.read(4)
                 if not length_bytes:
                     break  # End of file
 
-                length = int.from_bytes(length_bytes, byteorder="little")
-                data = f.read(length)  # Read the full protobuf message
+                # Convert the 4-byte length into an integer
+                length = struct.unpack("<I", length_bytes)[0]
 
+                # Read 'length' bytes for the Protobuf message
+                data = f.read(length)
                 if len(data) != length:
-                    raise ValueError("Unexpected end of file while reading alignment.")
+                    print("Unexpected end of file while reading alignment.")
+                    break
 
-                aln.ParseFromString(data)  # Deserialize the Protobuf message
+                # Parse the Protobuf message
+                aln.ParseFromString(data)
                 alignments.append(aln)
 
             except Exception as e:
@@ -34,5 +40,5 @@ gam_file = "/scratch/jshen/Qichen_data/test_gam/LIB027514_223KKHLT4_S13_L006_001
 alignments = parse_gam(gam_file)
 
 # Print first 5 alignments
-for aln in alignments[:5]:
-    print(f"Read Name: {aln.name}, Sequence: {aln.sequence}")
+for i, aln in enumerate(alignments[:5]):
+    print(f"Alignment {i + 1}: Read Name: {aln.name}, Sequence: {aln.sequence}")
