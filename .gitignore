@@ -4,6 +4,7 @@ Qichen_trueset_VCF/
 scripts_sh/
 BAM_files/
 GRCh38_references/
+vg/
 .idea/
 ./HG005_variants.json
 ./.gitignore

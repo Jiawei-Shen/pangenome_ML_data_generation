@@ -16,7 +16,7 @@ def parse_gam(gam_file):
     return alignments
 
 if __name__ == "__main__":
-    gam_file = "input.gam"  # Change this to your actual GAM file path
+    gam_file = "/scratch/jshen/Qichen_data/test_gam/LIB027514_223KKHLT4_S13_L006_001_hprc_hg38_v11.gam"  # Change this to your actual GAM file path
     alignments = parse_gam(gam_file)
 
     # Print some parsed alignments
