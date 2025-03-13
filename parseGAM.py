@@ -35,7 +35,7 @@ def gam_to_json(alignments):
 
 def main():
     parser = argparse.ArgumentParser(description="Parse a binary GAM file and output alignments in JSON format.")
-    parser.add_argument("input_gam", default="LIB027514_223KKHLT4_S13_L006_001_hprc_hg38_v11.gam", help="Path to the input GAM file")
+    parser.add_argument("input_gam", default="filtered.gam", help="Path to the input GAM file")
     parser.add_argument("-o", "--output", help="Path to the output JSON file (optional)")
     parser.add_argument("-n", "--num", type=int, default=5, help="Number of alignments to display (default: 5)")
 
