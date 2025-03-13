@@ -12,6 +12,7 @@ def read_gam(file_path):
     with gzip.open(file_path, "rb") as f:  # GAM files are BGZF compressed
         buf = f.read()
         pos = 0
+        print("Done reading the GAM file into the buffer.")
 
         while pos < len(buf):
             msg_len, new_pos = _DecodeVarint32(buf, pos)  # Read message length
