@@ -3,13 +3,20 @@ import gzip
 import json
 from google.protobuf.internal.decoder import _DecodeVarint32
 from vg_pb2 import Alignment  # Import the compiled Protobuf message
+import pysam
+
+
+def read_gam_bgzf(filepath):
+    with pysam.tabix_iterator(filepath) as f:
+        data = f.read()
+        print("Read", len(data), "bytes from BGZF-compressed GAM file")
 
 
 def read_gam(file_path):
     """Reads a GAM file and parses alignments."""
     alignments = []
 
-    with gzip.open(file_path, "rb") as f:  # GAM files are BGZF compressed
+    with open(file_path, "rb") as f:  # GAM files are BGZF compressed
         buf = f.read()
         pos = 0
         print("Done reading the GAM file into the buffer.")
@@ -42,6 +49,8 @@ def main():
     args = parser.parse_args()
 
     print(f"Reading GAM file: {args.input_gam}")
+    # read_gam_bgzf(args.input_gam)
+
     alignments = read_gam(args.input_gam)
 
     json_output = gam_to_json(alignments)
