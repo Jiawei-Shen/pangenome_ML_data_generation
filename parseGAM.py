@@ -1,57 +1,58 @@
-import struct
-import vg_pb2  # Make sure you have compiled vg.proto to vg_pb2.py
+import argparse
 import gzip
+import json
+from google.protobuf.internal.decoder import _DecodeVarint32
+from vg_pb2 import Alignment  # Import the compiled Protobuf message
 
 
-def read_varint(file):
-    """ Reads a varint from a binary file """
-    shift = 0
-    result = 0
-    while True:
-        byte = file.read(1)
-        if not byte:
-            raise EOFError("Unexpected end of file while reading varint")
-        b = ord(byte)
-        result |= (b & 0x7F) << shift
-        if not (b & 0x80):
-            break
-        shift += 7
-    return result
-
-
-def parse_gam(file_path):
-    """ Reads a GAM file in binary format and parses it into Alignment objects """
+def read_gam(file_path):
+    """Reads a GAM file and parses alignments."""
     alignments = []
 
-    with gzip.open(file_path, "rb") as f:  # Read BGZF (GAM) file in binary mode
-        while True:
-            aln = vg_pb2.Alignment()
-            try:
-                length = read_varint(f)  # Read the length of the next alignment
-                data = f.read(length)  # Read the protobuf-encoded data
+    with gzip.open(file_path, "rb") as f:  # GAM files are BGZF compressed
+        buf = f.read()
+        pos = 0
 
-                if len(data) != length:
-                    print("Unexpected end of file while reading alignment.")
-                    break
+        while pos < len(buf):
+            msg_len, new_pos = _DecodeVarint32(buf, pos)  # Read message length
+            pos = new_pos
+            print(msg_len, new_pos)
+            message = buf[pos: pos + msg_len]  # Extract message
+            pos += msg_len
 
-                aln.ParseFromString(data)  # Parse the binary data into a Protobuf message
-                alignments.append(aln)
-
-            except EOFError:
-                break
-            except Exception as e:
-                print(f"Error parsing alignment: {e}")
-                break
+            alignment = Alignment()
+            alignment.ParseFromString(message)  # Parse Protobuf message
+            alignments.append(alignment)
 
     return alignments
 
 
-# Path to your binary GAM file
-gam_file = "/scratch/jshen/Qichen_data/test_gam/LIB027514_223KKHLT4_S13_L006_001_hprc_hg38_v11.gam"
+def gam_to_json(alignments):
+    """Converts alignments to JSON format."""
+    return [json.loads(aln.SerializeToJsonString()) for aln in alignments]
 
-# Read alignments
-alignments = parse_gam(gam_file)
 
-# Print the first 5 parsed alignments
-for i, aln in enumerate(alignments[:5]):
-    print(f"Alignment {i + 1}: Read Name: {aln.name}, Sequence Length: {len(aln.sequence)}")
+def main():
+    parser = argparse.ArgumentParser(description="Parse a binary GAM file and output alignments in JSON format.")
+    parser.add_argument("input_gam", default="LIB027514_223KKHLT4_S13_L006_001_hprc_hg38_v11.gam", help="Path to the input GAM file")
+    parser.add_argument("-o", "--output", help="Path to the output JSON file (optional)")
+    parser.add_argument("-n", "--num", type=int, default=5, help="Number of alignments to display (default: 5)")
+
+    args = parser.parse_args()
+
+    print(f"Reading GAM file: {args.input_gam}")
+    alignments = read_gam(args.input_gam)
+
+    json_output = gam_to_json(alignments)
+
+    if args.output:
+        with open(args.output, "w") as out_file:
+            json.dump(json_output, out_file, indent=2)
+        print(f"Saved output to {args.output}")
+    else:
+        # Print the first N alignments
+        print(json.dumps(json_output[:args.num], indent=2))
+
+
+if __name__ == "__main__":
+    main()
