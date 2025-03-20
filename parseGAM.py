@@ -67,7 +67,7 @@ def parse_gam_file_groups(filename, expected_tag="GAM"):
                 print("Unexpected EOF when reading type tag bytes.")
                 break
             tag = tag_bytes.decode("utf-8")
-            print(f"  Type tag: {tag}")
+            # print(f"  Type tag: {tag}")
 
             if tag != expected_tag:
                 print("  Skipping group with unexpected tag.")
