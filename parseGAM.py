@@ -105,10 +105,13 @@ def main():
     parser.add_argument("filename", help="Path to the GAM file")
     args = parser.parse_args()
 
+    count = 0
     for alignment in parse_gam_file(args.filename):
         # Process the alignment as needed. Here we simply print the full message.
-        print("Parsed Alignment:")
-        print(alignment)
+        print(f"\rProgress: {count}%", end="", flush=True)
+        count += 1
+        # print("Parsed Alignment:")
+        # print(alignment)
 
 
 if __name__ == "__main__":
