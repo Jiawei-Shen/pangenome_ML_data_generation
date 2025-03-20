@@ -111,7 +111,7 @@ def process_group(group_tuple):
     return (group_number, alignments)
 
 
-def process_groups_pipeline(filename, threads, max_pending=10):
+def process_groups_pipeline(filename, threads, max_pending=100):
     """
     Read groups from the GAM file and process them concurrently as they are read.
     The max_pending parameter limits the number of groups in flight.
@@ -146,10 +146,13 @@ def main():
     args = parser.parse_args()
 
     start_time = time.perf_counter()
+    count = 0
     for group_number, alignments in process_groups_pipeline(args.filename, args.threads, args.max_pending):
-        print(f"Processed Group {group_number}: Parsed {len(alignments)} alignments")
+        # print(f"Processed Group {group_number}: Parsed {len(alignments)} alignments")
         for alignment in alignments:
-            print(f"  Alignment name: {alignment.name}")
+            # print(f"  Alignment name: {alignment.name}")
+            print(f"\rProgress: {count}%", end="", flush=True)
+            count += 1
     end_time = time.perf_counter()
     print(f"Elapsed time: {end_time - start_time:.6f} seconds")
 
