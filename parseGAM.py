@@ -94,7 +94,7 @@ def parse_gam_file(filename, expected_tag="GAM"):
                         break
                     alignment = vg_pb2.Alignment()
                     alignment.ParseFromString(msg_bytes)
-                    print(f"   Message {i + 1}: {msg_size} bytes, Alignment name: {alignment.name}")
+                    print(f"\r   Message {i + 1}: {msg_size} bytes, Alignment name: {alignment.name}", end="", flush=True)
                     yield alignment
     finally:
         f.close()
@@ -108,7 +108,7 @@ def main():
     count = 0
     for alignment in parse_gam_file(args.filename):
         # Process the alignment as needed. Here we simply print the full message.
-        print(f"\rProgress: {count}", end="", flush=True)
+        print(f"\n\rProgress: {count}", end="", flush=True)
         count += 1
         # print("Parsed Alignment:")
         # print(alignment)
