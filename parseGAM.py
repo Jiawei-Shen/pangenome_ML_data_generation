@@ -3,8 +3,8 @@ import argparse
 import gzip
 import os
 import time
-import sys
-import concurrent.futures
+import threading
+import queue
 import vg_pb2  # Import the generated protobuf module
 
 
@@ -36,8 +36,8 @@ def parse_gam_file_groups(filename, expected_tag="GAM"):
     Generator that traverses the GAM file group by group.
 
     Each group starts with a varint count and a type tag. If the tag matches
-    the expected_tag (default "GAM"), the generator yields a tuple:
-    (group_number, list of raw message bytes for each alignment in the group).
+    expected_tag, yield a tuple:
+       (group_number, list of raw message bytes for each alignment in the group)
     """
     if is_gzipped(filename):
         f = gzip.open(filename, 'rb')
@@ -52,7 +52,7 @@ def parse_gam_file_groups(filename, expected_tag="GAM"):
             except EOFError:
                 break  # End of file reached
             group_number += 1
-            # print(f"Reading Group {group_number}: {group_count} messages")
+            print(f"[Producer] Reading Group {group_number}: {group_count} messages")
 
             if group_count == 0:
                 continue
@@ -60,17 +60,17 @@ def parse_gam_file_groups(filename, expected_tag="GAM"):
             try:
                 tag_size = read_varint(f)
             except EOFError:
-                print("Unexpected EOF when reading type tag size.")
+                print("[Producer] Unexpected EOF when reading type tag size.")
                 break
             tag_bytes = f.read(tag_size)
             if len(tag_bytes) != tag_size:
-                print("Unexpected EOF when reading type tag bytes.")
+                print("[Producer] Unexpected EOF when reading type tag bytes.")
                 break
             tag = tag_bytes.decode("utf-8")
-            # print(f"  Type tag: {tag}")
+            print(f"[Producer]  Type tag: {tag}")
 
             if tag != expected_tag:
-                print("  Skipping group with unexpected tag.")
+                print(f"[Producer]  Skipping group with unexpected tag: {tag}")
                 # Skip remaining messages in this group.
                 for _ in range(group_count - 1):
                     try:
@@ -85,11 +85,11 @@ def parse_gam_file_groups(filename, expected_tag="GAM"):
                     try:
                         msg_size = read_varint(f)
                     except EOFError:
-                        print("Unexpected EOF when reading message size.")
+                        print("[Producer] Unexpected EOF when reading message size.")
                         break
                     msg_bytes = f.read(msg_size)
                     if len(msg_bytes) != msg_size:
-                        print("Unexpected EOF when reading message bytes.")
+                        print("[Producer] Unexpected EOF when reading message bytes.")
                         break
                     messages.append(msg_bytes)
                 yield (group_number, messages)
@@ -111,48 +111,67 @@ def process_group(group_tuple):
     return (group_number, alignments)
 
 
-def process_groups_pipeline(filename, threads, max_pending=100):
+def group_producer(filename, q, expected_tag="GAM"):
     """
-    Read groups from the GAM file and process them concurrently as they are read.
-    The max_pending parameter limits the number of groups in flight.
-    Yields processed group results as soon as they are available.
+    Read groups from the GAM file and put each group into the queue.
+    After finishing, put a sentinel (None) into the queue.
     """
-    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
-        pending_futures = []
-        # Iterate over groups one at a time
-        for group in parse_gam_file_groups(filename):
-            future = executor.submit(process_group, group)
-            pending_futures.append(future)
-            # If too many futures are pending, wait for at least one to finish.
-            if len(pending_futures) >= max_pending:
-                done, not_done = concurrent.futures.wait(
-                    pending_futures, return_when=concurrent.futures.FIRST_COMPLETED)
-                for completed in done:
-                    yield completed.result()
-                pending_futures = list(not_done)  # Convert set back to list
-        # Yield any remaining futures
-        for future in concurrent.futures.as_completed(pending_futures):
-            yield future.result()
+    for group in parse_gam_file_groups(filename, expected_tag):
+        q.put(group)
+    q.put(None)  # Sentinel to signal completion
+
+
+def group_consumer(q):
+    """
+    Continuously get groups from the queue, process them, and output results.
+    Exits when it sees the sentinel (None).
+    """
+    while True:
+        group = q.get()
+        if group is None:
+            # Propagate the sentinel to other consumers.
+            q.put(None)
+            q.task_done()
+            break
+        group_number, alignments = process_group(group)
+        print(f"[Consumer] Processed Group {group_number}: Parsed {len(alignments)} alignments")
+        for alignment in alignments:
+            print(f"  Alignment name: {alignment.name}")
+        q.task_done()
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Multi-threaded parsing of a GAM file by group using vg_pb2.")
+        description="Pipeline multi-threaded parsing of a GAM file by group using vg_pb2.")
     parser.add_argument("filename", help="Path to the GAM file")
     parser.add_argument("--threads", type=int, default=32,
-                        help="Number of worker threads to use (default: 4)")
-    parser.add_argument("--max_pending", type=int, default=1000,
-                        help="Maximum number of groups to process concurrently (default: 10)")
+                        help="Number of consumer threads to use (default: 32)")
+    parser.add_argument("--max_pending", type=int, default=100,
+                        help="Maximum number of groups to buffer (default: 100)")
     args = parser.parse_args()
 
     start_time = time.perf_counter()
-    count = 0
-    for group_number, alignments in process_groups_pipeline(args.filename, args.threads, args.max_pending):
-        # print(f"Processed Group {group_number}: Parsed {len(alignments)} alignments")
-        for alignment in alignments:
-            # print(f"  Alignment name: {alignment.name}")
-            print(f"\rProgress: {count}%", end="", flush=True)
-            count += 1
+    q = queue.Queue(maxsize=args.max_pending)
+
+    # Start the producer thread.
+    prod_thread = threading.Thread(target=group_producer, args=(args.filename, q, "GAM"))
+    prod_thread.start()
+
+    # Start consumer threads.
+    consumers = []
+    for i in range(args.threads):
+        t = threading.Thread(target=group_consumer, args=(q,))
+        t.start()
+        consumers.append(t)
+
+    # Wait for the producer to finish.
+    prod_thread.join()
+    # Wait until the queue is fully processed.
+    q.join()
+    # Wait for all consumers to finish.
+    for t in consumers:
+        t.join()
+
     end_time = time.perf_counter()
     print(f"Elapsed time: {end_time - start_time:.6f} seconds")
 
