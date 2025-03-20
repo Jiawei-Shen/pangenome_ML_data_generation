@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 import argparse
-import gzip
 import io
 import os
 import sys
 import concurrent.futures
+
+# Try to use pysam for BGZF support.
+try:
+    import pysam
+
+    USE_PYSAM = True
+except ImportError:
+    import gzip
+
+    USE_PYSAM = False
+
 import vg_pb2  # Import the generated protobuf module
-import time
 
 
 def read_varint(stream):
@@ -25,11 +34,23 @@ def read_varint(stream):
     return result
 
 
-def is_gzipped(filename):
-    """Check if the file is gzipped by reading its magic number."""
-    with open(filename, 'rb') as f:
-        magic = f.read(2)
-    return magic == b'\x1f\x8b'
+def open_file(filename):
+    """
+    Open the file for reading in binary mode.
+    If pysam is available, use pysam.BGZFFile to properly handle BGZF-compressed files.
+    Otherwise, if the file is gzipped, use gzip.open.
+    """
+    if USE_PYSAM:
+        return pysam.BGZFFile(filename, "rb")
+    else:
+        # Fallback to gzip if pysam is not installed.
+        with open(filename, 'rb') as f:
+            magic = f.read(2)
+        if magic == b'\x1f\x8b':
+            import gzip
+            return gzip.open(filename, "rb")
+        else:
+            return open(filename, "rb")
 
 
 def parse_gam_file_groups(filename, expected_tag="GAM"):
@@ -38,11 +59,8 @@ def parse_gam_file_groups(filename, expected_tag="GAM"):
     Each group is a tuple (group_number, messages) where messages is a list
     of raw protobuf bytes for each Alignment.
     """
-    # Open the file using BufferedReader for faster I/O.
-    if is_gzipped(filename):
-        f = gzip.open(filename, 'rb')
-    else:
-        f = open(filename, 'rb')
+    f = open_file(filename)
+    # Wrap in BufferedReader for faster I/O.
     f = io.BufferedReader(f)
 
     group_number = 0
@@ -53,8 +71,6 @@ def parse_gam_file_groups(filename, expected_tag="GAM"):
             except EOFError:
                 break  # End of file reached
             group_number += 1
-            # Print out debug info about the group
-            # (Optional: remove or comment out these prints in production.)
             print(f"Group {group_number}: {group_count} messages")
 
             if group_count == 0:
@@ -128,23 +144,13 @@ def main():
 
     # Use a ThreadPoolExecutor to process groups in parallel.
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as executor:
-        # Map the process_group function to each group.
         future_to_group = {executor.submit(process_group, group): group for group in groups}
         for future in concurrent.futures.as_completed(future_to_group):
             group_number, alignments = future.result()
             print(f"Processed Group {group_number}: Parsed {len(alignments)} alignments")
-            # Here you can process each alignment further.
             for alignment in alignments:
-                # For demonstration, print the alignment name.
                 print(f"  Alignment name: {alignment.name}")
 
 
 if __name__ == "__main__":
-    # main()
-    start_time = time.time()  # Record start time
-    # Your code here
-    main()  # Example task (simulating delay)
-    end_time = time.time()  # Record end time
-
-    elapsed_time = end_time - start_time
-    print(f"Elapsed time: {elapsed_time:.6f} seconds")
+    main()
