@@ -4,6 +4,7 @@ import gzip
 import os
 import time
 import sys
+import concurrent.futures
 import vg_pb2  # Import the generated protobuf module
 
 
@@ -30,15 +31,13 @@ def is_gzipped(filename):
     return magic == b'\x1f\x8b'
 
 
-def parse_gam_file(filename, expected_tag="GAM"):
+def parse_gam_file_groups(filename, expected_tag="GAM"):
     """
-    Parse a GAM file with the framing format.
+    Parse the GAM file using the framing format and yield groups.
 
-    Each group starts with a varint count and a type tag. If the tag matches
-    the expected_tag (default "GAM"), then the subsequent messages in the group
-    are parsed as vg_pb2.Alignment objects.
+    Each group is a tuple (group_number, messages), where messages is a list
+    of raw protobuf bytes for each Alignment in the group.
     """
-    # Open the file; if gzipped, use gzip.open
     if is_gzipped(filename):
         f = gzip.open(filename, 'rb')
     else:
@@ -72,7 +71,7 @@ def parse_gam_file(filename, expected_tag="GAM"):
 
             if tag != expected_tag:
                 print("  Skipping group with unexpected tag.")
-                # Skip remaining messages in this group
+                # Skip the remaining messages in this group.
                 for _ in range(group_count - 1):
                     try:
                         msg_size = read_varint(f)
@@ -81,7 +80,7 @@ def parse_gam_file(filename, expected_tag="GAM"):
                     f.seek(msg_size, os.SEEK_CUR)
                 continue
             else:
-                # For each remaining message in the group, decode it as an Alignment.
+                messages = []
                 for i in range(group_count - 1):
                     try:
                         msg_size = read_varint(f)
@@ -92,34 +91,53 @@ def parse_gam_file(filename, expected_tag="GAM"):
                     if len(msg_bytes) != msg_size:
                         print("Unexpected EOF when reading message bytes.")
                         break
-                    alignment = vg_pb2.Alignment()
-                    alignment.ParseFromString(msg_bytes)
-                    print(f"\r   Message {i + 1}: {msg_size} bytes, Alignment name: {alignment.name}", end="", flush=True)
-                    yield alignment
+                    messages.append(msg_bytes)
+                yield (group_number, messages)
     finally:
         f.close()
 
 
+def process_group(group_tuple):
+    """
+    Process a group of raw message bytes by parsing each one into a vg_pb2.Alignment.
+    Returns a tuple (group_number, list of parsed alignments).
+    """
+    group_number, messages = group_tuple
+    alignments = []
+    for i, msg_bytes in enumerate(messages):
+        alignment = vg_pb2.Alignment()
+        alignment.ParseFromString(msg_bytes)
+        alignments.append(alignment)
+    return (group_number, alignments)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Parse a GAM file using vg_pb2 and print alignments.")
+    parser = argparse.ArgumentParser(
+        description="Multi-threaded group-level traversal of a GAM file using vg_pb2.")
     parser.add_argument("filename", help="Path to the GAM file")
+    parser.add_argument("--threads", type=int, default=4,
+                        help="Number of worker threads to use (default: 4)")
     args = parser.parse_args()
 
-    count = 0
-    for alignment in parse_gam_file(args.filename):
-        # Process the alignment as needed. Here we simply print the full message.
-        print(f"\n\rProgress: {count}", end="", flush=True)
-        count += 1
-        # print("Parsed Alignment:")
-        # print(alignment)
+    start_time = time.perf_counter()
+    # Collect groups from the file generator
+    groups = list(parse_gam_file_groups(args.filename))
+    print(f"Found {len(groups)} groups with expected tag.")
+
+    # Process each group concurrently
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as executor:
+        future_to_group = {executor.submit(process_group, group): group for group in groups}
+        for future in concurrent.futures.as_completed(future_to_group):
+            group_number, alignments = future.result()
+            print(f"Processed Group {group_number}: Parsed {len(alignments)} alignments")
+            # For each alignment in the group, perform any needed processing.
+            # Here, we simply print the alignment name.
+            for alignment in alignments:
+                print(f"  Alignment name: {alignment.name}")
+
+    end_time = time.perf_counter()
+    print(f"Elapsed time: {end_time - start_time:.6f} seconds")
 
 
 if __name__ == "__main__":
-    # main()
-    start_time = time.perf_counter()
-    # Your code here
-    main()  # Simulating delay
-    end_time = time.perf_counter()
-
-    elapsed_time = end_time - start_time
-    print(f"Elapsed time: {elapsed_time:.6f} seconds")
+    main()
