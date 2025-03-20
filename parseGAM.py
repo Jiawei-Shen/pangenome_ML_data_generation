@@ -1,20 +1,9 @@
 #!/usr/bin/env python3
 import argparse
-import io
+import gzip
 import os
+import time
 import sys
-import concurrent.futures
-
-# Try to use pysam for BGZF support.
-try:
-    import pysam
-
-    USE_PYSAM = True
-except ImportError:
-    import gzip
-
-    USE_PYSAM = False
-
 import vg_pb2  # Import the generated protobuf module
 
 
@@ -34,34 +23,26 @@ def read_varint(stream):
     return result
 
 
-def open_file(filename):
+def is_gzipped(filename):
+    """Check if the file is gzipped by reading its magic number."""
+    with open(filename, 'rb') as f:
+        magic = f.read(2)
+    return magic == b'\x1f\x8b'
+
+
+def parse_gam_file(filename, expected_tag="GAM"):
     """
-    Open the file for reading in binary mode.
-    If pysam is available, use pysam.BGZFFile to properly handle BGZF-compressed files.
-    Otherwise, if the file is gzipped, use gzip.open.
+    Parse a GAM file with the framing format.
+
+    Each group starts with a varint count and a type tag. If the tag matches
+    the expected_tag (default "GAM"), then the subsequent messages in the group
+    are parsed as vg_pb2.Alignment objects.
     """
-    if USE_PYSAM:
-        return pysam.BGZFFile(filename, "rb")
+    # Open the file; if gzipped, use gzip.open
+    if is_gzipped(filename):
+        f = gzip.open(filename, 'rb')
     else:
-        # Fallback to gzip if pysam is not installed.
-        with open(filename, 'rb') as f:
-            magic = f.read(2)
-        if magic == b'\x1f\x8b':
-            import gzip
-            return gzip.open(filename, "rb")
-        else:
-            return open(filename, "rb")
-
-
-def parse_gam_file_groups(filename, expected_tag="GAM"):
-    """
-    Parse the GAM file using the framing format and yield groups.
-    Each group is a tuple (group_number, messages) where messages is a list
-    of raw protobuf bytes for each Alignment.
-    """
-    f = open_file(filename)
-    # Wrap in BufferedReader for faster I/O.
-    f = io.BufferedReader(f)
+        f = open(filename, 'rb')
 
     group_number = 0
     try:
@@ -91,7 +72,7 @@ def parse_gam_file_groups(filename, expected_tag="GAM"):
 
             if tag != expected_tag:
                 print("  Skipping group with unexpected tag.")
-                # Skip the remaining messages in this group.
+                # Skip remaining messages in this group
                 for _ in range(group_count - 1):
                     try:
                         msg_size = read_varint(f)
@@ -100,7 +81,7 @@ def parse_gam_file_groups(filename, expected_tag="GAM"):
                     f.seek(msg_size, os.SEEK_CUR)
                 continue
             else:
-                messages = []
+                # For each remaining message in the group, decode it as an Alignment.
                 for i in range(group_count - 1):
                     try:
                         msg_size = read_varint(f)
@@ -111,46 +92,31 @@ def parse_gam_file_groups(filename, expected_tag="GAM"):
                     if len(msg_bytes) != msg_size:
                         print("Unexpected EOF when reading message bytes.")
                         break
-                    messages.append(msg_bytes)
-                yield (group_number, messages)
+                    alignment = vg_pb2.Alignment()
+                    alignment.ParseFromString(msg_bytes)
+                    print(f"   Message {i + 1}: {msg_size} bytes, Alignment name: {alignment.name}")
+                    yield alignment
     finally:
         f.close()
 
 
-def process_group(group_tuple):
-    """
-    Process a group of raw message bytes by parsing each one into a vg_pb2.Alignment.
-    Returns a tuple (group_number, list of parsed alignments).
-    """
-    group_number, messages = group_tuple
-    alignments = []
-    for i, msg_bytes in enumerate(messages):
-        alignment = vg_pb2.Alignment()
-        alignment.ParseFromString(msg_bytes)
-        alignments.append(alignment)
-    return (group_number, alignments)
-
-
 def main():
-    parser = argparse.ArgumentParser(
-        description="Parse a GAM file using vg_pb2 in parallel and print alignments.")
+    parser = argparse.ArgumentParser(description="Parse a GAM file using vg_pb2 and print alignments.")
     parser.add_argument("filename", help="Path to the GAM file")
-    parser.add_argument("--threads", type=int, default=4,
-                        help="Number of worker threads to use (default: 4)")
     args = parser.parse_args()
 
-    groups = list(parse_gam_file_groups(args.filename))
-    print(f"Found {len(groups)} groups with expected tag.")
-
-    # Use a ThreadPoolExecutor to process groups in parallel.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as executor:
-        future_to_group = {executor.submit(process_group, group): group for group in groups}
-        for future in concurrent.futures.as_completed(future_to_group):
-            group_number, alignments = future.result()
-            print(f"Processed Group {group_number}: Parsed {len(alignments)} alignments")
-            for alignment in alignments:
-                print(f"  Alignment name: {alignment.name}")
+    for alignment in parse_gam_file(args.filename):
+        # Process the alignment as needed. Here we simply print the full message.
+        print("Parsed Alignment:")
+        print(alignment)
 
 
 if __name__ == "__main__":
-    main()
+    # main()
+    start_time = time.perf_counter()
+    # Your code here
+    main()  # Simulating delay
+    end_time = time.perf_counter()
+
+    elapsed_time = end_time - start_time
+    print(f"Elapsed time: {elapsed_time:.6f} seconds")
