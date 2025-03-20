@@ -52,7 +52,7 @@ def parse_gam_file_groups(filename, expected_tag="GAM"):
             except EOFError:
                 break  # End of file reached
             group_number += 1
-            print(f"Reading Group {group_number}: {group_count} messages")
+            # print(f"Reading Group {group_number}: {group_count} messages")
 
             if group_count == 0:
                 continue
