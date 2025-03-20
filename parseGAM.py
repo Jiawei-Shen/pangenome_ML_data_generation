@@ -108,7 +108,7 @@ def main():
     count = 0
     for alignment in parse_gam_file(args.filename):
         # Process the alignment as needed. Here we simply print the full message.
-        print(f"\rProgress: {count}%", end="", flush=True)
+        print(f"\rProgress: {count}", end="", flush=True)
         count += 1
         # print("Parsed Alignment:")
         # print(alignment)
