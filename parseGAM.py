@@ -135,12 +135,9 @@ def process_groups_pipeline(filename, threads, max_pending=10):
             yield future.result()
 
 
-def print_group_result(group_result):
-    """Print the processed group result."""
-    group_number, alignments = group_result
-    print(f"Processed Group {group_number}: Parsed {len(alignments)} alignments")
-    for alignment in alignments:
-        print(f"  Alignment name: {alignment.name}")
+def print_alignment(alignment):
+    """Print a single alignment's name."""
+    print(f"  Alignment name: {alignment.name}")
 
 
 def main():
@@ -154,17 +151,12 @@ def main():
     args = parser.parse_args()
 
     start_time = time.perf_counter()
-
-    # Use a ThreadPoolExecutor to concurrently print group results
-    with concurrent.futures.ThreadPoolExecutor() as print_executor:
-        print_futures = []
-        # Submit each group's printing task as soon as it's processed
-        for group_result in process_groups_pipeline(args.filename, args.threads, args.max_pending):
-            future = print_executor.submit(print_group_result, group_result)
-            print_futures.append(future)
-        # Wait for all printing tasks to complete
-        concurrent.futures.wait(print_futures)
-
+    for group_number, alignments in process_groups_pipeline(args.filename, args.threads, args.max_pending):
+        print(f"Processed Group {group_number}: Parsed {len(alignments)} alignments")
+        # Use a ThreadPoolExecutor to concurrently print each alignment's name.
+        with concurrent.futures.ThreadPoolExecutor() as inner_executor:
+            futures = [inner_executor.submit(print_alignment, alignment) for alignment in alignments]
+            concurrent.futures.wait(futures)
     end_time = time.perf_counter()
     print(f"Elapsed time: {end_time - start_time:.6f} seconds")
 
