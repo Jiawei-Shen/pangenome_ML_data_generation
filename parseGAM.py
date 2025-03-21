@@ -5,28 +5,23 @@ import os
 import time
 import sys
 import concurrent.futures
-import io
-from google.protobuf.internal.decoder import _DecodeVarint
 import vg_pb2  # Import the generated protobuf module
 
 
 def read_varint(stream):
-    """Read a varint from the stream using Google's internal fast decoder."""
-    # Ensure the stream is buffered so we can use peek
-    if not hasattr(stream, 'peek'):
-        stream = io.BufferedReader(stream)
-
-    # Peek up to 10 bytes (the maximum length for a 64-bit varint)
-    buf = stream.peek(10)[:10]
-
-    # Decode the varint from the buffer.
-    # _DecodeVarint returns a tuple: (decoded value, number of bytes consumed)
-    value, pos = _DecodeVarint(buf, 0)
-
-    # Consume the bytes that were used for the varint from the stream.
-    stream.read(pos)
-
-    return value
+    """Read a varint from the stream."""
+    result = 0
+    shift = 0
+    while True:
+        b = stream.read(1)
+        if len(b) == 0:
+            raise EOFError("Unexpected EOF while reading varint")
+        byte = b[0]
+        result |= (byte & 0x7F) << shift
+        if not (byte & 0x80):
+            break
+        shift += 7
+    return result
 
 
 def is_gzipped(filename):
