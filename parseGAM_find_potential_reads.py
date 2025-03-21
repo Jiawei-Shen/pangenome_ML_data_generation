@@ -168,25 +168,45 @@ def main():
     perfect_count = 0
     not_perfect_count = 0
 
+    chunk_size = 10000
+    not_perfect_buffer = []
+
     with open(args.output_json, "w") as out_f:
         # Stream and parse the GAM groups
         for group_number, alignments in process_groups_pipeline(
-            args.filename,
-            args.threads,
-            args.max_pending
+                args.filename,
+                args.threads,
+                args.max_pending
         ):
             for aln in alignments:
-                total_count += 1
-                if aln.identity < 1.0:
-                    print(aln)
-                    not_perfect_count += 1
-                    # Save only if also on the specified chromosome
-                    if is_on_chromosome(aln, args.chromosome):
+                if is_on_chromosome(aln, args.chromosome) or args.chromosome == "":
+                    total_count += 1
+                    if aln.identity < 1.0:
+                        not_perfect_count += 1
+                        # Store in a buffer
                         alignment_dict = MessageToDict(aln)
-                        json.dump(alignment_dict, out_f)
-                        out_f.write("\n")
-                else:
-                    perfect_count += 1
+                        not_perfect_buffer.append(alignment_dict)
+                        # If the buffer is large, flush to disk
+                        if len(not_perfect_buffer) >= chunk_size:
+                            for item in not_perfect_buffer:
+                                json.dump(item, out_f)
+                                out_f.write("\n")
+                            not_perfect_buffer.clear()
+
+                            print(f"Total reads processed: {total_count}")
+                            print(f"  Perfect reads: {perfect_count} "
+                                  f"({(perfect_count / total_count * 100) if total_count else 0:.2f}% of total)")
+                            print(f"  Not-perfect reads: {not_perfect_count} "
+                                  f"({(not_perfect_count / total_count * 100) if total_count else 0:.2f}% of total)\n")
+                            # print(f"Elapsed time: {elapsed:.2f} seconds.")
+                    else:
+                        perfect_count += 1
+
+        # After all alignments, flush any leftover
+        for item in not_perfect_buffer:
+            json.dump(item, out_f)
+            out_f.write("\n")
+        not_perfect_buffer.clear()
 
     end_time = time.perf_counter()
     elapsed = end_time - start_time
