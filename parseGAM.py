@@ -109,7 +109,7 @@ def main():
     for alignment in parse_gam_file(args.filename):
         # Process the alignment as needed. Here we simply print the full message.
         print("Parsed Alignment:")
-        # print(alignment)
+        print(alignment)
     end_time = time.perf_counter()
     print(f"Elapsed time: {end_time - start_time:.6f} seconds")
 
