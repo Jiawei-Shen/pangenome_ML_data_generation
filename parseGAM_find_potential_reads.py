@@ -176,10 +176,9 @@ def main():
             args.max_pending
         ):
             for aln in alignments:
-                print(aln)
                 total_count += 1
-
                 if aln.identity < 1.0:
+                    print(aln)
                     not_perfect_count += 1
                     # Save only if also on the specified chromosome
                     if is_on_chromosome(aln, args.chromosome):
