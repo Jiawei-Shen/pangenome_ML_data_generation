@@ -10,18 +10,16 @@ import vg_pb2  # Import the generated protobuf module
 
 def read_varint(stream):
     """Read a varint from the stream."""
+    # Read up to 10 bytes at once
+    buf = stream.read(10)
     result = 0
-    shift = 0
-    while True:
-        b = stream.read(1)
-        if len(b) == 0:
-            raise EOFError("Unexpected EOF while reading varint")
-        byte = b[0]
-        result |= (byte & 0x7F) << shift
-        if not (byte & 0x80):
-            break
-        shift += 7
-    return result
+    for i, b in enumerate(buf):
+        result |= (b & 0x7F) << (7 * i)
+        if b < 128:
+            # Optional: adjust the stream pointer if you read extra bytes
+            stream.seek(i - len(buf) + 1, 1)
+            return result
+    raise ValueError("Varint too long")
 
 
 def is_gzipped(filename):
