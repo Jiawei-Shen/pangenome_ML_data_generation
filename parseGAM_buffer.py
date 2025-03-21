@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 import argparse
 import gzip
-import io
 import os
 import time
-import sys
+import io
 import concurrent.futures
 import vg_pb2  # Import the generated protobuf module
 
+def is_gzipped(filename):
+    """Check if the file is gzipped by reading its magic number."""
+    with open(filename, 'rb') as f:
+        magic = f.read(2)
+    return magic == b'\x1f\x8b'
 
 def read_varint(stream):
-    """Read a varint from the stream."""
+    """Read a varint from a stream and return its value."""
     result = 0
     shift = 0
     while True:
@@ -24,122 +28,135 @@ def read_varint(stream):
         shift += 7
     return result
 
-
-def is_gzipped(filename):
-    """Check if the file is gzipped by reading its magic number."""
-    with open(filename, 'rb') as f:
-        magic = f.read(2)
-    return magic == b'\x1f\x8b'
-
-
-def parse_gam_file_groups(filename, expected_tag="GAM"):
+def scan_file_groups(filename, expected_tag="GAM"):
     """
-    Parse the GAM file using the framing format and yield groups.
-    Each group is a tuple (group_number, messages) where messages is a list
-    of raw protobuf bytes for each Alignment.
+    Scan the GAM file sequentially and record the metadata for each group.
+    Each group is recorded as a tuple:
+         (group_number, group_offset, group_size)
+    The group_offset is the file position at the start of the group,
+    and group_size is the number of bytes that belong to that group.
     """
-    # Open the file using BufferedReader for faster I/O.
+    groups = []
+    # Use BGZF access if gzipped and random access is needed.
     if is_gzipped(filename):
-        f = gzip.open(filename, 'rb')
+        try:
+            import pysam
+            f = pysam.BGZFFile(filename, "rb")
+        except ImportError:
+            raise RuntimeError("File is gzipped but pysam is not installed.")
     else:
-        f = open(filename, 'rb')
-    f = io.BufferedReader(f)
-
-    group_number = 0
+        f = open(filename, "rb")
     try:
+        group_number = 0
         while True:
+            group_start = f.tell()
             try:
                 group_count = read_varint(f)
             except EOFError:
-                break  # End of file reached
-            group_number += 1
-            # Print out debug info about the group
-            # (Optional: remove or comment out these prints in production.)
-            print(f"Group {group_number}: {group_count} messages")
-
+                break  # Reached end of file
+            # If group_count is 0, skip it.
             if group_count == 0:
-                print("Empty group.")
                 continue
-
+            group_number += 1
+            # Read type tag
             try:
                 tag_size = read_varint(f)
             except EOFError:
-                print("Unexpected EOF when reading type tag size.")
                 break
             tag_bytes = f.read(tag_size)
             if len(tag_bytes) != tag_size:
-                print("Unexpected EOF when reading type tag bytes.")
                 break
             tag = tag_bytes.decode("utf-8")
-            print(f"  Type tag: {tag}")
-
+            # Process (or skip) messages in the group based on tag.
             if tag != expected_tag:
-                print("  Skipping group with unexpected tag.")
-                # Skip the remaining messages in this group.
                 for _ in range(group_count - 1):
                     try:
                         msg_size = read_varint(f)
                     except EOFError:
                         break
                     f.seek(msg_size, os.SEEK_CUR)
-                continue
             else:
-                messages = []
-                for i in range(group_count - 1):
+                for _ in range(group_count - 1):
                     try:
                         msg_size = read_varint(f)
                     except EOFError:
-                        print("Unexpected EOF when reading message size.")
                         break
-                    msg_bytes = f.read(msg_size)
-                    if len(msg_bytes) != msg_size:
-                        print("Unexpected EOF when reading message bytes.")
-                        break
-                    messages.append(msg_bytes)
-                yield (group_number, messages)
+                    f.seek(msg_size, os.SEEK_CUR)
+            group_end = f.tell()
+            group_size = group_end - group_start
+            groups.append((group_number, group_start, group_size))
     finally:
         f.close()
+    return groups
 
-
-def process_group(group_tuple):
+def process_group_from_file(filename, group_meta, expected_tag="GAM"):
     """
-    Process a group of raw message bytes by parsing each one into a vg_pb2.Alignment.
-    Returns a tuple (group_number, list of parsed alignments).
+    Open the file, seek to the group's offset, read the group's bytes,
+    and parse the group into vg_pb2.Alignment objects.
+    Returns (group_number, list of alignments).
     """
-    group_number, messages = group_tuple
+    group_number, offset, size = group_meta
+    # Open file for random access (use pysam.BGZFFile if gzipped)
+    if is_gzipped(filename):
+        import pysam
+        f = pysam.BGZFFile(filename, "rb")
+    else:
+        f = open(filename, "rb")
+    try:
+        f.seek(offset)
+        data = f.read(size)
+    finally:
+        f.close()
+    stream = io.BytesIO(data)
+    try:
+        group_count = read_varint(stream)
+    except EOFError:
+        return (group_number, [])
+    try:
+        tag_size = read_varint(stream)
+    except EOFError:
+        return (group_number, [])
+    tag_bytes = stream.read(tag_size)
+    if len(tag_bytes) != tag_size:
+        return (group_number, [])
+    tag = tag_bytes.decode("utf-8")
     alignments = []
-    for i, msg_bytes in enumerate(messages):
+    if tag != expected_tag:
+        # If tag doesn't match, skip this group.
+        return (group_number, [])
+    for _ in range(group_count - 1):
+        try:
+            msg_size = read_varint(stream)
+        except EOFError:
+            break
+        msg_bytes = stream.read(msg_size)
+        if len(msg_bytes) != msg_size:
+            break
         alignment = vg_pb2.Alignment()
         alignment.ParseFromString(msg_bytes)
         alignments.append(alignment)
     return (group_number, alignments)
 
-
 def main():
     parser = argparse.ArgumentParser(
-        description="Parse a GAM file using vg_pb2 in parallel and print alignments.")
+        description="Multi-threaded parsing of a GAM file by processing groups concurrently using random access.")
     parser.add_argument("filename", help="Path to the GAM file")
     parser.add_argument("--threads", type=int, default=4,
-                        help="Number of worker threads to use (default: 4)")
+                        help="Number of worker threads (default: 4)")
     args = parser.parse_args()
 
     start_time = time.perf_counter()
-    groups = list(parse_gam_file_groups(args.filename))
-    print(f"Found {len(groups)} groups with expected tag.")
-    # Use a ThreadPoolExecutor to process groups in parallel.
+    groups = scan_file_groups(args.filename, expected_tag="GAM")
+    print(f"Found {len(groups)} groups in the file.")
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as executor:
-        # Map the process_group function to each group.
-        future_to_group = {executor.submit(process_group, group): group for group in groups}
+        future_to_group = {executor.submit(process_group_from_file, args.filename, meta, "GAM"): meta for meta in groups}
         for future in concurrent.futures.as_completed(future_to_group):
             group_number, alignments = future.result()
-            print(f"Processed Group {group_number}: Parsed {len(alignments)} alignments")
-            # Here you can process each alignment further.
-            for alignment in alignments:
-                # For demonstration, print the alignment name.
-                print(f"  Alignment name: {alignment.name}")
+            print(f"Processed Group {group_number}: Parsed {len(alignments)} alignments.")
+            for aln in alignments:
+                print(f"  Alignment name: {aln.name}")
     end_time = time.perf_counter()
     print(f"Elapsed time: {end_time - start_time:.6f} seconds")
-
 
 if __name__ == "__main__":
     main()
