@@ -168,7 +168,7 @@ def main():
     perfect_count = 0
     not_perfect_count = 0
 
-    chunk_size = 10000
+    chunk_size = 100000
     not_perfect_buffer = []
 
     with open(args.output_json, "w") as out_f:
