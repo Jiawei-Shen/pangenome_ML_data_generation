@@ -149,7 +149,7 @@ def main():
     for group_number, alignments in process_groups_pipeline(args.filename, args.threads, args.max_pending):
         print(f"Processed Group {group_number}: Parsed {len(alignments)} alignments")
         for alignment in alignments:
-            print(f"  Alignment name: {alignment}")
+            print(f"  Alignment name: {alignment.name}")
     end_time = time.perf_counter()
     print(f"Elapsed time: {end_time - start_time:.6f} seconds")
 
