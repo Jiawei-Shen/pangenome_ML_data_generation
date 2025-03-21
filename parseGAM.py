@@ -135,6 +135,11 @@ def process_groups_pipeline(filename, threads, max_pending=10):
             yield future.result()
 
 
+def print_alignment(alignment):
+    """Print a single alignment's name."""
+    print(f"  Alignment name: {alignment.name}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Multi-threaded parsing of a GAM file by group using vg_pb2.")
@@ -146,10 +151,11 @@ def main():
     args = parser.parse_args()
 
     start_time = time.perf_counter()
-    for group_number, alignments in process_groups_pipeline(args.filename, args.threads, args.max_pending):
-        print(f"Processed Group {group_number}: Parsed {len(alignments)} alignments")
-        for alignment in alignments:
-            print(f"  Alignment name: {alignment.name}")
+    with concurrent.futures.ThreadPoolExecutor() as inner_executor:
+        for group_number, alignments in process_groups_pipeline(args.filename, args.threads, args.max_pending):
+            print(f"Processed Group {group_number}: Parsed {len(alignments)} alignments")
+            futures = [inner_executor.submit(print_alignment, alignment) for alignment in alignments]
+            concurrent.futures.wait(futures)
     end_time = time.perf_counter()
     print(f"Elapsed time: {end_time - start_time:.6f} seconds")
 
