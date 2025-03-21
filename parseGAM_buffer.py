@@ -123,10 +123,9 @@ def main():
                         help="Number of worker threads to use (default: 4)")
     args = parser.parse_args()
 
+    start_time = time.perf_counter()
     groups = list(parse_gam_file_groups(args.filename))
     print(f"Found {len(groups)} groups with expected tag.")
-
-    start_time = time.perf_counter()
     # Use a ThreadPoolExecutor to process groups in parallel.
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as executor:
         # Map the process_group function to each group.
