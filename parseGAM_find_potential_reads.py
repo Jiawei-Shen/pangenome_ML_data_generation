@@ -134,9 +134,12 @@ def main():
     parser = argparse.ArgumentParser(description="Parse a GAM file, group by node ID, and filter non-perfect alignments.")
     parser.add_argument("filename", help="Path to the GAM file")
     parser.add_argument("--threads", type=int, default=4, help="Number of worker processes (default: 4)")
-    parser.add_argument("--max_pending", type=int, default=10, help="Max number of groups in flight (default: 10)")
+    parser.add_argument("--max_pending", type=int, default=16, help="Max number of groups in flight (default: 16)")
     parser.add_argument("--chr", default="", help="Chromosome name to filter on (default: \"\")")
     parser.add_argument("--output_json", default="reads_by_node.json", help="Output JSON with node_id -> reads")
+    parser.add_argument("--milestone", type=int, default=100_000_000,
+                        help="Number of reads between progress updates (default: 100000000)")
+
     args = parser.parse_args()
 
     start_time = time.perf_counter()
@@ -144,6 +147,7 @@ def main():
     total_count = 0
     perfect_count = 0
     not_perfect_count = 0
+    milestone = args.milestone
     node_to_reads_all = {}
 
     for group_number, node_reads, t, p, np in process_groups_pipeline(
@@ -158,14 +162,14 @@ def main():
                 node_to_reads_all[node_id] = []
             node_to_reads_all[node_id].extend(reads)
 
-        if total_count % 1_000_000 == 0:
+        if total_count >= milestone:
             elapsed = time.perf_counter() - start_time
-            print("\nEarly Summary:")
+            print("\nEarly Stop Summary:")
             print(f"  Total reads processed: {total_count}")
             print(f"  Perfect reads: {perfect_count} ({(perfect_count / total_count * 100):.2f}% of total)")
             print(f"  Not-perfect reads: {not_perfect_count} ({(not_perfect_count / total_count * 100):.2f}% of total)")
             print(f"Elapsed time: {elapsed:.2f} seconds.")
-
+            milestone += args.milestone
 
     with open(args.output_json, "w") as out_f:
         json.dump(node_to_reads_all, out_f)
