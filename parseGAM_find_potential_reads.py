@@ -158,14 +158,14 @@ def main():
                 node_to_reads_all[node_id] = []
             node_to_reads_all[node_id].extend(reads)
 
-        # if total_count >= 1_000_000:
-        #     elapsed = time.perf_counter() - start_time
-        #     print("\nEarly Stop Summary:")
-        #     print(f"  Total reads processed: {total_count}")
-        #     print(f"  Perfect reads: {perfect_count} ({(perfect_count / total_count * 100):.2f}% of total)")
-        #     print(f"  Not-perfect reads: {not_perfect_count} ({(not_perfect_count / total_count * 100):.2f}% of total)")
-        #     print(f"Elapsed time: {elapsed:.2f} seconds.")
-        #     break
+        if total_count % 1_000_000 == 0:
+            elapsed = time.perf_counter() - start_time
+            print("\nEarly Summary:")
+            print(f"  Total reads processed: {total_count}")
+            print(f"  Perfect reads: {perfect_count} ({(perfect_count / total_count * 100):.2f}% of total)")
+            print(f"  Not-perfect reads: {not_perfect_count} ({(not_perfect_count / total_count * 100):.2f}% of total)")
+            print(f"Elapsed time: {elapsed:.2f} seconds.")
+
 
     with open(args.output_json, "w") as out_f:
         json.dump(node_to_reads_all, out_f)
