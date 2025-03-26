@@ -4,9 +4,11 @@ import gzip
 import os
 import time
 import sys
-import concurrent.futures
+import subprocess
+import tempfile
 import vg_pb2
 import json
+import concurrent.futures
 from google.protobuf.json_format import MessageToDict
 
 
@@ -81,7 +83,7 @@ def process_group_serialized(args):
     total = 0
     perfect = 0
     not_perfect = 0
-    node_to_reads = {}
+    records = []
 
     for msg_bytes in messages:
         alignment = vg_pb2.Alignment()
@@ -102,11 +104,10 @@ def process_group_serialized(args):
         for mapping in alignment.path.mapping:
             if mapping.position.node_id:
                 node_id = mapping.position.node_id
-                if node_id not in node_to_reads:
-                    node_to_reads[node_id] = []
-                node_to_reads[node_id].append(aln_dict)
+                record = f"{node_id}\t{json.dumps(aln_dict)}"
+                records.append(record)
 
-    return group_number, node_to_reads, total, perfect, not_perfect
+    return group_number, records, total, perfect, not_perfect
 
 
 def process_groups_pipeline(filename, threads, max_pending=10, chrom_name=""):
@@ -130,6 +131,29 @@ def process_groups_pipeline(filename, threads, max_pending=10, chrom_name=""):
             yield future.result()
 
 
+def build_json_from_sorted_tsv(sorted_tsv_path, output_json_path):
+    with open(sorted_tsv_path, "r") as infile, open(output_json_path, "w") as out_f:
+        out_f.write("{\n")
+        current_node = None
+        current_reads = []
+
+        for line in infile:
+            node_id_str, json_read = line.strip().split("\t", 1)
+            if node_id_str != current_node:
+                if current_node is not None:
+                    json_entry = f'  "{current_node}": {json.dumps(current_reads)},\n'
+                    out_f.write(json_entry)
+                current_node = node_id_str
+                current_reads = [json.loads(json_read)]
+            else:
+                current_reads.append(json.loads(json_read))
+
+        if current_node is not None:
+            json_entry = f'  "{current_node}": {json.dumps(current_reads)}\n'
+            out_f.write(json_entry)
+        out_f.write("}\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Parse a GAM file, group by node ID, and filter non-perfect alignments.")
     parser.add_argument("filename", help="Path to the GAM file")
@@ -137,42 +161,57 @@ def main():
     parser.add_argument("--max_pending", type=int, default=16, help="Max number of groups in flight (default: 16)")
     parser.add_argument("--chr", default="", help="Chromosome name to filter on (default: \"\")")
     parser.add_argument("--output_json", default="reads_by_node.json", help="Output JSON with node_id -> reads")
+    parser.add_argument("--tmp_dir", default="./tmp", help="Directory to store temporary files (default: system temp)")
     parser.add_argument("--milestone", type=int, default=100_000_000,
                         help="Number of reads between progress updates (default: 100000000)")
+    parser.add_argument("--sort_buffer", default="4G",
+                        help="Buffer size for external sort (e.g. 1G, 512M). Default: 4G")
 
     args = parser.parse_args()
 
     start_time = time.perf_counter()
-
     total_count = 0
     perfect_count = 0
     not_perfect_count = 0
     milestone = args.milestone
-    node_to_reads_all = {}
 
-    for group_number, node_reads, t, p, np in process_groups_pipeline(
-            args.filename, args.threads, args.max_pending, chrom_name=args.chr):
+    with tempfile.NamedTemporaryFile(mode='w+', delete=False, dir=args.tmp_dir) as temp_out:
+        temp_path = temp_out.name
 
-        total_count += t
-        perfect_count += p
-        not_perfect_count += np
+        for group_number, records, t, p, np in process_groups_pipeline(
+                args.filename, args.threads, args.max_pending, chrom_name=args.chr):
 
-        for node_id, reads in node_reads.items():
-            if node_id not in node_to_reads_all:
-                node_to_reads_all[node_id] = []
-            node_to_reads_all[node_id].extend(reads)
+            total_count += t
+            perfect_count += p
+            not_perfect_count += np
 
-        if total_count >= milestone:
-            elapsed = time.perf_counter() - start_time
-            print("\nEarly Stop Summary:")
-            print(f"  Total reads processed: {total_count}")
-            print(f"  Perfect reads: {perfect_count} ({(perfect_count / total_count * 100):.2f}% of total)")
-            print(f"  Not-perfect reads: {not_perfect_count} ({(not_perfect_count / total_count * 100):.2f}% of total)")
-            print(f"Elapsed time: {elapsed:.2f} seconds.")
-            milestone += args.milestone
+            for record in records:
+                temp_out.write(record + "\n")
 
-    with open(args.output_json, "w") as out_f:
-        json.dump(node_to_reads_all, out_f)
+            if total_count >= milestone:
+                elapsed = time.perf_counter() - start_time
+                print("\nEarly Stop Summary:")
+                print(f"  Total reads processed: {total_count}")
+                print(f"  Perfect reads: {perfect_count} ({(perfect_count / total_count * 100):.2f}% of total)")
+                print(f"  Not-perfect reads: {not_perfect_count} ({(not_perfect_count / total_count * 100):.2f}% of total)")
+                print(f"Elapsed time: {elapsed:.2f} seconds.")
+                milestone += args.milestone
+
+    # Sort using external Unix sort with TMPDIR set
+    sorted_path = temp_path + ".sorted"
+    env = os.environ.copy()
+    if args.tmp_dir:
+        env["TMPDIR"] = args.tmp_dir
+
+    sort_cmd = f"sort -k1,1n --buffer-size={args.sort_buffer} {temp_path} > {sorted_path}"
+    subprocess.run(sort_cmd, shell=True, check=True, env=env)
+
+    # Convert sorted TSV to final JSON
+    build_json_from_sorted_tsv(sorted_path, args.output_json)
+
+    # Clean up
+    os.remove(temp_path)
+    os.remove(sorted_path)
 
     elapsed = time.perf_counter() - start_time
     print("\nFinal Summary:")
