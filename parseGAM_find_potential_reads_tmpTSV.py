@@ -168,6 +168,8 @@ def main():
                         help="Buffer size for external sort (e.g. 1G, 512M). Default: 4G")
 
     args = parser.parse_args()
+    if args.tmp_dir:
+        os.makedirs(args.tmp_dir, exist_ok=True)
 
     start_time = time.perf_counter()
     total_count = 0
