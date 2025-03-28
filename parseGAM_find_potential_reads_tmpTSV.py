@@ -4,12 +4,14 @@ import gzip
 import os
 import time
 import sys
-import subprocess
 import tempfile
 import vg_pb2
 import json
+import sqlite3
 import concurrent.futures
 from google.protobuf.json_format import MessageToDict
+import base64
+
 
 
 def read_varint(stream):
@@ -78,6 +80,8 @@ def is_on_chromosome(alignment, chrom_name):
     return any(rp.name == chrom_name for rp in alignment.refpos)
 
 
+import json
+
 def process_group_serialized(args):
     group_number, messages, chrom_name = args
     total = 0
@@ -93,21 +97,64 @@ def process_group_serialized(args):
             continue
 
         total += 1
-
         if alignment.identity == 1.0:
             perfect += 1
             continue
 
         not_perfect += 1
-        aln_dict = MessageToDict(alignment)
+        read_name = alignment.name
+        read_seq = alignment.sequence
+        read_qual = alignment.quality.decode('latin1')  # already decoded from Protobuf
+        read_offset = 0
 
         for mapping in alignment.path.mapping:
-            if mapping.position.node_id:
-                node_id = mapping.position.node_id
-                record = f"{node_id}\t{json.dumps(aln_dict)}"
-                records.append(record)
+            if not mapping.position.node_id:
+                continue
+
+            node_id = mapping.position.node_id
+            offset = mapping.position.offset if mapping.HasField("position") else 0
+
+            node_seq = ""
+            node_qual = ""
+
+            for edit in mapping.edit:
+                aligned_len = edit.from_length
+
+                if aligned_len > 0:
+                    # Get the matching segment from the read
+                    seg_seq = read_seq[read_offset:read_offset + aligned_len]
+                    seg_qual = read_qual[read_offset:read_offset + aligned_len]
+
+                    # If it's a substitution, mark it with lowercase
+                    if edit.sequence:
+                        seg_seq = seg_seq.lower()
+
+                    node_seq += seg_seq
+                    node_qual += seg_qual
+                    read_offset += aligned_len
+
+                elif edit.sequence:
+                    # Insertion: take and lowercase inserted read segment
+                    insert_len = len(edit.sequence)
+                    seg_seq = read_seq[read_offset:read_offset + insert_len].lower()
+                    seg_qual = read_qual[read_offset:read_offset + insert_len]
+
+                    node_seq += seg_seq
+                    node_qual += seg_qual
+                    read_offset += insert_len
+
+            record_data = {
+                "name": read_name,
+                "node_id": node_id,
+                "offset": offset,
+                "sequence": node_seq,
+                "quality": node_qual
+            }
+
+            records.append(f"{node_id}\t{json.dumps(record_data)}")
 
     return group_number, records, total, perfect, not_perfect
+
 
 
 def process_groups_pipeline(filename, threads, max_pending=10, chrom_name=""):
@@ -131,43 +178,44 @@ def process_groups_pipeline(filename, threads, max_pending=10, chrom_name=""):
             yield future.result()
 
 
-def build_json_from_sorted_tsv(sorted_tsv_path, output_json_path):
-    with open(sorted_tsv_path, "r") as infile, open(output_json_path, "w") as out_f:
+def setup_sqlite_db(db_path):
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode = OFF")
+    conn.execute("PRAGMA synchronous = OFF")
+    conn.execute("PRAGMA temp_store = MEMORY")
+    conn.execute("CREATE TABLE IF NOT EXISTS pileup (node_id INTEGER, read_json TEXT)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_node ON pileup (node_id)")
+    return conn
+
+
+def export_sqlite_to_json(conn, output_path):
+    cursor = conn.cursor()
+    cursor.execute("SELECT node_id, json_group_array(read_json) FROM pileup GROUP BY node_id")
+
+    with open(output_path, "w") as out_f:
         out_f.write("{\n")
-        current_node = None
-        current_reads = []
-
-        for line in infile:
-            node_id_str, json_read = line.strip().split("\t", 1)
-            if node_id_str != current_node:
-                if current_node is not None:
-                    json_entry = f'  "{current_node}": {json.dumps(current_reads)},\n'
-                    out_f.write(json_entry)
-                current_node = node_id_str
-                current_reads = [json.loads(json_read)]
-            else:
-                current_reads.append(json.loads(json_read))
-
-        if current_node is not None:
-            json_entry = f'  "{current_node}": {json.dumps(current_reads)}\n'
-            out_f.write(json_entry)
-        out_f.write("}\n")
+        first = True
+        for node_id, json_array in cursor:
+            if not first:
+                out_f.write(",\n")
+            first = False
+            out_f.write(f'  "{node_id}": {json_array}')
+        out_f.write("\n}\n")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Parse a GAM file, group by node ID, and filter non-perfect alignments.")
+    parser = argparse.ArgumentParser(description="Parse a GAM file, group by node ID, and filter non-perfect alignments using SQLite.")
     parser.add_argument("filename", help="Path to the GAM file")
     parser.add_argument("--threads", type=int, default=4, help="Number of worker processes (default: 4)")
     parser.add_argument("--max_pending", type=int, default=16, help="Max number of groups in flight (default: 16)")
     parser.add_argument("--chr", default="", help="Chromosome name to filter on (default: \"\")")
     parser.add_argument("--output_json", default="reads_by_node.json", help="Output JSON with node_id -> reads")
-    parser.add_argument("--tmp_dir", default="./tmp", help="Directory to store temporary files (default: system temp)")
+    parser.add_argument("--tmp_dir", default='./tmp', help="Directory to store temporary SQLite DB (default: system temp)")
     parser.add_argument("--milestone", type=int, default=100_000_000,
                         help="Number of reads between progress updates (default: 100000000)")
-    parser.add_argument("--sort_buffer", default="4G",
-                        help="Buffer size for external sort (e.g. 1G, 512M). Default: 4G")
 
     args = parser.parse_args()
+
     if args.tmp_dir:
         os.makedirs(args.tmp_dir, exist_ok=True)
 
@@ -177,43 +225,37 @@ def main():
     not_perfect_count = 0
     milestone = args.milestone
 
-    with tempfile.NamedTemporaryFile(mode='w+', delete=False, dir=args.tmp_dir) as temp_out:
-        temp_path = temp_out.name
+    db_path = os.path.join(args.tmp_dir or ".", "pileup.sqlite")
+    conn = setup_sqlite_db(db_path)
+    cursor = conn.cursor()
 
-        for group_number, records, t, p, np in process_groups_pipeline(
-                args.filename, args.threads, args.max_pending, chrom_name=args.chr):
+    for group_number, records, t, p, np in process_groups_pipeline(
+            args.filename, args.threads, args.max_pending, chrom_name=args.chr):
 
-            total_count += t
-            perfect_count += p
-            not_perfect_count += np
+        total_count += t
+        perfect_count += p
+        not_perfect_count += np
 
-            for record in records:
-                temp_out.write(record + "\n")
+        to_insert = []
+        for record in records:
+            node_id_str, read_json = record.split("\t", 1)
+            to_insert.append((int(node_id_str), read_json))
 
-            if total_count >= milestone:
-                elapsed = time.perf_counter() - start_time
-                print("\nEarly Stop Summary:")
-                print(f"  Total reads processed: {total_count}")
-                print(f"  Perfect reads: {perfect_count} ({(perfect_count / total_count * 100):.2f}% of total)")
-                print(f"  Not-perfect reads: {not_perfect_count} ({(not_perfect_count / total_count * 100):.2f}% of total)")
-                print(f"Elapsed time: {elapsed:.2f} seconds.")
-                milestone += args.milestone
+        cursor.executemany("INSERT INTO pileup (node_id, read_json) VALUES (?, ?)", to_insert)
 
-    # Sort using external Unix sort with TMPDIR set
-    sorted_path = temp_path + ".sorted"
-    env = os.environ.copy()
-    if args.tmp_dir:
-        env["TMPDIR"] = args.tmp_dir
+        if total_count >= milestone:
+            elapsed = time.perf_counter() - start_time
+            print("\nEarly Stop Summary:")
+            print(f"  Total reads processed: {total_count}")
+            print(f"  Perfect reads: {perfect_count} ({(perfect_count / total_count * 100):.2f}% of total)")
+            print(f"  Not-perfect reads: {not_perfect_count} ({(not_perfect_count / total_count * 100):.2f}% of total)")
+            print(f"Elapsed time: {elapsed:.2f} seconds.")
+            milestone += args.milestone
 
-    sort_cmd = f"sort -k1,1n --buffer-size={args.sort_buffer} {temp_path} > {sorted_path}"
-    subprocess.run(sort_cmd, shell=True, check=True, env=env)
-
-    # Convert sorted TSV to final JSON
-    build_json_from_sorted_tsv(sorted_path, args.output_json)
-
-    # Clean up
-    os.remove(temp_path)
-    os.remove(sorted_path)
+    conn.commit()
+    export_sqlite_to_json(conn, args.output_json)
+    conn.close()
+    os.remove(db_path)
 
     elapsed = time.perf_counter() - start_time
     print("\nFinal Summary:")
