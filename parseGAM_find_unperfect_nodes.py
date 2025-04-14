@@ -81,7 +81,7 @@ def process_group_serialized(args):
     total = 0
     perfect = 0
     not_perfect = 0
-    node_to_reads = {}
+    node_counts = {}  # node_id -> {"perfect": X, "not_perfect": Y}
 
     for msg_bytes in messages:
         alignment = vg_pb2.Alignment()
@@ -91,33 +91,30 @@ def process_group_serialized(args):
             continue
 
         total += 1
-        aln_dict = MessageToDict(alignment)
-
-        is_perfect_alignment = True
-        node_ids_seen = set()
 
         for mapping in alignment.path.mapping:
             if not mapping.position.node_id:
                 continue
 
             node_id = mapping.position.node_id
-            node_ids_seen.add(node_id)
+            is_perfect = True
 
             for edit in mapping.edit:
                 if edit.sequence or edit.from_length == 0:
-                    is_perfect_alignment = False
+                    is_perfect = False
                     break
 
-        if is_perfect_alignment:
-            perfect += 1
-        else:
-            not_perfect += 1
-            for node_id in node_ids_seen:
-                if node_id not in node_to_reads:
-                    node_to_reads[node_id] = []
-                node_to_reads[node_id].append(aln_dict)
+            if node_id not in node_counts:
+                node_counts[node_id] = {"perfect": 0, "not_perfect": 0}
 
-    return group_number, node_to_reads, total, perfect, not_perfect
+            if is_perfect:
+                node_counts[node_id]["perfect"] += 1
+                perfect += 1
+            else:
+                node_counts[node_id]["not_perfect"] += 1
+                not_perfect += 1
+
+    return group_number, node_counts, total, perfect, not_perfect
 
 
 def process_groups_pipeline(filename, threads, max_pending=10, chrom_name=""):
