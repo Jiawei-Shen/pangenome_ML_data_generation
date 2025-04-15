@@ -7,6 +7,7 @@ import concurrent.futures
 import vg_pb2
 import json
 import base64
+import time
 
 
 def read_varint(stream):
@@ -72,10 +73,12 @@ def parse_gam_file_groups(filename, expected_tag="GAM"):
 def process_group_extract(args):
     messages, filtered_nodes = args
     result = {}
+    read_count = 0
 
     for msg_bytes in messages:
         alignment = vg_pb2.Alignment()
         alignment.ParseFromString(msg_bytes)
+        read_count += 1
 
         read_seq = alignment.sequence
         base_quality = base64.b64decode(alignment.quality).decode('latin1') if alignment.quality else ""
@@ -123,20 +126,22 @@ def process_group_extract(args):
                 "read_quality": read_quality
             })
 
-    return result
+    return result, read_count
 
 
 def merge_node_results(results_list):
     merged = {}
-    for partial in results_list:
-        for node_id, segments in partial.items():
+    total_reads = 0
+    for partial_result, read_count in results_list:
+        total_reads += read_count
+        for node_id, segments in partial_result.items():
             if node_id not in merged:
                 merged[node_id] = []
             merged[node_id].extend(segments)
-    return merged
+    return merged, total_reads
 
 
-def extract_node_segments_parallel(gam_file, node_stats_pickle, output_prefix, threads=4, max_pending=16):
+def extract_node_segments_parallel(gam_file, node_stats_pickle, output_prefix, threads=4, max_pending=16, milestone=100_000_000):
     with open(node_stats_pickle, "rb") as f:
         node_stats = pickle.load(f)
 
@@ -147,6 +152,11 @@ def extract_node_segments_parallel(gam_file, node_stats_pickle, output_prefix, t
     }
     print(f"Filtered {len(filtered_nodes)} node IDs meeting criteria.")
 
+    total_reads = 0
+    all_results = []
+    start_time = time.perf_counter()
+    next_milestone = milestone
+
     with concurrent.futures.ProcessPoolExecutor(max_workers=threads) as executor:
         futures = []
         for messages in parse_gam_file_groups(gam_file):
@@ -154,10 +164,41 @@ def extract_node_segments_parallel(gam_file, node_stats_pickle, output_prefix, t
             while len(futures) >= max_pending:
                 done, futures = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
                 for fut in done:
-                    yield fut.result()
+                    result, read_count = fut.result()
+                    all_results.append((result, read_count))
+                    total_reads += read_count
+                    if total_reads >= next_milestone:
+                        elapsed = time.perf_counter() - start_time
+                        print(f"\nMilestone reached:")
+                        print(f"  Total reads processed: {total_reads}")
+                        print(f"  Nodes recorded so far: {len(set().union(*[r.keys() for r, _ in all_results]))}")
+                        print(f"  Elapsed time: {elapsed:.2f} seconds")
+                        next_milestone += milestone
 
         for fut in concurrent.futures.as_completed(futures):
-            yield fut.result()
+            result, read_count = fut.result()
+            all_results.append((result, read_count))
+            total_reads += read_count
+            if total_reads >= next_milestone:
+                elapsed = time.perf_counter() - start_time
+                print(f"\nMilestone reached:")
+                print(f"  Total reads processed: {total_reads}")
+                print(f"  Nodes recorded so far: {len(set().union(*[r.keys() for r, _ in all_results]))}")
+                print(f"  Elapsed time: {elapsed:.2f} seconds")
+                next_milestone += milestone
+
+    merged, _ = merge_node_results(all_results)
+
+    json_path = output_prefix + ".json"
+    pkl_path = output_prefix + ".pkl"
+
+    with open(json_path, "w") as f:
+        json.dump(merged, f, indent=2)
+    print(f"\nJSON saved to {json_path}")
+
+    with open(pkl_path, "wb") as f:
+        pickle.dump(merged, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"Pickle saved to {pkl_path}")
 
 
 def main():
@@ -167,25 +208,17 @@ def main():
     parser.add_argument("output_prefix", help="Prefix for output files (.json and .pkl)")
     parser.add_argument("--threads", type=int, default=4, help="Number of worker threads (default: 4)")
     parser.add_argument("--max_pending", type=int, default=16, help="Maximum number of futures pending (default: 16)")
+    parser.add_argument("--milestone", type=int, default=100_000_000, help="Reads between progress updates (default: 100M)")
     args = parser.parse_args()
 
-    all_results = []
-    for partial_result in extract_node_segments_parallel(
-            args.gam_file, args.node_stats_pickle, args.output_prefix, args.threads, args.max_pending):
-        all_results.append(partial_result)
-
-    merged = merge_node_results(all_results)
-
-    json_path = args.output_prefix + ".json"
-    pkl_path = args.output_prefix + ".pkl"
-
-    with open(json_path, "w") as f:
-        json.dump(merged, f, indent=2)
-    print(f"JSON saved to {json_path}")
-
-    with open(pkl_path, "wb") as f:
-        pickle.dump(merged, f, protocol=pickle.HIGHEST_PROTOCOL)
-    print(f"Pickle saved to {pkl_path}")
+    extract_node_segments_parallel(
+        args.gam_file,
+        args.node_stats_pickle,
+        args.output_prefix,
+        args.threads,
+        args.max_pending,
+        args.milestone
+    )
 
 
 if __name__ == "__main__":
