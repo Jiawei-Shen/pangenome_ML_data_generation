@@ -147,11 +147,13 @@ def extract_node_segments_parallel(gam_file, node_stats_pickle, output_prefix, t
         node_stats = pickle.load(f)
     print(f"Loaded node stats for {len(node_stats)} nodes.")
 
-    filtered_nodes = {
-        int(node_id)
-        for node_id, stats in node_stats.items()
-        if stats["not_perfect"] > 1 and stats["not_perfect"] / (stats["not_perfect"] + stats["perfect"]) > 0.1
-    }
+    filtered_nodes = set()
+    for node_id, stat_list in node_stats.items():
+        total_perfect = sum(s["perfect"] for s in stat_list)
+        total_not_perfect = sum(s["not_perfect"] for s in stat_list)
+        total = total_perfect + total_not_perfect
+        if total_not_perfect > 1 and total_not_perfect / total > 0.1:
+            filtered_nodes.add(int(node_id))
     print(f"Filtered {len(filtered_nodes)} node IDs meeting criteria.")
 
     total_reads = 0
