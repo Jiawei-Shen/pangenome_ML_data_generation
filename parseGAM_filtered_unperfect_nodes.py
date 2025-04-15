@@ -142,8 +142,10 @@ def merge_node_results(results_list):
 
 
 def extract_node_segments_parallel(gam_file, node_stats_pickle, output_prefix, threads=4, max_pending=16, milestone=100_000_000):
+    print(f"Loading node stats pickle from: {node_stats_pickle}")
     with open(node_stats_pickle, "rb") as f:
         node_stats = pickle.load(f)
+    print(f"Loaded node stats for {len(node_stats)} nodes.")
 
     filtered_nodes = {
         int(node_id)
