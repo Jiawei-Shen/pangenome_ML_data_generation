@@ -150,6 +150,7 @@ def extract_node_segments_parallel(gam_file, node_stats_pickle, output_prefix, t
 
     filtered_nodes = set()
     for node_id, stat_list in node_stats.items():
+        [print(s) for s in stat_list]
         total_perfect = sum(json.loads(s)["perfect"] for s in stat_list)
         total_not_perfect = sum(json.loads(s)["not_perfect"] for s in stat_list)
         total = total_perfect + total_not_perfect
