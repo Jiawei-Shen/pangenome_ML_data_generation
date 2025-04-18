@@ -165,10 +165,11 @@ def main():
         perfect_count += p
         not_perfect_count += np
 
-        for node_id, reads in node_reads.items():
+        for node_id, counts in node_reads.items():
             if node_id not in node_to_reads_all:
-                node_to_reads_all[node_id] = []
-            node_to_reads_all[node_id].append(reads)
+                node_to_reads_all[node_id] = {"perfect": 0, "not_perfect": 0}
+            node_to_reads_all[node_id]["perfect"] += counts["perfect"]
+            node_to_reads_all[node_id]["not_perfect"] += counts["not_perfect"]
 
         if total_count >= milestone:
             elapsed = time.perf_counter() - start_time
@@ -178,7 +179,6 @@ def main():
             print(f"  Not-perfect reads: {not_perfect_count} ({(not_perfect_count / total_count * 100):.2f}% of total)")
             print(f"  Elapsed time: {elapsed:.2f} seconds.")
             milestone += args.milestone
-            print(node_to_reads_all)
 
     output_file = args.output
     if not output_file:
