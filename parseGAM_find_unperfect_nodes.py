@@ -7,6 +7,7 @@ import sys
 import concurrent.futures
 import vg_pb2
 import json
+import pickle
 from google.protobuf.json_format import MessageToDict
 
 
@@ -139,18 +140,16 @@ def process_groups_pipeline(filename, threads, max_pending=10, chrom_name=""):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Parse a GAM file, group by node ID, and filter non-perfect alignments. Save output as pickle.")
+    parser = argparse.ArgumentParser(description="Parse a GAM file, group by node ID, and filter non-perfect alignments.")
     parser.add_argument("filename", help="Path to the GAM file")
     parser.add_argument("--threads", type=int, default=4, help="Number of worker processes (default: 4)")
     parser.add_argument("--max_pending", type=int, default=16, help="Max number of groups in flight (default: 16)")
     parser.add_argument("--chr", default="", help="Chromosome name to filter on (default: \"\")")
-    parser.add_argument("--output_pickle", default="reads_by_node.pkl", help="Output Pickle file with node_id -> reads")
-    parser.add_argument("--milestone", type=int, default=100_000_000,
-                        help="Number of reads between progress updates (default: 100000000)")
+    parser.add_argument("--milestone", type=int, default=100_000_000, help="Number of reads between progress updates")
+    parser.add_argument("--output_format", choices=["json", "pickle"], default="json", help="Output format (default: json)")
+    parser.add_argument("--output", help="Output file name (overrides default)")
 
     args = parser.parse_args()
-
-    import pickle
     start_time = time.perf_counter()
 
     total_count = 0
@@ -169,7 +168,7 @@ def main():
         for node_id, reads in node_reads.items():
             if node_id not in node_to_reads_all:
                 node_to_reads_all[node_id] = []
-            node_to_reads_all[node_id].extend(reads)
+            node_to_reads_all[node_id].append(reads)
 
         if total_count >= milestone:
             elapsed = time.perf_counter() - start_time
@@ -180,8 +179,20 @@ def main():
             print(f"  Elapsed time: {elapsed:.2f} seconds.")
             milestone += args.milestone
 
-    with open(args.output_pickle, "wb") as out_f:
-        pickle.dump(node_to_reads_all, out_f, protocol=pickle.HIGHEST_PROTOCOL)
+    output_file = args.output
+    if not output_file:
+        output_file = "reads_by_node.json" if args.output_format == "json" else "reads_by_node.pkl"
+
+    print(f"\nSaving output to {output_file} as {args.output_format.upper()}...")
+
+    if args.output_format == "json":
+        # Convert int keys to strings for JSON compatibility
+        json_data = {str(k): v for k, v in node_to_reads_all.items()}
+        with open(output_file, "w") as f:
+            json.dump(json_data, f, indent=2)
+    else:
+        with open(output_file, "wb") as f:
+            pickle.dump(node_to_reads_all, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     elapsed = time.perf_counter() - start_time
     print("\nFinal Summary:")

@@ -6,5 +6,6 @@ BAM_files/
 GRCh38_references/
 vg/
 .idea/
+__pycache__/
 ./HG005_variants.json
 ./.gitignore
