@@ -156,7 +156,6 @@ def process_group_serialized(args):
     return group_number, records, total, perfect, not_perfect
 
 
-
 def process_groups_pipeline(filename, threads, max_pending=10, chrom_name=""):
     with concurrent.futures.ProcessPoolExecutor(max_workers=threads) as executor:
         pending_futures = []

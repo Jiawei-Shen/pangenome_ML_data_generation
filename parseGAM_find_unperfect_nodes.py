@@ -178,6 +178,7 @@ def main():
             print(f"  Not-perfect reads: {not_perfect_count} ({(not_perfect_count / total_count * 100):.2f}% of total)")
             print(f"  Elapsed time: {elapsed:.2f} seconds.")
             milestone += args.milestone
+            print(node_to_reads_all)
 
     output_file = args.output
     if not output_file:
