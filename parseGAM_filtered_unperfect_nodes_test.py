@@ -62,7 +62,9 @@ def process_group(args):
     message_list, wanted_nodes, chrom_filter = args
     node_segments, read_count = {}, 0
     for raw in message_list:
-        aln = vg_pb2.Alignment(); aln.ParseFromString(raw)
+        aln = vg_pb2.Alignment()
+        aln.ParseFromString(raw)
+
         if chrom_filter and not any(rp.name == chrom_filter for rp in aln.refpos):
             continue
         read_count += 1
