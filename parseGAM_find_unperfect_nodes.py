@@ -3,9 +3,12 @@ import argparse
 import gzip
 import os
 import time
-import vg_pb2
-import sqlite3
+import sys
 import concurrent.futures
+import vg_pb2
+import json
+import pickle
+from google.protobuf.json_format import MessageToDict
 
 
 def read_varint(stream):
@@ -79,7 +82,7 @@ def process_group_serialized(args):
     total = 0
     perfect = 0
     not_perfect = 0
-    records = []
+    node_counts = {}  # node_id -> {"perfect": X, "not_perfect": Y}
 
     for msg_bytes in messages:
         alignment = vg_pb2.Alignment()
@@ -89,55 +92,31 @@ def process_group_serialized(args):
             continue
 
         total += 1
-        # if alignment.identity == 1.0:
-        #     perfect += 1
-        #     continue
-        #
-        # not_perfect += 1
-        read_seq = alignment.sequence
-        read_qual = alignment.quality.decode('latin1')
-        read_offset = 0
-        mapping_quality = alignment.mapping_quality
 
         for mapping in alignment.path.mapping:
             if not mapping.position.node_id:
                 continue
 
             node_id = mapping.position.node_id
-            offset = mapping.position.offset if mapping.HasField("position") else 0
-
-            node_seq = ""
-            node_qual = ""
+            is_perfect = True
 
             for edit in mapping.edit:
-                aligned_len = edit.from_length
+                if edit.sequence or edit.from_length == 0:
+                    is_perfect = False
+                    break
 
-                if aligned_len > 0:
-                    seg_seq = read_seq[read_offset:read_offset + aligned_len]
-                    seg_qual = read_qual[read_offset:read_offset + aligned_len]
-                    if edit.sequence:
-                        seg_seq = seg_seq.lower()
-                    node_seq += seg_seq
-                    node_qual += seg_qual
-                    read_offset += aligned_len
+            if node_id not in node_counts:
+                node_counts[node_id] = {"perfect": 0, "not_perfect": 0}
 
-                elif edit.sequence:
-                    insert_len = len(edit.sequence)
-                    seg_seq = read_seq[read_offset:read_offset + insert_len].lower()
-                    seg_qual = read_qual[read_offset:read_offset + insert_len]
-                    node_seq += seg_seq
-                    node_qual += seg_qual
-                    read_offset += insert_len
+            if is_perfect:
+                node_counts[node_id]["perfect"] += 1
+                perfect += 1
+            else:
+                node_counts[node_id]["not_perfect"] += 1
+                not_perfect += 1
 
-            records.append((
-                node_id,
-                offset,
-                node_seq,
-                node_qual,
-                mapping_quality
-            ))
+    return group_number, node_counts, total, perfect, not_perfect
 
-    return group_number, records, total#, perfect, not_perfect
 
 def process_groups_pipeline(filename, threads, max_pending=10, chrom_name=""):
     with concurrent.futures.ProcessPoolExecutor(max_workers=threads) as executor:
@@ -160,77 +139,68 @@ def process_groups_pipeline(filename, threads, max_pending=10, chrom_name=""):
             yield future.result()
 
 
-def setup_sqlite_db(db_path):
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA synchronous = NORMAL")
-    conn.execute("PRAGMA temp_store = MEMORY")
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS alignments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            node_id INTEGER,
-            offset INTEGER,
-            sequence TEXT,
-            quality TEXT,
-            mapping_quality INTEGER
-        )
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_node_id ON alignments(node_id)")
-    return conn
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Parse a GAM file and create a queryable SQLite database indexed by node_id.")
+    parser = argparse.ArgumentParser(description="Parse a GAM file, group by node ID, and filter non-perfect alignments.")
     parser.add_argument("filename", help="Path to the GAM file")
-    parser.add_argument("--threads", type=int, default=8, help="Number of worker processes")
-    parser.add_argument("--max_pending", type=int, default=16, help="Max groups in parallel")
-    parser.add_argument("--chr", default="", help="Chromosome name to filter on")
-    parser.add_argument("--output_db", default="./tmp/pileup.sqlite", help="Output SQLite filename")
-    parser.add_argument("--tmp_dir", default='./tmp', help="Temp directory (unused here, kept for compatibility)")
-    parser.add_argument("--milestone", type=int, default=100_000_000, help="Progress update interval")
+    parser.add_argument("--threads", type=int, default=4, help="Number of worker processes (default: 4)")
+    parser.add_argument("--max_pending", type=int, default=16, help="Max number of groups in flight (default: 16)")
+    parser.add_argument("--chr", default="", help="Chromosome name to filter on (default: \"\")")
+    parser.add_argument("--milestone", type=int, default=100_000_000, help="Number of reads between progress updates")
+    parser.add_argument("--output_format", choices=["json", "pickle"], default="json", help="Output format (default: json)")
+    parser.add_argument("--output", help="Output file name (overrides default)")
 
     args = parser.parse_args()
-    os.makedirs(args.tmp_dir, exist_ok=True)
-
-    db_path = os.path.join(".", args.output_db)
-    conn = setup_sqlite_db(db_path)
-    cursor = conn.cursor()
-
     start_time = time.perf_counter()
-    total_count = 0
-    # perfect_count = 0
-    # not_perfect_count = 0
-    milestone = args.milestone
 
-    for group_number, records, t in process_groups_pipeline(
-        args.filename, args.threads, args.max_pending, chrom_name=args.chr):
+    total_count = 0
+    perfect_count = 0
+    not_perfect_count = 0
+    milestone = args.milestone
+    node_to_reads_all = {}
+
+    for group_number, node_reads, t, p, np in process_groups_pipeline(
+            args.filename, args.threads, args.max_pending, chrom_name=args.chr):
 
         total_count += t
+        perfect_count += p
+        not_perfect_count += np
 
-        cursor.executemany("""
-            INSERT INTO alignments (node_id, offset, sequence, quality, mapping_quality)
-            VALUES (?, ?, ?, ?, ?)
-        """, records)
+        for node_id, counts in node_reads.items():
+            if node_id not in node_to_reads_all:
+                node_to_reads_all[node_id] = {"perfect": 0, "not_perfect": 0}
+            node_to_reads_all[node_id]["perfect"] += counts["perfect"]
+            node_to_reads_all[node_id]["not_perfect"] += counts["not_perfect"]
 
         if total_count >= milestone:
             elapsed = time.perf_counter() - start_time
-            print(f"\nReached {total_count} reads.")
-            # print(f"  Perfect reads: {perfect_count} ({(perfect_count / total_count * 100):.2f}%)")
-            # print(f"  Not-perfect reads: {not_perfect_count} ({(not_perfect_count / total_count * 100):.2f}%)")
+            print("\nMilestone reached:")
+            print(f"  Total reads processed: {total_count}")
+            print(f"  Perfect reads: {perfect_count} ({(perfect_count / total_count * 100):.2f}% of total)")
+            print(f"  Not-perfect reads: {not_perfect_count} ({(not_perfect_count / total_count * 100):.2f}% of total)")
             print(f"  Elapsed time: {elapsed:.2f} seconds.")
             milestone += args.milestone
 
-    conn.commit()
-    conn.close()
+    output_file = args.output
+    if not output_file:
+        output_file = "reads_by_node.json" if args.output_format == "json" else "reads_by_node.pkl"
+
+    print(f"\nSaving output to {output_file} as {args.output_format.upper()}...")
+
+    if args.output_format == "json":
+        # Convert int keys to strings for JSON compatibility
+        json_data = {str(k): v for k, v in node_to_reads_all.items()}
+        with open(output_file, "w") as f:
+            json.dump(json_data, f, indent=2)
+    else:
+        with open(output_file, "wb") as f:
+            pickle.dump(node_to_reads_all, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     elapsed = time.perf_counter() - start_time
     print("\nFinal Summary:")
     print(f"  Total reads processed: {total_count}")
-    # print(f"  Perfect reads: {perfect_count} ({(perfect_count / total_count * 100):.2f}%)")
-    # print(f"  Not-perfect reads: {not_perfect_count} ({(not_perfect_count / total_count * 100):.2f}%)")
+    print(f"  Perfect reads: {perfect_count} ({(perfect_count / total_count * 100):.2f}% of total)")
+    print(f"  Not-perfect reads: {not_perfect_count} ({(not_perfect_count / total_count * 100):.2f}% of total)")
     print(f"  Elapsed time: {elapsed:.2f} seconds.")
-    print(f"\nSQLite database saved to: {db_path}")
 
 
 if __name__ == "__main__":
