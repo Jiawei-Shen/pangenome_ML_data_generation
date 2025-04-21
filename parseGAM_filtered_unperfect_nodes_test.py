@@ -66,10 +66,10 @@ def process_group(args):
         if chrom_filter and not any(rp.name == chrom_filter for rp in aln.refpos):
             continue
         read_count += 1
-        seq = aln.sequence
-        qual_bytes = aln.quality
-        mapq = aln.mapping_quality
-        read_offset = 0
+        # seq = aln.sequence
+        # qual_bytes = aln.quality
+        # mapq = aln.mapping_quality
+        # read_offset = 0
 
         # for mapping in aln.path.mapping:
         #     node_id = mapping.position.node_id
