@@ -1,226 +1,220 @@
 #!/usr/bin/env python3
-import argparse
-import pickle
-import gzip
-import os
-import concurrent.futures
-import vg_pb2
-import json
-import base64
-import time
-import json
+import argparse, gzip, pickle, json, time, concurrent.futures, vg_pb2, base64
 
-
+# ---------- helpers ----------------------------------------------------------
 def read_varint(stream):
-    result = 0
-    shift = 0
+    res = shift = 0
     while True:
         b = stream.read(1)
-        if len(b) == 0:
-            raise EOFError("Unexpected EOF while reading varint")
+        if not b:
+            raise EOFError
         byte = b[0]
-        result |= (byte & 0x7F) << shift
+        res |= (byte & 0x7F) << shift
         if not (byte & 0x80):
-            break
+            return res
         shift += 7
-    return result
 
 
-def is_gzipped(filename):
-    with open(filename, 'rb') as f:
-        return f.read(2) == b'\x1f\x8b'
+def is_gz(path):
+    with open(path, "rb") as f:
+        return f.read(2) == b"\x1f\x8b"
 
 
-def parse_gam_file_groups(filename, expected_tag="GAM"):
-    open_func = gzip.open if is_gzipped(filename) else open
-    with open_func(filename, 'rb') as f:
+def parse_gam_groups(path, tag="GAM"):
+    opener = gzip.open if is_gz(path) else open
+    with opener(path, "rb") as f:
         while True:
             try:
-                group_count = read_varint(f)
+                n = read_varint(f)
             except EOFError:
                 break
-
-            if group_count == 0:
+            if n == 0:
                 continue
-
             try:
-                tag_size = read_varint(f)
-                tag = f.read(tag_size).decode("utf-8")
+                tlen = read_varint(f)
+                t = f.read(tlen).decode()
             except (EOFError, UnicodeDecodeError):
                 break
-
-            if tag != expected_tag:
-                for _ in range(group_count - 1):
+            if t != tag:
+                for _ in range(n - 1):
                     try:
-                        msg_size = read_varint(f)
-                        f.seek(msg_size, 1)
+                        f.seek(read_varint(f), 1)
                     except EOFError:
                         break
                 continue
-
-            messages = []
-            for _ in range(group_count - 1):
+            msgs = []
+            for _ in range(n - 1):
                 try:
-                    msg_size = read_varint(f)
-                    msg_bytes = f.read(msg_size)
-                    if len(msg_bytes) == msg_size:
-                        messages.append(msg_bytes)
+                    sz = read_varint(f)
+                    blk = f.read(sz)
                 except EOFError:
                     break
+                if len(blk) == sz:
+                    msgs.append(blk)
+            yield msgs
 
-            yield messages
 
-
-def process_group_extract(args):
-    messages, filtered_nodes = args
-    result = {}
-    read_count = 0
-
-    for msg_bytes in messages:
-        alignment = vg_pb2.Alignment()
-        alignment.ParseFromString(msg_bytes)
-        read_count += 1
-
-        read_seq = alignment.sequence
-        base_quality = base64.b64decode(alignment.quality).decode('latin1') if alignment.quality else ""
-        read_quality = alignment.mapping_quality
-        read_offset = 0
-
-        for mapping in alignment.path.mapping:
-            node_id = mapping.position.node_id
-            if node_id not in filtered_nodes:
-                for edit in mapping.edit:
-                    read_offset += max(edit.from_length, len(edit.sequence))
+# ---------- worker -----------------------------------------------------------
+def proc_group(args):
+    msgs, wanted = args
+    out, cnt = {}, 0
+    for mb in msgs:
+        aln = vg_pb2.Alignment()
+        aln.ParseFromString(mb)
+        cnt += 1
+        seq = aln.sequence
+        qbytes = aln.quality  # raw per‑base bytes
+        mapq = aln.mapping_quality
+        roff = 0
+        for m in aln.path.mapping:
+            nid = m.position.node_id
+            if nid not in wanted:
+                for e in m.edit:
+                    roff += max(e.from_length, len(e.sequence))
                 continue
-
-            offset = mapping.position.offset
-            node_seq = ""
-            node_bqual = ""
-
-            for edit in mapping.edit:
-                aligned_len = edit.from_length
-
-                if aligned_len > 0:
-                    seg_seq = read_seq[read_offset:read_offset + aligned_len]
-                    seg_qual = base_quality[read_offset:read_offset + aligned_len]
-                    if edit.sequence:
-                        seg_seq = seg_seq.lower()
-                    node_seq += seg_seq
-                    node_bqual += seg_qual
-                    read_offset += aligned_len
-
-                elif edit.sequence:
-                    insert_len = len(edit.sequence)
-                    seg_seq = read_seq[read_offset:read_offset + insert_len].lower()
-                    seg_qual = base_quality[read_offset:read_offset + insert_len]
-                    node_seq += seg_seq
-                    node_bqual += seg_qual
-                    read_offset += insert_len
-
-            if node_id not in result:
-                result[node_id] = []
-
-            result[node_id].append({
-                "offset": offset,
-                "sequence": node_seq,
-                "base_quality": node_bqual,
-                "read_quality": read_quality
-            })
-
-    return result, read_count
+            off = m.position.offset
+            seg_seq, seg_q = [], bytearray()
+            for e in m.edit:
+                if e.from_length:
+                    seg_seq.append(
+                        seq[roff : roff + e.from_length].lower()
+                        if e.sequence
+                        else seq[roff : roff + e.from_length]
+                    )
+                    seg_q.extend(qbytes[roff : roff + e.from_length])
+                    roff += e.from_length
+                elif e.sequence:  # insertion
+                    ins = len(e.sequence)
+                    seg_seq.append(seq[roff : roff + ins].lower())
+                    seg_q.extend(qbytes[roff : roff + ins])
+                    roff += ins
+            out.setdefault(nid, []).append(
+                {
+                    "offset": off,
+                    "sequence": "".join(seg_seq),
+                    "base_quality": base64.b64encode(seg_q).decode(),
+                    "read_quality": mapq,
+                }
+            )
+    return out, cnt
 
 
-def merge_node_results(results_list):
-    merged = {}
-    total_reads = 0
-    for partial_result, read_count in results_list:
-        total_reads += read_count
-        for node_id, segments in partial_result.items():
-            if node_id not in merged:
-                merged[node_id] = []
-            merged[node_id].extend(segments)
-    return merged, total_reads
+def merge(parts):
+    merged, reads = {}, 0
+    for part, cnt in parts:
+        reads += cnt
+        for nid, segs in part.items():
+            merged.setdefault(nid, []).extend(segs)
+    return merged, reads
 
 
-def extract_node_segments_parallel(gam_file, node_stats_pickle, output_prefix, threads=4, max_pending=16, milestone=100_000_000):
-    print(f"Loading node stats pickle from: {node_stats_pickle}")
-    with open(node_stats_pickle, "rb") as f:
-        node_stats = pickle.load(f)
-    print(f"Loaded node stats for {len(node_stats)} nodes.")
+# ---------- pipeline ---------------------------------------------------------
+def run(gam, stats_pkl, prefix, fmt, threads, max_pending, milestone):
+    print(f"Loading stats pickle: {stats_pkl}")
+    with open(stats_pkl, "rb") as f:
+        stats = pickle.load(f)
+
+    total_nodes = len(stats)
+    unperfect_nodes = sum(1 for s in stats.values() if s["not_perfect"] > 0)
 
     filtered_nodes = {
-        int(node_id)
-        for node_id, stats in node_stats.items()
-        if stats["not_perfect"] > 1 and stats["not_perfect"] / (stats["not_perfect"] + stats["perfect"]) > 0.1
+        int(nid)
+        for nid, s in stats.items()
+        if s["not_perfect"] > 1
+        and s["not_perfect"] / (s["perfect"] + s["not_perfect"]) > 0.1
     }
-    print(f"Filtered {len(filtered_nodes)} node IDs meeting criteria.")
 
-    total_reads = 0
-    all_results = []
-    start_time = time.perf_counter()
-    next_milestone = milestone
+    print("\nNode‑level overview")
+    print(f"  Total nodes in pickle      : {total_nodes}")
+    print(
+        f"  Nodes with ≥1 un‑perfect   : {unperfect_nodes} "
+        f"({unperfect_nodes/total_nodes*100:.2f} %)"
+    )
+    print(
+        f"  Nodes passing filter       : {len(filtered_nodes)} "
+        f"({len(filtered_nodes)/total_nodes*100:.2f} %)\n"
+    )
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=threads) as executor:
-        futures = []
-        for messages in parse_gam_file_groups(gam_file):
-            futures.append(executor.submit(process_group_extract, (messages, filtered_nodes)))
-            while len(futures) >= max_pending:
-                done, futures = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
-                for fut in done:
-                    result, read_count = fut.result()
-                    all_results.append((result, read_count))
-                    total_reads += read_count
-                    if total_reads >= next_milestone:
-                        elapsed = time.perf_counter() - start_time
-                        print(f"\nMilestone reached:")
-                        print(f"  Total reads processed: {total_reads}")
-                        print(f"  Nodes recorded so far: {len(set().union(*[r.keys() for r, _ in all_results]))}")
-                        print(f"  Elapsed time: {elapsed:.2f} seconds")
-                        next_milestone += milestone
+    parts, total, nxt, t0 = [], 0, milestone, time.perf_counter()
+    with concurrent.futures.ProcessPoolExecutor(max_workers=threads) as ex:
+        futs = []
+        for msgs in parse_gam_groups(gam):
+            futs.append(ex.submit(proc_group, (msgs, filtered_nodes)))
+            while len(futs) >= max_pending:
+                done, not_done = concurrent.futures.wait(
+                    futs, return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                for ft in done:
+                    parts.append(ft.result())
+                    total += ft.result()[1]
+                futs = list(not_done)
+                if total >= nxt:
+                    print(
+                        f"Milestone {total} reads  |  elapsed {time.perf_counter()-t0:.1f}s"
+                    )
+                    nxt += milestone
+        for ft in concurrent.futures.as_completed(futs):
+            parts.append(ft.result())
+            total += ft.result()[1]
+            if total >= nxt:
+                print(
+                    f"Milestone {total} reads  |  elapsed {time.perf_counter()-t0:.1f}s"
+                )
+                nxt += milestone
 
-        for fut in concurrent.futures.as_completed(futures):
-            result, read_count = fut.result()
-            all_results.append((result, read_count))
-            total_reads += read_count
-            if total_reads >= next_milestone:
-                elapsed = time.perf_counter() - start_time
-                print(f"\nMilestone reached:")
-                print(f"  Total reads processed: {total_reads}")
-                print(f"  Nodes recorded so far: {len(set().union(*[r.keys() for r, _ in all_results]))}")
-                print(f"  Elapsed time: {elapsed:.2f} seconds")
-                next_milestone += milestone
+    merged, _ = merge(parts)
 
-    merged, _ = merge_node_results(all_results)
+    # -------- pre‑write summary ---------------------------------------------
+    print("\n--- pre‑write summary ---")
+    print(f"  Reads processed : {total}")
+    print(f"  Nodes saved     : {len(merged)}")
+    print(f"  Elapsed so far  : {time.perf_counter()-t0:.2f}s")
 
-    json_path = output_prefix + ".json"
-    pkl_path = output_prefix + ".pkl"
+    if fmt in ("json", "both"):
+        jfile = prefix + ".json"
+        with open(jfile, "w") as jf:
+            json.dump(merged, jf, indent=2)
+        print(f"  JSON written    : {jfile}")
+    if fmt in ("pkl", "both"):
+        pfile = prefix + ".pkl"
+        with open(pfile, "wb") as pf:
+            pickle.dump(merged, pf, pickle.HIGHEST_PROTOCOL)
+        print(f"  Pickle written  : {pfile}")
 
-    with open(json_path, "w") as f:
-        json.dump(merged, f, indent=2)
-    print(f"\nJSON saved to {json_path}")
-
-    with open(pkl_path, "wb") as f:
-        pickle.dump(merged, f, protocol=pickle.HIGHEST_PROTOCOL)
-    print(f"Pickle saved to {pkl_path}")
+    # -------- final summary -------------------------------------------------
+    print("\n--- final summary ---")
+    print(f"  Total reads processed : {total}")
+    print(f"  Total nodes saved     : {len(merged)}")
+    print(f"  Total time            : {time.perf_counter()-t0:.2f}s\n")
 
 
+# ---------- CLI --------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Extract read segments mapping to nodes with high not-perfect ratio.")
-    parser.add_argument("gam_file", help="Input GAM file")
-    parser.add_argument("node_stats_pickle", help="Pickle file of node -> {perfect, not_perfect}")
-    parser.add_argument("output_prefix", help="Prefix for output files (.json and .pkl)")
-    parser.add_argument("--threads", type=int, default=4, help="Number of worker threads (default: 4)")
-    parser.add_argument("--max_pending", type=int, default=16, help="Maximum number of futures pending (default: 16)")
-    parser.add_argument("--milestone", type=int, default=100_000_000, help="Reads between progress updates (default: 100M)")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(
+        description="Extract node‑mapped read segments with high un‑perfect ratio"
+    )
+    ap.add_argument("gam_file")
+    ap.add_argument("stats_pickle")
+    ap.add_argument("output_prefix")
+    ap.add_argument(
+        "--save-format",
+        choices=["json", "pkl", "both"],
+        default="both",
+        help="Which file type(s) to write (default both)",
+    )
+    ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--max_pending", type=int, default=16)
+    ap.add_argument("--milestone", type=int, default=100_000_000)
+    args = ap.parse_args()
 
-    extract_node_segments_parallel(
+    run(
         args.gam_file,
-        args.node_stats_pickle,
+        args.stats_pickle,
         args.output_prefix,
+        args.save_format,
         args.threads,
         args.max_pending,
-        args.milestone
+        args.milestone,
     )
 
 

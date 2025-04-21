@@ -198,8 +198,9 @@ def main():
     elapsed = time.perf_counter() - start_time
     print("\nFinal Summary:")
     print(f"  Total reads processed: {total_count}")
-    print(f"  Perfect reads: {perfect_count} ({(perfect_count / total_count * 100):.2f}% of total)")
-    print(f"  Not-perfect reads: {not_perfect_count} ({(not_perfect_count / total_count * 100):.2f}% of total)")
+    print(f"  Perfect read segments: {perfect_count} ({(perfect_count / total_count * 100):.2f}% of total)")
+    print(f"  Not-perfect reads segments: {not_perfect_count} ({(not_perfect_count / total_count * 100):.2f}% of total)")
+    print(f"  Nodes included: {len(node_to_reads_all)}")
     print(f"  Elapsed time: {elapsed:.2f} seconds.")
 
 
