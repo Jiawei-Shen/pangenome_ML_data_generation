@@ -5,7 +5,6 @@ import sqlite3
 import vg_pb2
 import gc
 import time
-import json
 from collections import defaultdict
 
 def read_varint(stream):
@@ -47,12 +46,12 @@ def gam_record_iter(path, tag="GAM"):
                 break
 
 def process_alignment(raw_msg, wanted_nodes, chrom_filter):
-    segs_by_node = defaultdict(list)
+    entries = []
     alignment = vg_pb2.Alignment()
     alignment.ParseFromString(raw_msg)
 
     if chrom_filter and not any(p.name == chrom_filter for p in alignment.refpos):
-        return segs_by_node, 0
+        return [], 0
 
     read_seq = alignment.sequence
     read_qual = alignment.quality
@@ -70,43 +69,39 @@ def process_alignment(raw_msg, wanted_nodes, chrom_filter):
         node_off = mapping.position.offset
         strand = "-" if mapping.position.is_reverse else "+"
         parts = []
-        qual_bytes = list(read_qual)  # for JSON compatibility
+        qual_bytes = []
 
         for edit in mapping.edit:
             if edit.from_length:
                 frag = read_seq[read_off:read_off + edit.from_length]
                 parts.append(frag.lower() if edit.sequence else frag)
+                qual_bytes.extend(read_qual[read_off:read_off + edit.from_length])
                 read_off += edit.from_length
             elif edit.sequence:
                 l = len(edit.sequence)
                 frag = read_seq[read_off:read_off + l]
                 parts.append(frag.lower())
+                qual_bytes.extend(read_qual[read_off:read_off + l])
                 read_off += l
 
-        segs_by_node[node_id].append({
-            "offset": node_off,
-            "seq": "".join(parts),
-            "bq": qual_bytes[read_off - len(parts[-1]):read_off],
-            "rq": mapq,
-            "strand": strand
-        })
+        entries.append((
+            node_id,
+            node_off,
+            strand,
+            mapq,
+            "".join(parts),
+            bytes(qual_bytes).hex()
+        ))
 
-    return segs_by_node, read_count
+    return entries, read_count
 
-def flush_all(conn, node_cache):
-    for nid, segs_to_flush in list(node_cache.items()):
-        if not segs_to_flush:
-            continue
-        cur = conn.execute("SELECT data FROM segments WHERE node_id=?", (nid,))
-        row = cur.fetchone()
-        if row:
-            old_list = json.loads(row[0])
-            old_list.extend(segs_to_flush)
-        else:
-            old_list = segs_to_flush
-        conn.execute("INSERT OR REPLACE INTO segments VALUES (?, ?)", (nid, json.dumps(old_list)))
-        node_cache[nid].clear()
-    conn.commit()
+def flush_entries(conn, entries):
+    if entries:
+        conn.executemany("""
+            INSERT INTO segments (node_id, offset, strand, rq, seq, bq)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, entries)
+        conn.commit()
 
 def main():
     parser = argparse.ArgumentParser()
@@ -124,41 +119,39 @@ def main():
         int(nid) for nid, v in stats.items()
         if v["not_perfect"] > 1 and v["not_perfect"] / (v["not_perfect"] + v["perfect"]) > 0.1
     }
-    total_nodes = len(stats)
-    nodes_with_unperfect = sum(1 for s in stats.values() if s["not_perfect"] > 0)
-    print("\nNode‑level overview")
-    print(f"  Total nodes               : {total_nodes}")
-    print(f"  Nodes with ≥1 un‑perfect  : {nodes_with_unperfect} "
-          f"({nodes_with_unperfect/total_nodes*100:.2f}%)")
-    print(f"  Nodes passing filter      : {len(wanted_nodes)} "
-          f"({len(wanted_nodes)/total_nodes*100:.2f}%)\n")
-
-    del stats
-    gc.collect()
 
     conn = sqlite3.connect(args.sqlite)
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("CREATE TABLE IF NOT EXISTS segments (node_id INTEGER PRIMARY KEY, data TEXT)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS segments (
+            node_id INTEGER,
+            offset INTEGER,
+            strand TEXT,
+            rq INTEGER,
+            seq TEXT,
+            bq TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_node ON segments(node_id)")
 
     total_reads = 0
-    node_cache = defaultdict(list)
-    start = time.perf_counter()
+    batch_entries = []
     milestone = args.milestone
+    start = time.perf_counter()
 
     for raw_msg in gam_record_iter(args.gam):
-        segs, count = process_alignment(raw_msg, wanted_nodes, args.chr)
+        entries, count = process_alignment(raw_msg, wanted_nodes, args.chr)
+        batch_entries.extend(entries)
         total_reads += count
 
-        for nid, items in segs.items():
-            node_cache[nid].extend(items)
-
         if total_reads >= milestone:
-            flush_all(conn, node_cache)
+            flush_entries(conn, batch_entries)
+            batch_entries.clear()
             elapsed = time.perf_counter() - start
-            print(f"{total_reads} reads processed | {elapsed:.1f} s")
+            print(f"{total_reads} reads processed | {elapsed:.1f}s")
             milestone += args.milestone
 
-    flush_all(conn, node_cache)
+    flush_entries(conn, batch_entries)
     conn.close()
     print(f"✅ Done. Total reads: {total_reads}")
 
