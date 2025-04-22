@@ -7,6 +7,7 @@ with strand, and save as JSON / Pickle / both.
 import argparse, gzip, json, pickle, time, base64
 import concurrent.futures, vg_pb2
 import gc  # Garbage collector interface
+from itertools import islice
 
 # ─────────────────────────── helpers ─────────────────────────────────────────
 def read_varint(stream):
@@ -150,13 +151,14 @@ def run_pipeline(
     partials = []
     reads_total = 0
     next_milestone = milestone
+    subset = set(islice(filtered_nodes, 1000))
 
     start = time.perf_counter()
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=threads) as ex:
         pending = []
         for batch in parse_gam_groups(gam_path):
-            pending.append(ex.submit(process_group, (batch, filtered_nodes[:1000], chrom)))
+            pending.append(ex.submit(process_group, (batch, subset, chrom)))
             while len(pending) >= max_pending:
                 done, not_done = concurrent.futures.wait(
                     pending, return_when=concurrent.futures.FIRST_COMPLETED)
