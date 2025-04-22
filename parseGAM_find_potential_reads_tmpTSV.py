@@ -188,7 +188,7 @@ def main():
     parser.add_argument("--chr", default="", help="Chromosome name to filter on")
     parser.add_argument("--output_db", default="./tmp/pileup.sqlite", help="Output SQLite filename")
     parser.add_argument("--tmp_dir", default='./tmp', help="Temp directory (unused here, kept for compatibility)")
-    parser.add_argument("--milestone", type=int, default=100_000_000, help="Progress update interval")
+    parser.add_argument("--milestone", type=int, default=10_000_000, help="Progress update interval")
 
     args = parser.parse_args()
     os.makedirs(args.tmp_dir, exist_ok=True)

@@ -93,8 +93,12 @@ def main():
 
     # init SQLite
     conn = sqlite3.connect(args.sqlite)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=OFF")
+    # 1) speed up journaling
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=OFF;")
+    conn.execute("PRAGMA temp_store=MEMORY;")
+    # 2) wrap all inserts in one big transaction
+    conn.execute("BEGIN")
     conn.execute("DROP TABLE IF EXISTS segments")
     conn.execute("""CREATE TABLE segments (
         node_id INTEGER,
@@ -110,7 +114,7 @@ def main():
     reads = 0
     next_m = args.milestone
     t0 = time.perf_counter()
-    conn.execute("BEGIN")
+
 
     for raw in gam_record_iter(args.gam):
         rows = process_alignment(raw, wanted, args.chr)
