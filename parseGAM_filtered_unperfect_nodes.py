@@ -62,9 +62,12 @@ def process_group(args):
     message_list, wanted_nodes, chrom_filter = args
     node_segments, read_count = {}, 0
     for raw in message_list:
-        aln = vg_pb2.Alignment(); aln.ParseFromString(raw)
+        aln = vg_pb2.Alignment()
+        aln.ParseFromString(raw)
+
         if chrom_filter and not any(rp.name == chrom_filter for rp in aln.refpos):
             continue
+
         read_count += 1
         seq = aln.sequence
         qual_bytes = aln.quality
@@ -72,6 +75,8 @@ def process_group(args):
         read_offset = 0
 
         for mapping in aln.path.mapping:
+            if not mapping.position.node_id:
+                continue
             node_id = mapping.position.node_id
             if node_id not in wanted_nodes:
                 for e in mapping.edit:
@@ -105,6 +110,7 @@ def process_group(args):
                 "read_quality": mapq,
                 "strand": strand_char
             })
+
     return node_segments, read_count
 
 def merge_partial(parts):
@@ -149,12 +155,14 @@ def run_pipeline(
                 done, not_done = concurrent.futures.wait(
                     pending, return_when=concurrent.futures.FIRST_COMPLETED)
                 for fut in done:
-                    partials.append(fut.result()); reads_total += fut.result()[1]
+                    partials.append(fut.result())
+                    reads_total += fut.result()[1]
                 pending = list(not_done)
                 if reads_total >= next_milestone:
                     print(f"Milestone {reads_total} reads | "
                           f"{time.perf_counter()-start:.1f}s")
                     next_milestone += milestone
+
         for fut in concurrent.futures.as_completed(pending):
             partials.append(fut.result()); reads_total += fut.result()[1]
             if reads_total >= next_milestone:
