@@ -151,7 +151,7 @@ def run_pipeline(
     partials = []
     reads_total = 0
     next_milestone = milestone
-    subset = set(islice(filtered_nodes, 1000))
+    subset = set(islice(filtered_nodes, 1000000))
 
     start = time.perf_counter()
 
