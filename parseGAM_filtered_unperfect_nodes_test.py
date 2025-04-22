@@ -1,194 +1,207 @@
 #!/usr/bin/env python3
-"""
-Aggregate perfect / un‑perfect read‑segments per VG node
-(with strand) and save as JSON / Pickle / both – single‑threaded.
-"""
-import argparse, gzip, json, pickle, time, base64
-import vg_pb2                     # protobufs generated from vg.proto
+import argparse
+import gzip
+import json
+import pickle
+import time
+import gc
+import vg_pb2
 
-# ───────── helpers ──────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Utility: Read varint from stream
 def read_varint(stream):
-    value = shift = 0
+    value = 0
+    shift_amount = 0
     while True:
-        b = stream.read(1)
-        if not b:
+        byte_pair = stream.read(1)
+        if not byte_pair:
             raise EOFError
-        byte = b[0]
-        value |= (byte & 0x7F) << shift
-        if not (byte & 0x80):
+        byte_value = byte_pair[0]
+        value |= (byte_value & 0x7F) << shift_amount
+        if not (byte_value & 0x80):
             return value
-        shift += 7
+        shift_amount += 7
 
-def file_is_gzip(path: str) -> bool:
-    with open(path, "rb") as fh:
-        return fh.read(2) == b"\x1f\x8b"
+# Utility: Check if a file is gzipped
+def file_is_gzip(path):
+    with open(path, "rb") as file_handle:
+        return file_handle.read(2) == b"\x1f\x8b"
 
-def parse_gam_groups(path: str, tag="GAM"):
-    opener = gzip.open if file_is_gzip(path) else open
-    with opener(path, "rb") as fh:
+# Generator: Yield groups of GAM records from file
+def gam_group_iter(path, tag="GAM"):
+    open_func = gzip.open if file_is_gzip(path) else open
+    with open_func(path, "rb") as file_handle:
         while True:
             try:
-                group_count = read_varint(fh)
+                group_count = read_varint(file_handle)
             except EOFError:
                 break
             if group_count == 0:
                 continue
             try:
-                tag_len   = read_varint(fh)
-                group_tag = fh.read(tag_len).decode()
+                tag_length = read_varint(file_handle)
+                group_tag = file_handle.read(tag_length).decode()
             except (EOFError, UnicodeDecodeError):
                 break
-
-            # skip groups that aren’t GAM
             if group_tag != tag:
                 for _ in range(group_count - 1):
                     try:
-                        skip = read_varint(fh)
-                        fh.seek(skip, 1)
+                        skip_length = read_varint(file_handle)
+                        file_handle.seek(skip_length, 1)
                     except EOFError:
                         break
                 continue
-
-            msgs = []
+            message_list = []
             for _ in range(group_count - 1):
                 try:
-                    size = read_varint(fh)
-                    msg  = fh.read(size)
+                    message_size = read_varint(file_handle)
+                    message_bytes = file_handle.read(message_size)
                 except EOFError:
                     break
-                if len(msg) == size:
-                    msgs.append(msg)
-            if msgs:
-                yield msgs
+                if len(message_bytes) == message_size:
+                    message_list.append(message_bytes)
+            if message_list:
+                yield message_list
 
-# ───────── worker (now local call) ─────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Process one group of alignments
 def process_group(message_list, wanted_nodes, chrom_filter):
-    node_segments, read_count = {}, 0
-    for raw in message_list:
-        aln = vg_pb2.Alignment(); aln.ParseFromString(raw)
+    segment_dict = {}
+    read_count = 0
 
-        if chrom_filter and not any(rp.name == chrom_filter for rp in aln.refpos):
+    for raw_message in message_list:
+        alignment = vg_pb2.Alignment()
+        alignment.ParseFromString(raw_message)
+
+        if chrom_filter and not any(pos.name == chrom_filter for pos in alignment.refpos):
             continue
 
         read_count += 1
-        seq, qual_bytes, mapq = aln.sequence, aln.quality, aln.mapping_quality
+        read_sequence = alignment.sequence
+        read_quality_bytes = alignment.quality
+        mapping_quality = alignment.mapping_quality
         read_offset = 0
 
-        for mapping in aln.path.mapping:
-            nid = mapping.position.node_id
-            if nid not in wanted_nodes:
-                for e in mapping.edit:
-                    read_offset += max(e.from_length, len(e.sequence))
+        for mapping in alignment.path.mapping:
+            node_id = mapping.position.node_id
+
+            if node_id not in wanted_nodes:
+                for edit in mapping.edit:
+                    read_offset += max(edit.from_length, len(edit.sequence))
                 continue
 
-            node_offset  = mapping.position.offset
-            strand_char  = "-" if mapping.position.is_reverse else "+"
+            node_offset = mapping.position.offset
+            strand_char = "-" if mapping.position.is_reverse else "+"
+            sequence_parts = []
+            quality_bytes = bytearray()
 
-            part_seq, part_q = [], bytearray()
             for edit in mapping.edit:
                 if edit.from_length:
-                    frag = seq[read_offset : read_offset + edit.from_length]
-                    part_seq.append(frag.lower() if edit.sequence else frag)
-                    part_q.extend(qual_bytes[read_offset : read_offset + edit.from_length])
+                    fragment = read_sequence[read_offset : read_offset + edit.from_length]
+                    sequence_parts.append(fragment.lower() if edit.sequence else fragment)
+                    quality_bytes.extend(read_quality_bytes[read_offset : read_offset + edit.from_length])
                     read_offset += edit.from_length
-                elif edit.sequence:          # insertion
-                    ins_len = len(edit.sequence)
-                    part_seq.append(seq[read_offset : read_offset + ins_len].lower())
-                    part_q.extend(qual_bytes[read_offset : read_offset + ins_len])
-                    read_offset += ins_len
+                elif edit.sequence:
+                    insertion_length = len(edit.sequence)
+                    fragment = read_sequence[read_offset : read_offset + insertion_length]
+                    sequence_parts.append(fragment.lower())
+                    quality_bytes.extend(read_quality_bytes[read_offset : read_offset + insertion_length])
+                    read_offset += insertion_length
 
-            node_segments.setdefault(nid, []).append({
-                "offset"      : node_offset,
-                "sequence"    : "".join(part_seq),
-                "base_quality": base64.b64encode(part_q).decode(),
-                "read_quality": mapq,
-                "strand"      : strand_char
+            # Record this read‑segment for the current node
+            segment_dict.setdefault(node_id, []).append({
+                "offset"           : node_offset,                   # Start within node
+                "sequence"         : "".join(sequence_parts),       # Bases (insertions lower‑cased)
+                "base_quality_hex" : quality_bytes.hex(),           # Per‑base Phred scores, hex-encoded
+                "read_quality"     : mapping_quality,               # MAPQ from the read
+                "strand"           : strand_char                    # "+" or "-" on node
             })
-    return node_segments, read_count
 
-def merge_partial(parts):
-    merged, total = {}, 0
-    for part, cnt in parts:
-        total += cnt
-        for nid, segs in part.items():
-            merged.setdefault(nid, []).extend(segs)
-    return merged, total
+    return segment_dict, read_count
 
-# ───────── pipeline ────────────────────────────────────────────────────────
-def run_pipeline(gam_path, stats_pkl, prefix, fmt, milestone, chrom):
-    print(f"Loading stats: {stats_pkl}")
-    with open(stats_pkl, "rb") as fh:
-        stats = pickle.load(fh)
+# ─────────────────────────────────────────────────────────────────────────────
+# Merge multiple segment dictionaries
+def merge_partials(partial_list):
+    merged_dict = {}
+    total_reads = 0
+    for segment_dict, read_count in partial_list:
+        total_reads += read_count
+        for node_id, segment_list in segment_dict.items():
+            merged_dict.setdefault(node_id, []).extend(segment_list)
+    return merged_dict, total_reads
 
-    total_nodes          = len(stats)
-    nodes_with_unperfect = sum(1 for s in stats.values() if s["not_perfect"] > 0)
-    filtered_nodes = {
-        int(nid)
-        for nid, s in stats.items()
-        if s["not_perfect"] > 1 and s["not_perfect"] / (s["perfect"] + s["not_perfect"]) > 0.1
+# ─────────────────────────────────────────────────────────────────────────────
+# Main pipeline
+def run_pipeline(gam_path, stats_path, output_prefix, output_format, milestone_step, chrom_filter):
+    print(f"Loading stats: {stats_path}")
+    with open(stats_path, "rb") as stats_file:
+        stats_data = pickle.load(stats_file)
+
+    wanted_nodes = {
+        int(node_id)
+        for node_id, stat in stats_data.items()
+        if stat["not_perfect"] > 1 and stat["not_perfect"] / (stat["perfect"] + stat["not_perfect"]) > 0.10
     }
 
-    print("\nNode‑level overview")
-    print(f"  Total nodes               : {total_nodes}")
-    print(f"  Nodes with ≥1 un‑perfect  : {nodes_with_unperfect} "
-          f"({nodes_with_unperfect/total_nodes*100:.2f} %)")
-    print(f"  Nodes passing filter      : {len(filtered_nodes)} "
-          f"({len(filtered_nodes)/total_nodes*100:.2f} %)\n")
+    del stats_data
+    gc.collect()  # Release memory
 
-    partials, reads_total, next_mstone = [], 0, milestone
-    start = time.perf_counter()
+    print(f"Filtered {len(wanted_nodes)} nodes from stats file.")
 
-    for batch in parse_gam_groups(gam_path):
-        part = process_group(batch, filtered_nodes, chrom)
-        partials.append(part)
-        reads_total += part[1]
+    partial_results = []
+    total_reads = 0
+    next_milestone = milestone_step
+    start_time = time.perf_counter()
 
-        if reads_total >= next_mstone:
-            print(f"Milestone {reads_total} reads | {time.perf_counter()-start:.1f}s")
-            next_mstone += milestone
+    for message_batch in gam_group_iter(gam_path):
+        result = process_group(message_batch, wanted_nodes, chrom_filter)
+        partial_results.append(result)
+        total_reads += result[1]
 
-    merged, _ = merge_partial(partials)
+        if total_reads >= next_milestone:
+            elapsed = time.perf_counter() - start_time
+            print(f"{total_reads} reads processed | {elapsed:.1f} seconds")
+            next_milestone += milestone_step
 
-    # ─── write out ──────────────────────────────────────────────────────────
-    print("\n--- pre‑write summary ---")
-    print(f"  Reads processed : {reads_total}")
-    print(f"  Nodes saved     : {len(merged)}")
-    print(f"  Elapsed so far  : {time.perf_counter()-start:.2f}s")
+    merged_segments, _ = merge_partials(partial_results)
 
-    if fmt in ("json", "both"):
-        jfile = prefix + ".json"
-        with open(jfile, "w") as jf:
-            json.dump({str(k): v for k, v in merged.items()}, jf, indent=2)
-        print(f"  JSON written    : {jfile}")
-    if fmt in ("pkl", "both"):
-        pfile = prefix + ".pkl"
-        with open(pfile, "wb") as pf:
-            pickle.dump(merged, pf, pickle.HIGHEST_PROTOCOL)
-        print(f"  Pickle written  : {pfile}")
+    if output_format in ("json", "both"):
+        json_path = output_prefix + ".json"
+        with open(json_path, "w") as json_file:
+            json.dump({str(k): v for k, v in merged_segments.items()}, json_file)
+        print(f"Wrote JSON: {json_path}")
 
-    print("\n--- final summary ---")
-    print(f"  Reads processed : {reads_total}")
-    print(f"  Nodes saved     : {len(merged)}")
-    print(f"  Total time      : {time.perf_counter()-start:.2f}s\n")
+    if output_format in ("pkl", "both"):
+        pickle_path = output_prefix + ".pkl"
+        with open(pickle_path, "wb") as pickle_file:
+            pickle.dump(merged_segments, pickle_file, pickle.HIGHEST_PROTOCOL)
+        print(f"Wrote Pickle: {pickle_path}")
 
-# ───────── CLI ──────────────────────────────────────────────────────────────
+    elapsed = time.perf_counter() - start_time
+    print("\nFinal Summary:")
+    print(f"  Total reads processed: {total_reads}")
+    print(f"  Nodes included: {len(merged_segments)}")
+    print(f"  Elapsed time: {elapsed:.2f} seconds")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Command-line interface
 def main():
-    ap = argparse.ArgumentParser(
-        description="Extract node‑mapped read segments with strand and high un‑perfect ratio (single‑thread)."
-    )
-    ap.add_argument("gam_file")
-    ap.add_argument("stats_pickle")
-    ap.add_argument("output_prefix")
-    ap.add_argument("--save-format", choices=["json", "pkl", "both"],
-                    default="json", help="File format(s) to write")
-    ap.add_argument("--milestone", type=int, default=100_000_000,
-                    help="Progress update frequency (reads)")
-    ap.add_argument("--chr", default="", help="Restrict to chromosome name in refpos")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser(description="Extract read-segments by node from a GAM file.")
+    parser.add_argument("gam_path", help="Path to the GAM file")
+    parser.add_argument("stats_pickle", help="Path to the node stats pickle file")
+    parser.add_argument("output_prefix", help="Prefix for output files")
+    parser.add_argument("--fmt", choices=["json", "pkl", "both"], default="json", help="Output format")
+    parser.add_argument("--milestone", type=int, default=100_000_000, help="Progress report interval")
+    parser.add_argument("--chr", default="", help="Optional chromosome name to filter on")
+    args = parser.parse_args()
 
     run_pipeline(
-        args.gam_file, args.stats_pickle, args.output_prefix,
-        args.save_format, args.milestone, args.chr
+        gam_path=args.gam_path,
+        stats_path=args.stats_pickle,
+        output_prefix=args.output_prefix,
+        output_format=args.fmt,
+        milestone_step=args.milestone,
+        chrom_filter=args.chr
     )
 
 if __name__ == "__main__":
