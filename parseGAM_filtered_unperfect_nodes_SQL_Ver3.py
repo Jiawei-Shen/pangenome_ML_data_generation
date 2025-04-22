@@ -9,8 +9,6 @@ import gc
 import time
 from collections import defaultdict
 
-MAX_CACHE_SIZE = 1_000_000  # Flush when a single node gets this many reads
-
 def read_varint(stream):
     value, shift = 0, 0
     while True:
@@ -98,25 +96,20 @@ def process_alignment(raw_msg, wanted_nodes, chrom_filter):
 
     return segs_by_node, read_count
 
-def flush_node_to_sqlite(conn, nid, node_cache):
-    segs_to_flush = node_cache[nid]
-    if not segs_to_flush:
-        return
-    # Load existing blob if present
-    cur = conn.execute("SELECT blob FROM segments WHERE node_id=?", (nid,))
-    row = cur.fetchone()
-    if row:
-        old_list = pickle.loads(zlib.decompress(row[0]))
-        old_list.extend(segs_to_flush)
-    else:
-        old_list = segs_to_flush
-    new_blob = zlib.compress(pickle.dumps(old_list, protocol=5))
-    conn.execute("INSERT OR REPLACE INTO segments VALUES (?, ?)", (nid, new_blob))
-    node_cache[nid].clear()
-
 def flush_all(conn, node_cache):
-    for nid in list(node_cache.keys()):
-        flush_node_to_sqlite(conn, nid, node_cache)
+    for nid, segs_to_flush in list(node_cache.items()):
+        if not segs_to_flush:
+            continue
+        cur = conn.execute("SELECT blob FROM segments WHERE node_id=?", (nid,))
+        row = cur.fetchone()
+        if row:
+            old_list = pickle.loads(zlib.decompress(row[0]))
+            old_list.extend(segs_to_flush)
+        else:
+            old_list = segs_to_flush
+        new_blob = zlib.compress(pickle.dumps(old_list, protocol=5))
+        conn.execute("INSERT OR REPLACE INTO segments VALUES (?, ?)", (nid, new_blob))
+        node_cache[nid].clear()
     conn.commit()
 
 def main():
@@ -161,11 +154,9 @@ def main():
 
         for nid, items in segs.items():
             node_cache[nid].extend(items)
-            if len(node_cache[nid]) >= MAX_CACHE_SIZE:
-                flush_node_to_sqlite(conn, nid, node_cache)
 
         if total_reads >= milestone:
-            conn.commit()
+            flush_all(conn, node_cache)
             elapsed = time.perf_counter() - start
             print(f"{total_reads} reads processed | {elapsed:.1f} s")
             milestone += args.milestone
