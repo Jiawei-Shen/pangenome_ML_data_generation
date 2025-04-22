@@ -134,6 +134,15 @@ def main():
         int(nid) for nid, v in stats.items()
         if v["not_perfect"] > 1 and v["not_perfect"] / (v["not_perfect"] + v["perfect"]) > 0.1
     }
+    total_nodes = len(stats)
+    nodes_with_unperfect = sum(1 for s in stats.values() if s["not_perfect"] > 0)
+    print("\nNode‑level overview")
+    print(f"  Total nodes               : {total_nodes}")
+    print(f"  Nodes with ≥1 un‑perfect  : {nodes_with_unperfect} "
+          f"({nodes_with_unperfect/total_nodes*100:.2f}%)")
+    print(f"  Nodes passing filter      : {len(wanted_nodes)} "
+          f"({len(wanted_nodes)/total_nodes*100:.2f}%)\n")
+
     del stats
     gc.collect()
 
