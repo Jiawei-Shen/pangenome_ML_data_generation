@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 import argparse
 import gzip
-import json
 import pickle
 import time
 import gc
+import json
+import shelve
 from collections import defaultdict
 import vg_pb2
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Utility: Read varint from stream
 def read_varint(stream):
     value = 0
     shift_amount = 0
@@ -23,46 +22,33 @@ def read_varint(stream):
             return value
         shift_amount += 7
 
-# Utility: Check if a file is gzipped
 def file_is_gzip(path):
     with open(path, "rb") as file_handle:
         return file_handle.read(2) == b"\x1f\x8b"
 
-# Generator: Yield one GAM record at a time
 def gam_record_iter(path, tag="GAM"):
     open_func = gzip.open if file_is_gzip(path) else open
     with open_func(path, "rb") as f:
         while True:
             try:
                 group_count = read_varint(f)
-            except EOFError:
-                break
-            if group_count == 0:
-                continue
-            try:
+                if group_count == 0:
+                    continue
                 tag_len = read_varint(f)
                 group_tag = f.read(tag_len).decode()
-            except (EOFError, UnicodeDecodeError):
-                break
-            if group_tag != tag:
-                for _ in range(group_count - 1):
-                    try:
+                if group_tag != tag:
+                    for _ in range(group_count - 1):
                         skip_len = read_varint(f)
                         f.seek(skip_len, 1)
-                    except EOFError:
-                        break
-                continue
-            for _ in range(group_count - 1):
-                try:
+                    continue
+                for _ in range(group_count - 1):
                     msg_size = read_varint(f)
                     yield f.read(msg_size)
-                except EOFError:
-                    break
+            except (EOFError, UnicodeDecodeError):
+                break
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Process one alignment record
 def process_alignment(raw_message, wanted_nodes, chrom_filter):
-    segment_dict = {}
+    segment_dict = defaultdict(list)
     alignment = vg_pb2.Alignment()
     alignment.ParseFromString(raw_message)
 
@@ -100,19 +86,28 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
                 quality_bytes.extend(read_quality_bytes[read_offset: read_offset + ins_len])
                 read_offset += ins_len
 
-        segment_dict.setdefault(node_id, []).append({
+        segment_dict[node_id].append({
             "offset": node_offset,
             "seq": "".join(sequence_parts),
-            "bq": bytes(quality_bytes),  # store as raw bytes
+            "bq": bytes(quality_bytes),
             "rq": mapping_quality,
             "strand": strand_char
         })
 
     return segment_dict, reads
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main pipeline
-def run_pipeline(gam_path, stats_path, output_prefix, output_format, milestone_step, chrom_filter):
+def flush_segment_dict(shelf, buffer_dict):
+    for node_id, segs in buffer_dict.items():
+        key = str(node_id)
+        if key in shelf:
+            old = pickle.loads(shelf[key])
+            old.extend(segs)
+        else:
+            old = segs
+        shelf[key] = pickle.dumps(old, protocol=pickle.HIGHEST_PROTOCOL)
+    buffer_dict.clear()
+
+def run_pipeline(gam_path, stats_path, output_db, milestone_step, chrom_filter):
     print(f"Loading stats: {stats_path}")
     with open(stats_path, "rb") as stats_file:
         stats_data = pickle.load(stats_file)
@@ -125,55 +120,38 @@ def run_pipeline(gam_path, stats_path, output_prefix, output_format, milestone_s
 
     del stats_data
     gc.collect()
-
     print(f"Filtered {len(wanted_nodes)} nodes from stats file.")
 
-    merged_segments = defaultdict(list)
+    segment_buffer = defaultdict(list)
     total_reads = 0
     next_milestone = milestone_step
     start_time = time.perf_counter()
 
-    for raw_msg in gam_record_iter(gam_path):
-        segment_dict, read_count = process_alignment(raw_msg, wanted_nodes, chrom_filter)
-        total_reads += read_count
-        for node_id, segs in segment_dict.items():
-            merged_segments[node_id].extend(segs)
+    with shelve.open(output_db, writeback=False) as db:
+        for raw_msg in gam_record_iter(gam_path):
+            seg_dict, count = process_alignment(raw_msg, wanted_nodes, chrom_filter)
+            total_reads += count
+            for node_id, segs in seg_dict.items():
+                segment_buffer[node_id].extend(segs)
 
-        if total_reads >= next_milestone:
-            elapsed = time.perf_counter() - start_time
-            print(f"{total_reads} reads processed | {elapsed:.1f} seconds")
-            next_milestone += milestone_step
+            if total_reads >= next_milestone:
+                flush_segment_dict(db, segment_buffer)
+                elapsed = time.perf_counter() - start_time
+                print(f"{total_reads} reads processed | {elapsed:.1f} seconds")
+                next_milestone += milestone_step
 
-    merged_segments = dict(merged_segments)
-
-    if output_format in ("pkl", "both"):
-        pickle_path = output_prefix + ".pkl"
-        with open(pickle_path, "wb") as pickle_file:
-            pickle.dump(merged_segments, pickle_file, pickle.HIGHEST_PROTOCOL)
-        print(f"Wrote Pickle: {pickle_path}")
-
-    if output_format in ("json", "both"):
-        json_path = output_prefix + ".json"
-        with open(json_path, "w") as json_file:
-            json.dump({str(k): [
-                {**d, "bq": d["bq"].hex()} for d in v
-            ] for k, v in merged_segments.items()}, json_file)
-        print(f"Wrote JSON: {json_path}")
+        flush_segment_dict(db, segment_buffer)
 
     elapsed = time.perf_counter() - start_time
     print("\nFinal Summary:")
     print(f"  Total reads processed: {total_reads}")
-    print(f"  Nodes included: {len(merged_segments)}")
     print(f"  Elapsed time: {elapsed:.2f} seconds")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Command-line interface
 def main():
-    parser = argparse.ArgumentParser(description="Extract read-segments by node from a GAM file.")
+    parser = argparse.ArgumentParser(description="Stream and store GAM read-segments to a shelf database.")
     parser.add_argument("gam_path", help="Path to the GAM file")
     parser.add_argument("stats_pickle", help="Path to the node stats pickle file")
-    parser.add_argument("output_prefix", help="Prefix for output files")
-    parser.add_argument("--fmt", choices=["json", "pkl", "both"], default="json", help="Output format")
+    parser.add_argument("output_shelf", help="Output shelf DB file prefix")
     parser.add_argument("--milestone", type=int, default=10_000_000, help="Progress report interval")
     parser.add_argument("--chr", default="", help="Optional chromosome name to filter on")
     args = parser.parse_args()
@@ -181,8 +159,7 @@ def main():
     run_pipeline(
         gam_path=args.gam_path,
         stats_path=args.stats_pickle,
-        output_prefix=args.output_prefix,
-        output_format=args.fmt,
+        output_db=args.output_shelf,
         milestone_step=args.milestone,
         chrom_filter=args.chr
     )
