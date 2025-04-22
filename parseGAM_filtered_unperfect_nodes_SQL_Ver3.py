@@ -118,8 +118,8 @@ def main():
         reads += 1
 
         if reads >= next_m:
-            flush(conn, buf)
-            buf.clear()
+            # flush(conn, buf)
+            # buf.clear()
             dt = time.perf_counter() - t0
             print(f"{reads} reads | {dt:.1f}s")
             next_m += args.milestone
