@@ -93,11 +93,18 @@ def main():
 
     # init SQLite
     conn = sqlite3.connect(args.sqlite)
-    # 1) speed up journaling
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=OFF;")
-    conn.execute("PRAGMA temp_store=MEMORY;")
-    # 2) wrap all inserts in one big transaction
+    # 1) Use a write‑ahead log so commits are appends, not file‑renames
+    conn.execute("PRAGMA journal_mode = WAL;")
+    # 2) Skip the final fsync on each transaction (safer than OFF_SYNC=OFF, but still fast)
+    conn.execute("PRAGMA synchronous = OFF;")
+    # 3) Hold the database lock in memory (avoids repeated file locks)
+    conn.execute("PRAGMA locking_mode = EXCLUSIVE;")
+    # 4) Give SQLite a big in‑memory page cache (negative value = size in KB)
+    conn.execute("PRAGMA cache_size = -500000;")    # ~500 MB
+    # 5) Keep temp tables and indices in RAM, not on disk
+    conn.execute("PRAGMA temp_store = MEMORY;")
+    # 6) Memory‑map the database file (30 GB here—tune to your file size)
+    conn.execute("PRAGMA mmap_size = 30000000000;")
     conn.execute("BEGIN")
     conn.execute("DROP TABLE IF EXISTS segments")
     conn.execute("""CREATE TABLE segments (
