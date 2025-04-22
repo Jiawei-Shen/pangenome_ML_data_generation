@@ -5,6 +5,7 @@ import sqlite3
 import vg_pb2
 import gc
 import time
+import pickle
 from collections import defaultdict
 
 def read_varint(stream):
@@ -112,18 +113,34 @@ def main():
     parser.add_argument("--milestone", type=int, default=1_000_000)
     args = parser.parse_args()
 
-    import pickle
     with open(args.stats, "rb") as f:
         stats = pickle.load(f)
-    wanted_nodes = {
-        int(nid) for nid, v in stats.items()
-        if v["not_perfect"] > 1 and v["not_perfect"] / (v["not_perfect"] + v["perfect"]) > 0.1
-    }
 
+    # Filter node IDs based on imperfect read count
+    filtered_nodes = {
+        int(nid) for nid, v in stats.items()
+        if v["not_perfect"] > 1 and v["not_perfect"] / (v["perfect"] + v["not_perfect"]) > 0.1
+    }
+    total_nodes = len(stats)
+    nodes_with_unperfect = sum(1 for v in stats.values() if v["not_perfect"] > 0)
+
+    # Node-level summary
+    print("\nNode‑level overview")
+    print(f"  Total nodes               : {total_nodes}")
+    print(f"  Nodes with ≥1 un‑perfect  : {nodes_with_unperfect} "
+          f"({nodes_with_unperfect / total_nodes * 100:.2f} %)")
+    print(f"  Nodes passing filter      : {len(filtered_nodes)} "
+          f"({len(filtered_nodes) / total_nodes * 100:.2f} %)\n")
+
+    del stats
+    gc.collect()
+
+    # Set up database
     conn = sqlite3.connect(args.sqlite)
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("DROP TABLE IF EXISTS segments")
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS segments (
+        CREATE TABLE segments (
             node_id INTEGER,
             offset INTEGER,
             strand TEXT,
@@ -140,7 +157,7 @@ def main():
     start = time.perf_counter()
 
     for raw_msg in gam_record_iter(args.gam):
-        entries, count = process_alignment(raw_msg, wanted_nodes, args.chr)
+        entries, count = process_alignment(raw_msg, filtered_nodes, args.chr)
         batch_entries.extend(entries)
         total_reads += count
 
