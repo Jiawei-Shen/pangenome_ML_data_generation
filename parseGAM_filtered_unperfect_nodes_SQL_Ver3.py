@@ -98,11 +98,12 @@ def process_alignment(raw_msg, wanted_nodes, chrom_filter):
 
 def flush_entries(conn, entries):
     if entries:
+        conn.execute("BEGIN TRANSACTION")
         conn.executemany("""
             INSERT INTO segments (node_id, offset, strand, rq, seq, bq)
             VALUES (?, ?, ?, ?, ?, ?)
         """, entries)
-        conn.commit()
+        conn.execute("COMMIT")
 
 def main():
     parser = argparse.ArgumentParser()
@@ -116,7 +117,6 @@ def main():
     with open(args.stats, "rb") as f:
         stats = pickle.load(f)
 
-    # Filter node IDs based on imperfect read count
     filtered_nodes = {
         int(nid) for nid, v in stats.items()
         if v["not_perfect"] > 1 and v["not_perfect"] / (v["perfect"] + v["not_perfect"]) > 0.1
@@ -124,7 +124,6 @@ def main():
     total_nodes = len(stats)
     nodes_with_unperfect = sum(1 for v in stats.values() if v["not_perfect"] > 0)
 
-    # Node-level summary
     print("\nNode‑level overview")
     print(f"  Total nodes               : {total_nodes}")
     print(f"  Nodes with ≥1 un‑perfect  : {nodes_with_unperfect} "
@@ -135,9 +134,9 @@ def main():
     del stats
     gc.collect()
 
-    # Set up database
     conn = sqlite3.connect(args.sqlite)
-    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = OFF")  # Optional for speed
     conn.execute("DROP TABLE IF EXISTS segments")
     conn.execute("""
         CREATE TABLE segments (
