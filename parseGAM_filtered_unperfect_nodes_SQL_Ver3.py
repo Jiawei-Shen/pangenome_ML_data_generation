@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 import argparse
 import gzip
-import pickle
 import sqlite3
-import zlib
 import vg_pb2
 import gc
 import time
+import json
 from collections import defaultdict
 
 def read_varint(stream):
@@ -71,25 +70,23 @@ def process_alignment(raw_msg, wanted_nodes, chrom_filter):
         node_off = mapping.position.offset
         strand = "-" if mapping.position.is_reverse else "+"
         parts = []
-        qual_bytes = bytearray()
+        qual_bytes = list(read_qual)  # for JSON compatibility
 
         for edit in mapping.edit:
             if edit.from_length:
                 frag = read_seq[read_off:read_off + edit.from_length]
                 parts.append(frag.lower() if edit.sequence else frag)
-                qual_bytes.extend(read_qual[read_off:read_off + edit.from_length])
                 read_off += edit.from_length
             elif edit.sequence:
                 l = len(edit.sequence)
                 frag = read_seq[read_off:read_off + l]
                 parts.append(frag.lower())
-                qual_bytes.extend(read_qual[read_off:read_off + l])
                 read_off += l
 
         segs_by_node[node_id].append({
             "offset": node_off,
             "seq": "".join(parts),
-            "bq": bytes(qual_bytes),
+            "bq": qual_bytes[read_off - len(parts[-1]):read_off],
             "rq": mapq,
             "strand": strand
         })
@@ -100,15 +97,14 @@ def flush_all(conn, node_cache):
     for nid, segs_to_flush in list(node_cache.items()):
         if not segs_to_flush:
             continue
-        cur = conn.execute("SELECT blob FROM segments WHERE node_id=?", (nid,))
+        cur = conn.execute("SELECT data FROM segments WHERE node_id=?", (nid,))
         row = cur.fetchone()
         if row:
-            old_list = pickle.loads(zlib.decompress(row[0]))
+            old_list = json.loads(row[0])
             old_list.extend(segs_to_flush)
         else:
             old_list = segs_to_flush
-        new_blob = zlib.compress(pickle.dumps(old_list, protocol=5))
-        conn.execute("INSERT OR REPLACE INTO segments VALUES (?, ?)", (nid, new_blob))
+        conn.execute("INSERT OR REPLACE INTO segments VALUES (?, ?)", (nid, json.dumps(old_list)))
         node_cache[nid].clear()
     conn.commit()
 
@@ -121,6 +117,7 @@ def main():
     parser.add_argument("--milestone", type=int, default=1_000_000)
     args = parser.parse_args()
 
+    import pickle
     with open(args.stats, "rb") as f:
         stats = pickle.load(f)
     wanted_nodes = {
@@ -141,7 +138,7 @@ def main():
 
     conn = sqlite3.connect(args.sqlite)
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("CREATE TABLE IF NOT EXISTS segments (node_id INTEGER PRIMARY KEY, blob BLOB)")
+    conn.execute("CREATE TABLE IF NOT EXISTS segments (node_id INTEGER PRIMARY KEY, data TEXT)")
 
     total_reads = 0
     node_cache = defaultdict(list)
