@@ -6,6 +6,7 @@ with strand, and save as JSON / Pickle / both.
 
 import argparse, gzip, json, pickle, time, base64
 import concurrent.futures, vg_pb2
+import gc  # Garbage collector interface
 
 # ─────────────────────────── helpers ─────────────────────────────────────────
 def read_varint(stream):
@@ -138,11 +139,18 @@ def run_pipeline(
     print("\nNode‑level overview")
     print(f"  Total nodes               : {total_nodes}")
     print(f"  Nodes with ≥1 un‑perfect  : {nodes_with_unperfect} "
-          f"({nodes_with_unperfect/total_nodes*100:.2f} %)")
+          f"({nodes_with_unperfect / total_nodes * 100:.2f} %)")
     print(f"  Nodes passing filter      : {len(filtered_nodes)} "
-          f"({len(filtered_nodes)/total_nodes*100:.2f} %)\n")
+          f"({len(filtered_nodes) / total_nodes * 100:.2f} %)\n")
 
-    partials = []; reads_total = 0; next_milestone = milestone
+    # Release memory
+    del stats
+    gc.collect()
+
+    partials = []
+    reads_total = 0
+    next_milestone = milestone
+
     start = time.perf_counter()
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=threads) as ex:
@@ -153,7 +161,8 @@ def run_pipeline(
                 done, not_done = concurrent.futures.wait(
                     pending, return_when=concurrent.futures.FIRST_COMPLETED)
                 for fut in done:
-                    partials.append(fut.result()); reads_total += fut.result()[1]
+                    partials.append(fut.result())
+                    reads_total += fut.result()[1]
                 pending = list(not_done)
                 if reads_total >= next_milestone:
                     print(f"Milestone {reads_total} reads | "
