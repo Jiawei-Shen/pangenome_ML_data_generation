@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-Aggregate perfect / un‑perfect read‑segments per VG node
+Aggregate perfect / un‑perfect read‑segments per VG node
 with strand, and save as JSON / Pickle / both.
 """
 
 import argparse, gzip, json, pickle, time, base64
-import concurrent.futures, vg_pb2
-import gc  # Garbage collector interface
-from itertools import islice
+import vg_pb2
 
 # ─────────────────────────── helpers ─────────────────────────────────────────
 def read_varint(stream):
@@ -40,7 +38,7 @@ def parse_gam_groups(path: str, tag="GAM"):
             except (EOFError, UnicodeDecodeError):
                 break
             if group_tag != tag:
-                for _ in range(group_count - 1):      # skip whole group
+                for _ in range(group_count - 1):
                     try:
                         skip = read_varint(fh)
                         fh.seek(skip, 1)
@@ -60,58 +58,53 @@ def parse_gam_groups(path: str, tag="GAM"):
                 yield messages
 
 # ─────────────────────────── worker ──────────────────────────────────────────
-def process_group(args):
-    message_list, wanted_nodes, chrom_filter = args
+def process_group(message_list, wanted_nodes, chrom_filter):
     node_segments, read_count = {}, 0
     for raw in message_list:
-        aln = vg_pb2.Alignment()
-        aln.ParseFromString(raw)
-
+        aln = vg_pb2.Alignment(); aln.ParseFromString(raw)
         if chrom_filter and not any(rp.name == chrom_filter for rp in aln.refpos):
             continue
         read_count += 1
-        # seq = aln.sequence
-        # qual_bytes = aln.quality
-        # mapq = aln.mapping_quality
-        # read_offset = 0
+        seq = aln.sequence
+        qual_bytes = aln.quality
+        mapq = aln.mapping_quality
+        read_offset = 0
 
-        # for mapping in aln.path.mapping:
-        #     node_id = mapping.position.node_id
-        #     if node_id not in wanted_nodes:
-        #         for e in mapping.edit:
-        #             read_offset += max(e.from_length, len(e.sequence))
-        #         continue
-        #     node_offset = mapping.position.offset
-        #     strand_char = "-" if mapping.position.is_reverse else "+"
-        #
-        #     part_seq, part_q = [], bytearray()
-        #     for edit in mapping.edit:
-        #         if edit.from_length:
-        #             part_seq.append(
-        #                 seq[read_offset : read_offset + edit.from_length].lower()
-        #                 if edit.sequence else
-        #                 seq[read_offset : read_offset + edit.from_length]
-        #             )
-        #             part_q.extend(
-        #                 qual_bytes[read_offset : read_offset + edit.from_length]
-        #             )
-        #             read_offset += edit.from_length
-        #         elif edit.sequence:   # insertion
-        #             ins = len(edit.sequence)
-        #             part_seq.append(seq[read_offset : read_offset + ins].lower())
-        #             part_q.extend(qual_bytes[read_offset : read_offset + ins])
-        #             read_offset += ins
-        #
-        #     node_segments.setdefault(node_id, []).append({
-        #         "offset": node_offset,
-        #         "sequence": "".join(part_seq),
-        #         "base_quality": base64.b64encode(part_q).decode(),
-        #         "read_quality": mapq,
-        #         "strand": strand_char
-        #     })
-    # return node_segments, read_count
-    return node_segments.setdefault(0, []), read_count
+        for mapping in aln.path.mapping:
+            node_id = mapping.position.node_id
+            if node_id not in wanted_nodes:
+                for e in mapping.edit:
+                    read_offset += max(e.from_length, len(e.sequence))
+                continue
+            node_offset = mapping.position.offset
+            strand_char = "-" if mapping.position.is_reverse else "+"
 
+            part_seq, part_q = [], bytearray()
+            for edit in mapping.edit:
+                if edit.from_length:
+                    part_seq.append(
+                        seq[read_offset : read_offset + edit.from_length].lower()
+                        if edit.sequence else
+                        seq[read_offset : read_offset + edit.from_length]
+                    )
+                    part_q.extend(
+                        qual_bytes[read_offset : read_offset + edit.from_length]
+                    )
+                    read_offset += edit.from_length
+                elif edit.sequence:
+                    ins = len(edit.sequence)
+                    part_seq.append(seq[read_offset : read_offset + ins].lower())
+                    part_q.extend(qual_bytes[read_offset : read_offset + ins])
+                    read_offset += ins
+
+            node_segments.setdefault(node_id, []).append({
+                "offset": node_offset,
+                "sequence": "".join(part_seq),
+                "base_quality": base64.b64encode(part_q).decode(),
+                "read_quality": mapq,
+                "strand": strand_char
+            })
+    return node_segments, read_count
 
 def merge_partial(parts):
     merged = {}; total = 0
@@ -122,9 +115,7 @@ def merge_partial(parts):
     return merged, total
 
 # ─────────────────────────── pipeline ────────────────────────────────────────
-def run_pipeline(
-    gam_path, stats_pkl, prefix, fmt, threads, max_pending, milestone, chrom
-):
+def run_pipeline(gam_path, stats_pkl, prefix, fmt, milestone, chrom):
     print(f"Loading stats: {stats_pkl}")
     with open(stats_pkl, "rb") as fh:
         stats = pickle.load(fh)
@@ -140,42 +131,20 @@ def run_pipeline(
     print("\nNode‑level overview")
     print(f"  Total nodes               : {total_nodes}")
     print(f"  Nodes with ≥1 un‑perfect  : {nodes_with_unperfect} "
-          f"({nodes_with_unperfect / total_nodes * 100:.2f} %)")
+          f"({nodes_with_unperfect/total_nodes*100:.2f} %)")
     print(f"  Nodes passing filter      : {len(filtered_nodes)} "
-          f"({len(filtered_nodes) / total_nodes * 100:.2f} %)\n")
+          f"({len(filtered_nodes)/total_nodes*100:.2f} %)\n")
 
-    # Release memory
-    del stats
-    gc.collect()
-
-    partials = []
-    reads_total = 0
-    next_milestone = milestone
-    subset = set(islice(filtered_nodes, 1000000))
-
+    partials = []; reads_total = 0; next_milestone = milestone
     start = time.perf_counter()
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=threads) as ex:
-        pending = []
-        for batch in parse_gam_groups(gam_path):
-            pending.append(ex.submit(process_group, (batch, subset, chrom)))
-            while len(pending) >= max_pending:
-                done, not_done = concurrent.futures.wait(
-                    pending, return_when=concurrent.futures.FIRST_COMPLETED)
-                for fut in done:
-                    partials.append(fut.result())
-                    reads_total += fut.result()[1]
-                pending = list(not_done)
-                if reads_total >= next_milestone:
-                    print(f"Milestone {reads_total} reads | "
-                          f"{time.perf_counter()-start:.1f}s")
-                    next_milestone += milestone
-        for fut in concurrent.futures.as_completed(pending):
-            partials.append(fut.result()); reads_total += fut.result()[1]
-            if reads_total >= next_milestone:
-                print(f"Milestone {reads_total} reads | "
-                      f"{time.perf_counter()-start:.1f}s")
-                next_milestone += milestone
+    for batch in parse_gam_groups(gam_path):
+        part = process_group(batch, filtered_nodes, chrom)
+        partials.append(part)
+        reads_total += part[1]
+        if reads_total >= next_milestone:
+            print(f"Milestone {reads_total} reads | {time.perf_counter()-start:.1f}s")
+            next_milestone += milestone
 
     merged, _ = merge_partial(partials)
 
@@ -212,15 +181,13 @@ def main():
     ap.add_argument("output_prefix")
     ap.add_argument("--save-format", choices=["json", "pkl", "both"],
                     default="json", help="File format(s) to write")
-    ap.add_argument("--threads", type=int, default=4)
-    ap.add_argument("--max_pending", type=int, default=16)
     ap.add_argument("--milestone", type=int, default=100_000_000)
     ap.add_argument("--chr", default="", help="Filter by chromosome name")
     args = ap.parse_args()
 
     run_pipeline(
         args.gam_file, args.stats_pickle, args.output_prefix, args.save_format,
-        args.threads, args.max_pending, args.milestone, args.chr
+        args.milestone, args.chr
     )
 
 if __name__ == "__main__":
