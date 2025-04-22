@@ -117,6 +117,22 @@ def process_group(message_list, wanted_nodes, chrom_filter):
                 "strand": strand_char                    # "+" or "-" on node
             })
 
+            # segment_dict.setdefault(node_id, []).append({
+            #     "offset": node_offset,  # Start within node
+            #     "sequence": "".join(sequence_parts),  # Bases (insertions lower‑cased)
+            #     "base_quality_hex": quality_bytes.hex(),  # Per‑base Phred scores, hex-encoded
+            #     "read_quality": mapping_quality,  # MAPQ from the read
+            #     "strand": strand_char  # "+" or "-" on node
+            # })
+
+            segment_dict.setdefault(node_id, []).append({
+                "offset": node_offset,  # offset: Start within node
+                "seq": "".join(sequence_parts),  # sequence: Bases (insertions lower‑cased)
+                "bq": quality_bytes.hex(),  # base_quality_hex: Per‑base Phred scores, hex-encoded
+                "rq": mapping_quality,  # read_quality: MAPQ from the read
+                "strand": strand_char  # strand: "+" or "-" on node
+            })
+
     return segment_dict, read_count
 
 # ─────────────────────────────────────────────────────────────────────────────
