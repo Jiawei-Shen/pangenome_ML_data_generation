@@ -124,29 +124,29 @@ def merge_partial(parts):
 def run_pipeline(
     gam_path, stats_pkl, prefix, fmt, threads, max_pending, milestone, chrom
 ):
-    # print(f"Loading stats: {stats_pkl}")
-    # with open(stats_pkl, "rb") as fh:
-    #     stats = pickle.load(fh)
-    #
-    # total_nodes = len(stats)
-    # nodes_with_unperfect = sum(1 for s in stats.values() if s["not_perfect"] > 0)
-    # filtered_nodes = {
-    #     int(nid)
-    #     for nid, s in stats.items()
-    #     if s["not_perfect"] > 1 and s["not_perfect"] / (s["perfect"] + s["not_perfect"]) > 0.1
-    # }
-    #
-    # print("\nNode‑level overview")
-    # print(f"  Total nodes               : {total_nodes}")
-    # print(f"  Nodes with ≥1 un‑perfect  : {nodes_with_unperfect} "
-    #       f"({nodes_with_unperfect / total_nodes * 100:.2f} %)")
-    # print(f"  Nodes passing filter      : {len(filtered_nodes)} "
-    #       f"({len(filtered_nodes) / total_nodes * 100:.2f} %)\n")
-    #
-    # # Release memory
-    # del stats
-    # gc.collect()
-    #
+    print(f"Loading stats: {stats_pkl}")
+    with open(stats_pkl, "rb") as fh:
+        stats = pickle.load(fh)
+
+    total_nodes = len(stats)
+    nodes_with_unperfect = sum(1 for s in stats.values() if s["not_perfect"] > 0)
+    filtered_nodes = {
+        int(nid)
+        for nid, s in stats.items()
+        if s["not_perfect"] > 1 and s["not_perfect"] / (s["perfect"] + s["not_perfect"]) > 0.1
+    }
+
+    print("\nNode‑level overview")
+    print(f"  Total nodes               : {total_nodes}")
+    print(f"  Nodes with ≥1 un‑perfect  : {nodes_with_unperfect} "
+          f"({nodes_with_unperfect / total_nodes * 100:.2f} %)")
+    print(f"  Nodes passing filter      : {len(filtered_nodes)} "
+          f"({len(filtered_nodes) / total_nodes * 100:.2f} %)\n")
+
+    # Release memory
+    del stats
+    gc.collect()
+
     partials = []
     reads_total = 0
     next_milestone = milestone
@@ -156,7 +156,7 @@ def run_pipeline(
     with concurrent.futures.ProcessPoolExecutor(max_workers=threads) as ex:
         pending = []
         for batch in parse_gam_groups(gam_path):
-            pending.append(ex.submit(process_group, (batch, [], chrom)))
+            pending.append(ex.submit(process_group, (batch, filtered_nodes[:1000], chrom)))
             while len(pending) >= max_pending:
                 done, not_done = concurrent.futures.wait(
                     pending, return_when=concurrent.futures.FIRST_COMPLETED)
