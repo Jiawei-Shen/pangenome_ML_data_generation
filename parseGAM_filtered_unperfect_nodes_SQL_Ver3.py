@@ -119,6 +119,12 @@ def main():
 
         if reads >= next_m:
             # flush(conn, buf)
+            if not buf: break
+            conn.execute("BEGIN")
+            conn.executemany(
+                "INSERT INTO segments VALUES (?,?,?,?,?,?)", buf
+            )
+            conn.execute("COMMIT")
             buf.clear()
             dt = time.perf_counter() - t0
             print(f"{reads} reads | {dt:.1f}s")
