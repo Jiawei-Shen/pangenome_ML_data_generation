@@ -110,11 +110,11 @@ def process_group(message_list, wanted_nodes, chrom_filter):
 
             # Record this read‑segment for the current node
             segment_dict.setdefault(node_id, []).append({
-                "offset"           : node_offset,                   # Start within node
-                "sequence"         : "".join(sequence_parts),       # Bases (insertions lower‑cased)
-                "base_quality_hex" : quality_bytes.hex(),           # Per‑base Phred scores, hex-encoded
-                "read_quality"     : mapping_quality,               # MAPQ from the read
-                "strand"           : strand_char                    # "+" or "-" on node
+                "offset": node_offset,                   # Start within node
+                "sequence": "".join(sequence_parts),       # Bases (insertions lower‑cased)
+                "base_quality_hex": quality_bytes.hex(),           # Per‑base Phred scores, hex-encoded
+                "read_quality": mapping_quality,               # MAPQ from the read
+                "strand": strand_char                    # "+" or "-" on node
             })
 
     return segment_dict, read_count
@@ -165,17 +165,17 @@ def run_pipeline(gam_path, stats_path, output_prefix, output_format, milestone_s
 
     merged_segments, _ = merge_partials(partial_results)
 
-    if output_format in ("json", "both"):
-        json_path = output_prefix + ".json"
-        with open(json_path, "w") as json_file:
-            json.dump({str(k): v for k, v in merged_segments.items()}, json_file)
-        print(f"Wrote JSON: {json_path}")
-
     if output_format in ("pkl", "both"):
         pickle_path = output_prefix + ".pkl"
         with open(pickle_path, "wb") as pickle_file:
             pickle.dump(merged_segments, pickle_file, pickle.HIGHEST_PROTOCOL)
         print(f"Wrote Pickle: {pickle_path}")
+
+    if output_format in ("json", "both"):
+        json_path = output_prefix + ".json"
+        with open(json_path, "w") as json_file:
+            json.dump({str(k): v for k, v in merged_segments.items()}, json_file)
+        print(f"Wrote JSON: {json_path}")
 
     elapsed = time.perf_counter() - start_time
     print("\nFinal Summary:")
@@ -191,7 +191,7 @@ def main():
     parser.add_argument("stats_pickle", help="Path to the node stats pickle file")
     parser.add_argument("output_prefix", help="Prefix for output files")
     parser.add_argument("--fmt", choices=["json", "pkl", "both"], default="json", help="Output format")
-    parser.add_argument("--milestone", type=int, default=100_000_000, help="Progress report interval")
+    parser.add_argument("--milestone", type=int, default=10_000_000, help="Progress report interval")
     parser.add_argument("--chr", default="", help="Optional chromosome name to filter on")
     args = parser.parse_args()
 
