@@ -110,6 +110,7 @@ def main():
     reads = 0
     next_m = args.milestone
     t0 = time.perf_counter()
+    conn.execute("BEGIN")
 
     for raw in gam_record_iter(args.gam):
         rows = process_alignment(raw, wanted, args.chr)
@@ -120,17 +121,19 @@ def main():
         if reads >= next_m:
             # flush(conn, buf)
             if not buf: break
-            conn.execute("BEGIN")
+            # conn.execute("BEGIN")
             conn.executemany(
                 "INSERT INTO segments VALUES (?,?,?,?,?,?)", buf
             )
-            conn.execute("COMMIT")
+            # conn.execute("COMMIT")
             buf.clear()
             dt = time.perf_counter() - t0
             print(f"{reads} reads | {dt:.1f}s")
             next_m += args.milestone
 
     flush(conn, buf)
+
+    conn.execute("COMMIT")
     conn.close()
     print(f"\n✅ Done. Total reads: {reads}")
 
