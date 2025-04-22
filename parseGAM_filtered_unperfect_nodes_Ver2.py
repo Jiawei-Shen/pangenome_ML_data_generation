@@ -5,6 +5,7 @@ import json
 import pickle
 import time
 import gc
+from collections import defaultdict
 import vg_pb2
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -27,108 +28,87 @@ def file_is_gzip(path):
     with open(path, "rb") as file_handle:
         return file_handle.read(2) == b"\x1f\x8b"
 
-# Generator: Yield groups of GAM records from file
-def gam_group_iter(path, tag="GAM"):
+# Generator: Yield one GAM record at a time
+def gam_record_iter(path, tag="GAM"):
     open_func = gzip.open if file_is_gzip(path) else open
-    with open_func(path, "rb") as file_handle:
+    with open_func(path, "rb") as f:
         while True:
             try:
-                group_count = read_varint(file_handle)
+                group_count = read_varint(f)
             except EOFError:
                 break
             if group_count == 0:
                 continue
             try:
-                tag_length = read_varint(file_handle)
-                group_tag = file_handle.read(tag_length).decode()
+                tag_len = read_varint(f)
+                group_tag = f.read(tag_len).decode()
             except (EOFError, UnicodeDecodeError):
                 break
             if group_tag != tag:
                 for _ in range(group_count - 1):
                     try:
-                        skip_length = read_varint(file_handle)
-                        file_handle.seek(skip_length, 1)
+                        skip_len = read_varint(f)
+                        f.seek(skip_len, 1)
                     except EOFError:
                         break
                 continue
-            message_list = []
             for _ in range(group_count - 1):
                 try:
-                    message_size = read_varint(file_handle)
-                    message_bytes = file_handle.read(message_size)
+                    msg_size = read_varint(f)
+                    yield f.read(msg_size)
                 except EOFError:
                     break
-                if len(message_bytes) == message_size:
-                    message_list.append(message_bytes)
-            if message_list:
-                yield message_list
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Process one group of alignments
-def process_group(message_list, wanted_nodes, chrom_filter):
+# Process one alignment record
+def process_alignment(raw_message, wanted_nodes, chrom_filter):
     segment_dict = {}
-    read_count = 0
+    alignment = vg_pb2.Alignment()
+    alignment.ParseFromString(raw_message)
 
-    for raw_message in message_list:
-        alignment = vg_pb2.Alignment()
-        alignment.ParseFromString(raw_message)
+    if chrom_filter and not any(pos.name == chrom_filter for pos in alignment.refpos):
+        return segment_dict, 0
 
-        if chrom_filter and not any(pos.name == chrom_filter for pos in alignment.refpos):
+    read_sequence = alignment.sequence
+    read_quality_bytes = alignment.quality
+    mapping_quality = alignment.mapping_quality
+    read_offset = 0
+    reads = 1
+
+    for mapping in alignment.path.mapping:
+        node_id = mapping.position.node_id
+        if node_id not in wanted_nodes:
+            for edit in mapping.edit:
+                read_offset += max(edit.from_length, len(edit.sequence))
             continue
 
-        read_count += 1
-        read_sequence = alignment.sequence
-        read_quality_bytes = alignment.quality
-        mapping_quality = alignment.mapping_quality
-        read_offset = 0
+        node_offset = mapping.position.offset
+        strand_char = "-" if mapping.position.is_reverse else "+"
+        sequence_parts = []
+        quality_bytes = bytearray()
 
-        for mapping in alignment.path.mapping:
-            node_id = mapping.position.node_id
+        for edit in mapping.edit:
+            if edit.from_length:
+                frag = read_sequence[read_offset: read_offset + edit.from_length]
+                sequence_parts.append(frag.lower() if edit.sequence else frag)
+                quality_bytes.extend(read_quality_bytes[read_offset: read_offset + edit.from_length])
+                read_offset += edit.from_length
+            elif edit.sequence:
+                ins_len = len(edit.sequence)
+                frag = read_sequence[read_offset: read_offset + ins_len]
+                sequence_parts.append(frag.lower())
+                quality_bytes.extend(read_quality_bytes[read_offset: read_offset + ins_len])
+                read_offset += ins_len
 
-            if node_id not in wanted_nodes:
-                for edit in mapping.edit:
-                    read_offset += max(edit.from_length, len(edit.sequence))
-                continue
+        segment_dict.setdefault(node_id, []).append({
+            "offset": node_offset,
+            "seq": "".join(sequence_parts),
+            "bq": bytes(quality_bytes),  # store as raw bytes
+            "rq": mapping_quality,
+            "strand": strand_char
+        })
 
-            node_offset = mapping.position.offset
-            strand_char = "-" if mapping.position.is_reverse else "+"
-            sequence_parts = []
-            quality_bytes = bytearray()
-
-            for edit in mapping.edit:
-                if edit.from_length:
-                    fragment = read_sequence[read_offset : read_offset + edit.from_length]
-                    sequence_parts.append(fragment.lower() if edit.sequence else fragment)
-                    quality_bytes.extend(read_quality_bytes[read_offset : read_offset + edit.from_length])
-                    read_offset += edit.from_length
-                elif edit.sequence:
-                    insertion_length = len(edit.sequence)
-                    fragment = read_sequence[read_offset : read_offset + insertion_length]
-                    sequence_parts.append(fragment.lower())
-                    quality_bytes.extend(read_quality_bytes[read_offset : read_offset + insertion_length])
-                    read_offset += insertion_length
-
-            # Record this read‑segment for the current node
-            segment_dict.setdefault(node_id, []).append({
-                "offset": node_offset,  # offset: Start within node
-                "seq": "".join(sequence_parts),  # sequence: Bases (insertions lower‑cased)
-                "bq": quality_bytes.hex(),  # base_quality_hex: Per‑base Phred scores, hex-encoded
-                "rq": mapping_quality,  # read_quality: MAPQ from the read
-                "strand": strand_char  # strand: "+" or "-" on node
-            })
-
-    return segment_dict, read_count
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Merge multiple segment dictionaries
-def merge_partials(partial_list):
-    merged_dict = {}
-    total_reads = 0
-    for segment_dict, read_count in partial_list:
-        total_reads += read_count
-        for node_id, segment_list in segment_dict.items():
-            merged_dict.setdefault(node_id, []).extend(segment_list)
-    return merged_dict, total_reads
+    return segment_dict, reads
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main pipeline
@@ -144,26 +124,27 @@ def run_pipeline(gam_path, stats_path, output_prefix, output_format, milestone_s
     }
 
     del stats_data
-    gc.collect()  # Release memory
+    gc.collect()
 
     print(f"Filtered {len(wanted_nodes)} nodes from stats file.")
 
-    partial_results = []
+    merged_segments = defaultdict(list)
     total_reads = 0
     next_milestone = milestone_step
     start_time = time.perf_counter()
 
-    for message_batch in gam_group_iter(gam_path):
-        result = process_group(message_batch, wanted_nodes, chrom_filter)
-        partial_results.append(result)
-        total_reads += result[1]
+    for raw_msg in gam_record_iter(gam_path):
+        segment_dict, read_count = process_alignment(raw_msg, wanted_nodes, chrom_filter)
+        total_reads += read_count
+        for node_id, segs in segment_dict.items():
+            merged_segments[node_id].extend(segs)
 
         if total_reads >= next_milestone:
             elapsed = time.perf_counter() - start_time
             print(f"{total_reads} reads processed | {elapsed:.1f} seconds")
             next_milestone += milestone_step
 
-    merged_segments, _ = merge_partials(partial_results)
+    merged_segments = dict(merged_segments)
 
     if output_format in ("pkl", "both"):
         pickle_path = output_prefix + ".pkl"
@@ -174,7 +155,9 @@ def run_pipeline(gam_path, stats_path, output_prefix, output_format, milestone_s
     if output_format in ("json", "both"):
         json_path = output_prefix + ".json"
         with open(json_path, "w") as json_file:
-            json.dump({str(k): v for k, v in merged_segments.items()}, json_file)
+            json.dump({str(k): [
+                {**d, "bq": d["bq"].hex()} for d in v
+            ] for k, v in merged_segments.items()}, json_file)
         print(f"Wrote JSON: {json_path}")
 
     elapsed = time.perf_counter() - start_time
