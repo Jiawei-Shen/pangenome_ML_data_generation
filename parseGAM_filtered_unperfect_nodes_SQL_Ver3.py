@@ -83,6 +83,7 @@ def main():
     args = p.parse_args()
 
     # load and filter nodes
+    print(f"\nload and filter nodes")
     with open(args.stats,"rb") as f: stats=pickle.load(f)
     wanted = {int(n) for n,s in stats.items() if s["not_perfect"]>1 and s["not_perfect"]/(s["perfect"]+s["not_perfect"])>0.10}
     tot, unp = len(stats), sum(1 for s in stats.values() if s["not_perfect"]>0)
