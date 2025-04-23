@@ -140,6 +140,7 @@ def main():
     conn.execute("COMMIT")
     conn.execute("CREATE INDEX idx_node ON segments(node_id)")
     conn.close()
+    print(f"{reads} reads | {dt:.1f}s")
     print(f"\n✅ Done. Total reads: {reads}")
 
 if __name__=="__main__":
