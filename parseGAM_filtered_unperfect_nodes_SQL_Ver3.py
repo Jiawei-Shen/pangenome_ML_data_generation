@@ -97,6 +97,7 @@ def main():
     # 1) speed up journaling
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=OFF;")
+    conn.execute("PRAGMA cache_size = -1000000;")
     conn.execute("PRAGMA temp_store=MEMORY;")
     # 2) wrap all inserts in one big transaction
     conn.execute("BEGIN")
