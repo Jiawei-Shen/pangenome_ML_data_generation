@@ -150,7 +150,7 @@ def initialize_output_files(stats_path, output_prefix):
     gc.collect()
 
     dat_path = output_prefix + ".dat"
-
+    #
     # with open(dat_path, "wb") as f:
     #     f.write(b"MYFMT\1")
     #     f.write(struct.pack("<BBI16s", 0, 1, len(block_infos), b'\x00' * 16))
@@ -181,31 +181,56 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
     print(f"Output file created: {dat_path}")
 
+    BUFFER_SEGMENTS = 500_000  # 每累积50万条segments flush一次
+
     next_milestone = milestone_step
     total_reads = 0
+    total_segments = 0
     start_time = time.perf_counter()
 
     dat_fh = open(dat_path, "r+b")
+    segment_buffer = defaultdict(list)
     alignment = vg_pb2.Alignment()
+
+    def flush_segment_buffer():
+        nonlocal total_segments
+        for node_id, segs in segment_buffer.items():
+            if not segs:
+                continue
+            info = block_infos[node_id]
+            base_offset = info["offset"] + 4 + 4 + 2
+
+            # batch组包
+            batch_blob = bytearray()
+            for seg in segs:
+                batch_blob += RECORD_STRUCT.pack(seg.offset, seg.seq, seg.bq, seg.rq, seg.strand)
+
+            pos = base_offset + info["current_pos"] * RECORD_SIZE
+            dat_fh.seek(pos)
+            dat_fh.write(batch_blob)
+
+            info["current_pos"] += len(segs)
+
+        segment_buffer.clear()
+        total_segments = 0
 
     for raw_msg in gam_record_iter(gam_path):
         segment_dict, read_count = process_alignment(raw_msg, wanted_nodes, chrom_filter, alignment)
         total_reads += read_count
 
         for node_id, segs in segment_dict.items():
-            info = block_infos[node_id]
-            base_offset = info["offset"] + 4 + 4 + 2
-            for seg in segs:
-                pos = base_offset + info["current_pos"] * RECORD_SIZE
-                dat_fh.seek(pos)
-                dat_fh.write(RECORD_STRUCT.pack(seg.offset, seg.seq, seg.bq, seg.rq, seg.strand))
-                info["current_pos"] += 1
+            segment_buffer[node_id].extend(segs)
+            total_segments += len(segs)
+
+        if total_segments >= BUFFER_SEGMENTS:
+            flush_segment_buffer()
 
         if total_reads >= next_milestone:
             elapsed = time.perf_counter() - start_time
             print(f"{total_reads} reads processed | {elapsed:.1f} seconds")
             next_milestone += milestone_step
 
+    flush_segment_buffer()
     dat_fh.close()
 
     elapsed = time.perf_counter() - start_time
