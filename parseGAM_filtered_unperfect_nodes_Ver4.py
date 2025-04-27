@@ -3,13 +3,13 @@ import argparse
 import gzip
 import json
 import pickle
+import struct
 import time
 import gc
 from collections import defaultdict
 import vg_pb2
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Lightweight segment container using __slots__ to cut per-object overhead
 class Segment:
     __slots__ = ('offset', 'seq', 'bq', 'rq', 'strand')
     def __init__(self, offset, seq, bq, rq, strand):
@@ -20,7 +20,10 @@ class Segment:
         self.strand = strand
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Utility: Read varint from stream
+RECORD_STRUCT = struct.Struct("<h150s150shc")
+RECORD_SIZE = RECORD_STRUCT.size
+
+# ─────────────────────────────────────────────────────────────────────────────
 def read_varint(stream):
     value = 0
     shift_amount = 0
@@ -34,12 +37,10 @@ def read_varint(stream):
             return value
         shift_amount += 7
 
-# Utility: Check if a file is gzipped
 def file_is_gzip(path):
     with open(path, "rb") as fh:
         return fh.read(2) == b"\x1f\x8b"
 
-# Generator: Yield one GAM record at a time
 def gam_record_iter(path, tag="GAM"):
     open_func = gzip.open if file_is_gzip(path) else open
     with open_func(path, "rb") as f:
@@ -56,12 +57,10 @@ def gam_record_iter(path, tag="GAM"):
             except (EOFError, UnicodeDecodeError):
                 break
             if group_tag != tag:
-                # skip the rest of this group
                 for _ in range(group_count - 1):
                     skip_len = read_varint(f)
                     f.seek(skip_len, 1)
                 continue
-            # yield each message in the group
             for _ in range(group_count - 1):
                 try:
                     msg_size = read_varint(f)
@@ -69,14 +68,11 @@ def gam_record_iter(path, tag="GAM"):
                 except EOFError:
                     break
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Process one alignment record, reusing a single Alignment instance
 def process_alignment(raw_message, wanted_nodes, chrom_filter, alignment):
     segment_dict = {}
     alignment.Clear()
     alignment.ParseFromString(raw_message)
 
-    # optional chromosome filter
     if chrom_filter and not any(pos.name == chrom_filter for pos in alignment.refpos):
         return segment_dict, 0
 
@@ -90,17 +86,15 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter, alignment):
         node_id = mapping.position.node_id
 
         if node_id not in wanted_nodes:
-            # advance offset past this mapping
             for edit in mapping.edit:
                 read_offset += max(edit.from_length, len(edit.sequence))
             continue
 
         node_offset = mapping.position.offset
-        strand_char = "-" if mapping.position.is_reverse else "+"
+        strand_char = b"-" if mapping.position.is_reverse else b"+"
         sequence_parts = []
         quality_bytes = bytearray()
 
-        # collect all matched/inserted fragments
         for edit in mapping.edit:
             if edit.from_length:
                 frag = read_sequence[read_offset: read_offset + edit.from_length]
@@ -114,11 +108,10 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter, alignment):
                 quality_bytes.extend(read_quality_bytes[read_offset: read_offset + ins_len])
                 read_offset += ins_len
 
-        # store as Slot-based object
         seg = Segment(
             node_offset,
-            "".join(sequence_parts),
-            bytes(quality_bytes),
+            "".join(sequence_parts).encode().ljust(150, b'\x00')[:150],
+            bytes(quality_bytes).ljust(150, b'\x00')[:150],
             mapping_quality,
             strand_char
         )
@@ -127,83 +120,109 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter, alignment):
     return segment_dict, reads
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main pipeline
-def run_pipeline(gam_path, stats_path, output_prefix, output_format, milestone_step, chrom_filter):
-    print(f"Loading stats: {stats_path}")
+def initialize_output_files(stats_path, output_prefix):
     with open(stats_path, "rb") as stats_file:
         stats_data = pickle.load(stats_file)
 
-    # filter wanted nodes
-    wanted_nodes = {
-        int(node_id)
-        for node_id, stat in stats_data.items()
-        if stat["not_perfect"] > 1 and stat["not_perfect"] / (stat["perfect"] + stat["not_perfect"]) > 0.10
-    }
-    del stats_data
-    gc.collect()
+    block_infos = {}
+    wanted_nodes = set()
 
-    print(f"Filtered {len(wanted_nodes)} nodes from stats file.")
+    current_offset = 0
+    for node_id_str, stat in stats_data.items():
+        node_id = int(node_id_str)
+        perfect = stat["perfect"]
+        not_perfect = stat["not_perfect"]
+        if not_perfect > 1 and not_perfect / (perfect + not_perfect) > 0.10:
+            wanted_nodes.add(node_id)
+            n_records = perfect + not_perfect
 
-    merged_segments = defaultdict(list)
-    total_reads = 0
+            block_infos[node_id] = {
+                "block_id": node_id,
+                "offset": current_offset,
+                "n_records": n_records,
+                "current_pos": 0
+            }
+            current_offset += 4 + 4 + 2 + 0 + n_records * RECORD_SIZE
+
+    dat_path = output_prefix + ".dat"
+    with open(dat_path, "wb") as f:
+        f.write(b"MYFMT\1")
+        f.write(struct.pack("<BBI16s", 0, 1, len(block_infos), b'\x00' * 16))
+
+        for node_id, info in block_infos.items():
+            f.write(struct.pack("<I I H", info["block_id"], info["n_records"], 0))
+            for _ in range(info["n_records"]):
+                f.write(RECORD_STRUCT.pack(0, b'\x00'*150, b'\x00'*150, 0, b'+'))
+
+    idx_path = output_prefix + ".idx"
+    with open(idx_path, "wb") as idx_file:
+        idx_file.write(struct.pack("<I", len(block_infos)))
+        for node_id, info in block_infos.items():
+            idx_file.write(struct.pack("<I Q I I H", info["block_id"], info["offset"],
+                                       4 + 4 + 2 + info["n_records"] * RECORD_SIZE, info["n_records"], 0))
+
+    return block_infos, dat_path, wanted_nodes
+
+# ─────────────────────────────────────────────────────────────────────────────
+def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filter):
+    print(f"Initializing output files...")
+    block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
+    print(f"Output file created: {dat_path}")
+
     next_milestone = milestone_step
+    total_reads = 0
     start_time = time.perf_counter()
 
-    # reuse one Alignment object
+    dat_fh = open(dat_path, "r+b")
+
+    # --- NEW: buffer for segments
+    segment_buffer = defaultdict(list)
+
     alignment = vg_pb2.Alignment()
+
+    def flush_segment_buffer():
+        for node_id, segs in segment_buffer.items():
+            if not segs:
+                continue
+            info = block_infos[node_id]
+            base_offset = info["offset"] + 4 + 4 + 2
+            for seg in segs:
+                pos = base_offset + info["current_pos"] * RECORD_SIZE
+                dat_fh.seek(pos)
+                dat_fh.write(RECORD_STRUCT.pack(seg.offset, seg.seq, seg.bq, seg.rq, seg.strand))
+                info["current_pos"] += 1
+        segment_buffer.clear()
 
     for raw_msg in gam_record_iter(gam_path):
         segment_dict, read_count = process_alignment(raw_msg, wanted_nodes, chrom_filter, alignment)
         total_reads += read_count
 
         for node_id, segs in segment_dict.items():
-            merged_segments[node_id].extend(segs)
+            segment_buffer[node_id].extend(segs)
 
         if total_reads >= next_milestone:
             elapsed = time.perf_counter() - start_time
             print(f"{total_reads} reads processed | {elapsed:.1f} seconds")
+            flush_segment_buffer()
             next_milestone += milestone_step
 
-    # finalize in-memory dict
-    merged_segments = dict(merged_segments)
+    # flush最后一波
+    flush_segment_buffer()
 
-    # write outputs
-    if output_format in ("pkl", "both"):
-        pickle_path = output_prefix + ".pkl"
-        with open(pickle_path, "wb") as pkl_f:
-            pickle.dump(merged_segments, pkl.HIGHEST_PROTOCOL)
-        print(f"Wrote Pickle: {pickle_path}")
-
-    if output_format in ("json", "both"):
-        json_path = output_prefix + ".json"
-        with open(json_path, "w") as j_f:
-            json.dump({
-                str(k): [
-                    {
-                        "offset": seg.offset,
-                        "seq":    seg.seq,
-                        "bq":     seg.bq.hex(),
-                        "rq":     seg.rq,
-                        "strand": seg.strand
-                    } for seg in v
-                ] for k, v in merged_segments.items()
-            }, j_f)
-        print(f"Wrote JSON: {json_path}")
+    dat_fh.close()
 
     elapsed = time.perf_counter() - start_time
     print("\nFinal Summary:")
     print(f"  Total reads processed: {total_reads}")
-    print(f"  Nodes included: {len(merged_segments)}")
+    print(f"  Nodes included: {len(block_infos)}")
     print(f"  Elapsed time: {elapsed:.2f} seconds")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Command-line interface
 def main():
-    parser = argparse.ArgumentParser(description="Extract read-segments by node from a GAM file.")
+    parser = argparse.ArgumentParser(description="GAM segment extractor into binary blocks.")
     parser.add_argument("gam_path", help="Path to the GAM file")
     parser.add_argument("stats_pickle", help="Path to the node stats pickle file")
     parser.add_argument("output_prefix", help="Prefix for output files")
-    parser.add_argument("--fmt", choices=["json", "pkl", "both"], default="json", help="Output format")
     parser.add_argument("--milestone", type=int, default=10_000_000, help="Progress report interval")
     parser.add_argument("--chr", default="", help="Optional chromosome name to filter on")
     args = parser.parse_args()
@@ -212,7 +231,6 @@ def main():
         gam_path=args.gam_path,
         stats_path=args.stats_pickle,
         output_prefix=args.output_prefix,
-        output_format=args.fmt,
         milestone_step=args.milestone,
         chrom_filter=args.chr
     )
