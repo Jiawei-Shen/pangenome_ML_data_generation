@@ -206,8 +206,8 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         segment_dict, read_count = process_alignment(raw_msg, wanted_nodes, chrom_filter, alignment)
         total_reads += read_count
 
-        for node_id, segs in segment_dict.items():
-            segment_buffer[node_id].extend(segs)
+        # for node_id, segs in segment_dict.items():
+        #     segment_buffer[node_id].extend(segs)
 
         if total_reads >= next_milestone:
             elapsed = time.perf_counter() - start_time
