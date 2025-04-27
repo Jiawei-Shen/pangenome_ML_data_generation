@@ -144,24 +144,28 @@ def initialize_output_files(stats_path, output_prefix):
             }
             current_offset += 4 + 4 + 2 + n_records * RECORD_SIZE
 
-    # 打印过滤结果
     print(f"Filtered {len(wanted_nodes)} nodes from {total_nodes} total nodes "
           f"({len(wanted_nodes) / total_nodes:.2%} selected).")
-
-    # 释放内存
     del stats_data
     gc.collect()
 
     dat_path = output_prefix + ".dat"
+
     with open(dat_path, "wb") as f:
         f.write(b"MYFMT\1")
         f.write(struct.pack("<BBI16s", 0, 1, len(block_infos), b'\x00' * 16))
 
-        for node_id, info in block_infos.items():
-            f.write(struct.pack("<I I H", node_id, info["n_records"], 0))
-            for _ in range(info["n_records"]):
-                f.write(RECORD_STRUCT.pack(0, b'\x00'*150, b'\x00'*150, 0, b'+'))
+        # 直接顺序写所有block
+        blank_record = RECORD_STRUCT.pack(0, b'\x00'*150, b'\x00'*150, 0, b'+')
 
+        for node_id, info in block_infos.items():
+            # 构建整个block的内容 (block header + n_records blank)
+            block_header = struct.pack("<I I H", node_id, info["n_records"], 0)
+            records_blob = blank_record * info["n_records"]
+            full_block = block_header + records_blob
+            f.write(full_block)
+
+    # idx文件（照旧，单线程）
     idx_path = output_prefix + ".idx"
     with open(idx_path, "wb") as idx_file:
         idx_file.write(struct.pack("<I", len(block_infos)))
