@@ -151,27 +151,27 @@ def initialize_output_files(stats_path, output_prefix):
 
     dat_path = output_prefix + ".dat"
 
-    with open(dat_path, "wb") as f:
-        f.write(b"MYFMT\1")
-        f.write(struct.pack("<BBI16s", 0, 1, len(block_infos), b'\x00' * 16))
-
-        # 直接顺序写所有block
-        blank_record = RECORD_STRUCT.pack(0, b'\x00'*150, b'\x00'*150, 0, b'+')
-
-        for node_id, info in block_infos.items():
-            # 构建整个block的内容 (block header + n_records blank)
-            block_header = struct.pack("<I I H", node_id, info["n_records"], 0)
-            records_blob = blank_record * info["n_records"]
-            full_block = block_header + records_blob
-            f.write(full_block)
-
-    # idx文件（照旧，单线程）
-    idx_path = output_prefix + ".idx"
-    with open(idx_path, "wb") as idx_file:
-        idx_file.write(struct.pack("<I", len(block_infos)))
-        for node_id, info in block_infos.items():
-            idx_file.write(struct.pack("<I Q I I H", node_id, info["offset"],
-                                       4 + 4 + 2 + info["n_records"] * RECORD_SIZE, info["n_records"], 0))
+    # with open(dat_path, "wb") as f:
+    #     f.write(b"MYFMT\1")
+    #     f.write(struct.pack("<BBI16s", 0, 1, len(block_infos), b'\x00' * 16))
+    #
+    #     # 直接顺序写所有block
+    #     blank_record = RECORD_STRUCT.pack(0, b'\x00'*150, b'\x00'*150, 0, b'+')
+    #
+    #     for node_id, info in block_infos.items():
+    #         # 构建整个block的内容 (block header + n_records blank)
+    #         block_header = struct.pack("<I I H", node_id, info["n_records"], 0)
+    #         records_blob = blank_record * info["n_records"]
+    #         full_block = block_header + records_blob
+    #         f.write(full_block)
+    #
+    # # idx文件（照旧，单线程）
+    # idx_path = output_prefix + ".idx"
+    # with open(idx_path, "wb") as idx_file:
+    #     idx_file.write(struct.pack("<I", len(block_infos)))
+    #     for node_id, info in block_infos.items():
+    #         idx_file.write(struct.pack("<I Q I I H", node_id, info["offset"],
+    #                                    4 + 4 + 2 + info["n_records"] * RECORD_SIZE, info["n_records"], 0))
 
     return block_infos, dat_path, wanted_nodes
 
@@ -186,13 +186,13 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     start_time = time.perf_counter()
 
     dat_fh = open(dat_path, "r+b")
-    segment_buffer = defaultdict(list)
     alignment = vg_pb2.Alignment()
 
-    def flush_segment_buffer():
-        for node_id, segs in segment_buffer.items():
-            if not segs:
-                continue
+    for raw_msg in gam_record_iter(gam_path):
+        segment_dict, read_count = process_alignment(raw_msg, wanted_nodes, chrom_filter, alignment)
+        total_reads += read_count
+
+        for node_id, segs in segment_dict.items():
             info = block_infos[node_id]
             base_offset = info["offset"] + 4 + 4 + 2
             for seg in segs:
@@ -200,22 +200,12 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
                 dat_fh.seek(pos)
                 dat_fh.write(RECORD_STRUCT.pack(seg.offset, seg.seq, seg.bq, seg.rq, seg.strand))
                 info["current_pos"] += 1
-        segment_buffer.clear()
-
-    for raw_msg in gam_record_iter(gam_path):
-        segment_dict, read_count = process_alignment(raw_msg, wanted_nodes, chrom_filter, alignment)
-        total_reads += read_count
-
-        # for node_id, segs in segment_dict.items():
-        #     segment_buffer[node_id].extend(segs)
 
         if total_reads >= next_milestone:
             elapsed = time.perf_counter() - start_time
             print(f"{total_reads} reads processed | {elapsed:.1f} seconds")
-            flush_segment_buffer()
             next_milestone += milestone_step
 
-    flush_segment_buffer()
     dat_fh.close()
 
     elapsed = time.perf_counter() - start_time
