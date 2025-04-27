@@ -6,6 +6,7 @@ import struct
 import time
 import gc
 from collections import defaultdict
+import concurrent.futures
 import vg_pb2
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -144,11 +145,8 @@ def initialize_output_files(stats_path, output_prefix):
             }
             current_offset += 4 + 4 + 2 + n_records * RECORD_SIZE
 
-    # 打印过滤结果
     print(f"Filtered {len(wanted_nodes)} nodes from {total_nodes} total nodes "
           f"({len(wanted_nodes) / total_nodes:.2%} selected).")
-
-    # 释放内存
     del stats_data
     gc.collect()
 
@@ -156,12 +154,26 @@ def initialize_output_files(stats_path, output_prefix):
     with open(dat_path, "wb") as f:
         f.write(b"MYFMT\1")
         f.write(struct.pack("<BBI16s", 0, 1, len(block_infos), b'\x00' * 16))
+        # 先写file header
 
-        for node_id, info in block_infos.items():
-            f.write(struct.pack("<I I H", node_id, info["n_records"], 0))
+    # 分多线程写 blocks
+    def write_block(node_id, info):
+        with open(dat_path, "r+b") as local_fh:
+            base_offset = info["offset"]
+            local_fh.seek(base_offset)
+            local_fh.write(struct.pack("<I I H", node_id, info["n_records"], 0))
+            blank_record = RECORD_STRUCT.pack(0, b'\x00'*150, b'\x00'*150, 0, b'+')
             for _ in range(info["n_records"]):
-                f.write(RECORD_STRUCT.pack(0, b'\x00'*150, b'\x00'*150, 0, b'+'))
+                local_fh.write(blank_record)
 
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = []
+        for node_id, info in block_infos.items():
+            futures.append(executor.submit(write_block, node_id, info))
+        for future in futures:
+            future.result()
+
+    # 写idx文件（单线程）
     idx_path = output_prefix + ".idx"
     with open(idx_path, "wb") as idx_file:
         idx_file.write(struct.pack("<I", len(block_infos)))
