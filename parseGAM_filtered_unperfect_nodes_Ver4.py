@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import argparse
 import gzip
-import json
 import pickle
 import struct
 import time
@@ -19,7 +18,6 @@ class Segment:
         self.rq     = rq
         self.strand = strand
 
-# ─────────────────────────────────────────────────────────────────────────────
 RECORD_STRUCT = struct.Struct("<h150s150shc")
 RECORD_SIZE = RECORD_STRUCT.size
 
@@ -128,7 +126,10 @@ def initialize_output_files(stats_path, output_prefix):
     wanted_nodes = set()
 
     current_offset = 0
+    total_nodes = 0
+
     for node_id_str, stat in stats_data.items():
+        total_nodes += 1
         node_id = int(node_id_str)
         perfect = stat["perfect"]
         not_perfect = stat["not_perfect"]
@@ -137,12 +138,19 @@ def initialize_output_files(stats_path, output_prefix):
             n_records = perfect + not_perfect
 
             block_infos[node_id] = {
-                "block_id": node_id,
                 "offset": current_offset,
                 "n_records": n_records,
                 "current_pos": 0
             }
-            current_offset += 4 + 4 + 2 + 0 + n_records * RECORD_SIZE
+            current_offset += 4 + 4 + 2 + n_records * RECORD_SIZE
+
+    # 打印过滤结果
+    print(f"Filtered {len(wanted_nodes)} nodes from {total_nodes} total nodes "
+          f"({len(wanted_nodes) / total_nodes:.2%} selected).")
+
+    # 释放内存
+    del stats_data
+    gc.collect()
 
     dat_path = output_prefix + ".dat"
     with open(dat_path, "wb") as f:
@@ -150,7 +158,7 @@ def initialize_output_files(stats_path, output_prefix):
         f.write(struct.pack("<BBI16s", 0, 1, len(block_infos), b'\x00' * 16))
 
         for node_id, info in block_infos.items():
-            f.write(struct.pack("<I I H", info["block_id"], info["n_records"], 0))
+            f.write(struct.pack("<I I H", node_id, info["n_records"], 0))
             for _ in range(info["n_records"]):
                 f.write(RECORD_STRUCT.pack(0, b'\x00'*150, b'\x00'*150, 0, b'+'))
 
@@ -158,7 +166,7 @@ def initialize_output_files(stats_path, output_prefix):
     with open(idx_path, "wb") as idx_file:
         idx_file.write(struct.pack("<I", len(block_infos)))
         for node_id, info in block_infos.items():
-            idx_file.write(struct.pack("<I Q I I H", info["block_id"], info["offset"],
+            idx_file.write(struct.pack("<I Q I I H", node_id, info["offset"],
                                        4 + 4 + 2 + info["n_records"] * RECORD_SIZE, info["n_records"], 0))
 
     return block_infos, dat_path, wanted_nodes
@@ -174,10 +182,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     start_time = time.perf_counter()
 
     dat_fh = open(dat_path, "r+b")
-
-    # --- NEW: buffer for segments
     segment_buffer = defaultdict(list)
-
     alignment = vg_pb2.Alignment()
 
     def flush_segment_buffer():
@@ -206,9 +211,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
             flush_segment_buffer()
             next_milestone += milestone_step
 
-    # flush最后一波
     flush_segment_buffer()
-
     dat_fh.close()
 
     elapsed = time.perf_counter() - start_time
@@ -219,7 +222,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
 
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="GAM segment extractor into binary blocks.")
+    parser = argparse.ArgumentParser(description="GAM segment extractor into binary blocks (single-threaded).")
     parser.add_argument("gam_path", help="Path to the GAM file")
     parser.add_argument("stats_pickle", help="Path to the node stats pickle file")
     parser.add_argument("output_prefix", help="Prefix for output files")
