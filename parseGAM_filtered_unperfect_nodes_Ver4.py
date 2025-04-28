@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 import argparse
 import gzip
-import io
-import zlib
-import subprocess
 import pickle
 import struct
 import time
@@ -40,67 +37,38 @@ def read_varint(stream):
             return value
         shift_amount += 7
 
-
 def file_is_gzip(path):
     with open(path, "rb") as fh:
         return fh.read(2) == b"\x1f\x8b"
 
 def gam_record_iter(path, tag="GAM"):
-    """
-    流式 Yield 原始 GAM protobuf bytes。
-    - 如果文件是 gzip 格式，使用系统 gzip -dc 解压（C 程序里管理缓冲）；
-    - 否则直接 open(path, "rb")。
-    这样 Python 端只保留几十 KB 管道缓冲，不会爆内存，也不会 DecodeError。
-    """
-    # 1) 根据 file_is_gzip 判断
-    if file_is_gzip(path):
-        p = subprocess.Popen(
-            ["gzip", "-dc", path],
-            stdout=subprocess.PIPE,
-            bufsize=64*1024
-        )
-        f = p.stdout
-    else:
-        f = open(path, "rb")
-
-    try:
-        while True:
-            try:
-                group_count = read_varint(f)
-            except EOFError:
-                break
-            if group_count == 0:
-                continue
-
-            # 读 tag
-            try:
-                tag_len = read_varint(f)
-                group_tag = f.read(tag_len).decode()
-            except (EOFError, UnicodeDecodeError):
-                break
-
-            if group_tag != tag:
-                # 跳过这一组
-                for _ in range(group_count - 1):
-                    skip_len = read_varint(f)
-                    f.seek(skip_len, 1)
-                continue
-
-            # 产出每条 protobuf raw bytes
-            for _ in range(group_count - 1):
-                try:
-                    msg_size = read_varint(f)
-                    yield f.read(msg_size)
-                except EOFError:
-                    break
-    finally:
-        try:
-            f.close()
-        except:
-            pass
-        if file_is_gzip(path):
-            p.wait()
-
+    open_func = gzip.open if file_is_gzip(path) else open
+    test = b'\n~TCCCTGAGGTGGTGGCGGAGGTGGTGGAGGGGCGGAGGGCGGAGCACCGTAGCCCCCTCTGGCCCGACTCGGGGCGGCCCGATTGCCCCGGTCCCAGCAGCCCTCCAGGGCCTCCAGGCCCCGGCC\x12o\x12\x11\n\x07\x08\xd3\xd7\xd8*\x10\x0f\x12\x04\x08\x11\x10\x11(\x01\x12\x0f\n\x05\x08\xd4\xd7\xd8*\x12\x04\x08 \x10 (\x02\x12\x1e\n\x05\x08\xd5\xd7\xd8*\x12\x04\x08\x19\x10\x19\x12\x07\x08\x01\x10\x01\x1a\x01C\x12\x04\x08\x06\x10\x06(\x03\x12\x0f\n\x05\x08\xd6\xd7\xd8*\x12\x04\x08 \x10 (\x04\x12\x18\n\x05\x08\xd7\xd7\xd8*\x12\x04\x08\x0c\x10\x0c\x12\x07\x08\x01\x10\x01\x1a\x01C(\x05\x1a\x14ERR903030.252281075 "~\x1e \x1f!""\x10\x1f\x0f$\x1f\x0f\x1d\x0f%!\x1d\x0e\x0e\x0e\x1b$\x1f\x0f\x0e\x0f\x18$&\x18"& \x1d\x0e\x1b\x0e\x0e\x0e\x1b\x0e\x19\x0e""!&&\x0e\x19\x19\x19\x1f\x0f\x0f\x19"\x0e$\x0f\x0f$\x0f\x1f#\x0e"\x1e\x18"\x0e\x0e\x19\x0e\x0e\x19\x0e\x18\x0e\x0e""&\x1b"#"\x0f\r"\x1a"\x1a&!\x0e\x0e\x19\x16\r\r\x17\x15\x1f\r"#"\x15#\r\x15\r\x19\x1f\x17\x0e\r\x17""\x02\x02\x02\x02\x02(<0~Z\x16\x1a\x14ERR903030.252281075 \x81\x01\xdf\xf7}\xdf\xf7}\xef?\x8a\x01\x12\n\x05chr22 \xc9\xfb\xff\xff\xff\xff\xff\xff\xff\x01\x9a\x01\x0c\x10\xf5\xf1\x94\x08*\x05chr22\xf1\x01\x00\x00\x00\x00\x00\x80I@\x82\x02\x171927:443.135:148.44:0:1\x99\x02\x00\x00\x00\x00\x00\x14\x93@'
+    yield test
+    # with open_func(path, "rb") as f:
+    #     while True:
+    #         try:
+    #             group_count = read_varint(f)
+    #         except EOFError:
+    #             break
+    #         if group_count == 0:
+    #             continue
+    #         try:
+    #             tag_len = read_varint(f)
+    #             group_tag = f.read(tag_len).decode()
+    #         except (EOFError, UnicodeDecodeError):
+    #             break
+    #         if group_tag != tag:
+    #             for _ in range(group_count - 1):
+    #                 skip_len = read_varint(f)
+    #                 f.seek(skip_len, 1)
+    #             continue
+    #         for _ in range(group_count - 1):
+    #             try:
+    #                 msg_size = read_varint(f)
+    #                 yield f.read(msg_size)
+    #             except EOFError:
+    #                 break
 
 
 def process_alignment(raw_message, wanted_nodes, chrom_filter, alignment):
@@ -153,6 +121,7 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter, alignment):
         segment_dict.setdefault(node_id, []).append(seg)
 
     return segment_dict, reads
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 def initialize_output_files(stats_path, output_prefix):
