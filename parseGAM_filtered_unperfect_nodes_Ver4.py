@@ -6,6 +6,7 @@ import struct
 import time
 import gc
 import psutil
+import tracemalloc
 from collections import defaultdict
 import vg_pb2
 
@@ -197,9 +198,13 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     process = psutil.Process()
     baseline_memory = process.memory_info().rss
     print(f"[Info] baseline_memory: {baseline_memory / 1024 / 1024:.2f} MB")
+    
+    # 在run_pipeline开始时加：
+    tracemalloc.start()
+    flush_counter = 0
 
     def flush_segment_buffer():
-        nonlocal total_segments, baseline_memory, segment_buffer
+        nonlocal total_segments, baseline_memory, segment_buffer, flush_counter
         for node_id, segs in segment_buffer.items():
             if not segs:
                 continue
@@ -216,14 +221,27 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
 
             info["current_pos"] += len(segs)
 
-        # 关键变化
-        segment_buffer = defaultdict(list)  # 🆕 新建，不是.clear()
+        # flush结束
+        segment_buffer = defaultdict(list)  # 重新new一个
         total_segments = 0
+        flush_counter += 1
 
+        # 强制GC
         gc.collect()
 
-        current_memory = process.memory_info().rss
-        print(f"[Info] Memory usage after flush: {current_memory / 1024 / 1024:.2f} MB")
+        # 记录内存
+        current_memory = process.memory_info()
+        print(
+            f"[Info] Memory usage after flush #{flush_counter}: RSS={current_memory.rss / 1024 / 1024:.2f} MB, VMS={current_memory.vms / 1024 / 1024:.2f} MB")
+
+        # 每隔5次flush做一次tracemalloc snapshot
+        if flush_counter % 5 == 0:
+            snapshot = tracemalloc.take_snapshot()
+            top_stats = snapshot.statistics('lineno')
+
+            print("[tracemalloc] Top 5 memory allocations:")
+            for stat in top_stats[:5]:
+                print(stat)
 
     for raw_msg in gam_record_iter(gam_path):
         segment_dict, read_count = process_alignment(raw_msg, wanted_nodes, chrom_filter, alignment)
