@@ -268,14 +268,13 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         total_reads += 1
 
         for node_id, segs in segment_dict.items():
-            segment_buffer[node_id].extend(segs)
+            # segment_buffer[node_id].extend(segs)
             total_segments += len(segs)
-        #
-        # if total_segments >= BUFFER_SEGMENTS:
-        #     flush_segment_buffer()
+
+        if total_segments >= BUFFER_SEGMENTS:
+            flush_segment_buffer()
 
         if total_reads >= next_milestone:
-            flush_segment_buffer()
             elapsed = time.perf_counter() - start_time
             print(f"{total_reads} reads processed | {elapsed:.1f} seconds")
             next_milestone += milestone_step
