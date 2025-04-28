@@ -76,53 +76,53 @@ def gam_record_iter(path, tag="GAM"):
 
 def process_alignment(raw_message, wanted_nodes, chrom_filter, alignment):
     segment_dict = {}
+    alignment = vg_pb2.Alignment()
     alignment.ParseFromString(raw_message)
-    alignment.Clear()
 
-    # if chrom_filter and not any(pos.name == chrom_filter for pos in alignment.refpos):
-    #     return segment_dict, 0
-    #
-    # read_sequence = alignment.sequence
-    # read_quality_bytes = alignment.quality
-    # mapping_quality = alignment.mapping_quality
-    # read_offset = 0
-    #
-    # for mapping in alignment.path.mapping:
-    #     node_id = mapping.position.node_id
-    #
-    #     if node_id not in wanted_nodes:
-    #         for edit in mapping.edit:
-    #             read_offset += max(edit.from_length, len(edit.sequence))
-    #         continue
-    #
-    #     node_offset = mapping.position.offset
-    #     strand_char = b"-" if mapping.position.is_reverse else b"+"
-    #     sequence_parts = []
-    #     quality_bytes = bytearray()
-    #
-    #     for edit in mapping.edit:
-    #         if edit.from_length:
-    #             frag = read_sequence[read_offset: read_offset + edit.from_length]
-    #             sequence_parts.append(frag.lower() if edit.sequence else frag)
-    #             quality_bytes.extend(read_quality_bytes[read_offset: read_offset + edit.from_length])
-    #             read_offset += edit.from_length
-    #         elif edit.sequence:
-    #             ins_len = len(edit.sequence)
-    #             frag = read_sequence[read_offset: read_offset + ins_len]
-    #             sequence_parts.append(frag.lower())
-    #             quality_bytes.extend(read_quality_bytes[read_offset: read_offset + ins_len])
-    #             read_offset += ins_len
-    #
-    #     seg = Segment(
-    #         node_offset,
-    #         "".join(sequence_parts).encode().ljust(150, b'\x00')[:150],
-    #         bytes(quality_bytes).ljust(150, b'\x00')[:150],
-    #         mapping_quality,
-    #         strand_char
-    #     )
-    #     segment_dict.setdefault(node_id, []).append(seg)
+    if chrom_filter and not any(pos.name == chrom_filter for pos in alignment.refpos):
+        return segment_dict, 0
 
-    return {}
+    read_sequence = alignment.sequence
+    read_quality_bytes = alignment.quality
+    mapping_quality = alignment.mapping_quality
+    read_offset = 0
+
+    for mapping in alignment.path.mapping:
+        node_id = mapping.position.node_id
+
+        if node_id not in wanted_nodes:
+            for edit in mapping.edit:
+                read_offset += max(edit.from_length, len(edit.sequence))
+            continue
+
+        node_offset = mapping.position.offset
+        strand_char = b"-" if mapping.position.is_reverse else b"+"
+        sequence_parts = []
+        quality_bytes = bytearray()
+
+        for edit in mapping.edit:
+            if edit.from_length:
+                frag = read_sequence[read_offset: read_offset + edit.from_length]
+                sequence_parts.append(frag.lower() if edit.sequence else frag)
+                quality_bytes.extend(read_quality_bytes[read_offset: read_offset + edit.from_length])
+                read_offset += edit.from_length
+            elif edit.sequence:
+                ins_len = len(edit.sequence)
+                frag = read_sequence[read_offset: read_offset + ins_len]
+                sequence_parts.append(frag.lower())
+                quality_bytes.extend(read_quality_bytes[read_offset: read_offset + ins_len])
+                read_offset += ins_len
+
+        seg = Segment(
+            node_offset,
+            "".join(sequence_parts).encode().ljust(150, b'\x00')[:150],
+            bytes(quality_bytes).ljust(150, b'\x00')[:150],
+            mapping_quality,
+            strand_char
+        )
+        segment_dict.setdefault(node_id, []).append(seg)
+
+    return segment_dict
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -240,15 +240,6 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         print(
             f"[Info] Memory usage after flush #{flush_counter}: RSS={current_memory.rss / 1024 / 1024:.2f} MB, VMS={current_memory.vms / 1024 / 1024:.2f} MB")
 
-        # 每隔5次flush做一次tracemalloc snapshot
-        if flush_counter % 5 == 0:
-            snapshot = tracemalloc.take_snapshot()
-            top_stats = snapshot.statistics('lineno')
-
-            print("[tracemalloc] Top 5 memory allocations:")
-            for stat in top_stats[:5]:
-                print(stat)
-
     for raw_msg in gam_record_iter(gam_path):
         segment_dict = process_alignment(raw_msg, wanted_nodes, chrom_filter, alignment)
         total_reads += 1
@@ -261,7 +252,6 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
             flush_segment_buffer()
 
         if total_reads >= next_milestone:
-            flush_segment_buffer()
             elapsed = time.perf_counter() - start_time
             print(f"{total_reads} reads processed | {elapsed:.1f} seconds")
             next_milestone += milestone_step
