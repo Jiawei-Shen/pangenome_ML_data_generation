@@ -46,30 +46,30 @@ def gam_record_iter(path, tag="GAM"):
     test = b'\n\x97\x01CCGGAAAGTTTGAATGGAAGCCAGGCTTGGCTGTGAGGAGACCAGAGGAGCAAGAAGGGAAAAAGGAAGGGAAGGAGGCCGTCTCTGGTTTCAGAGAAAAGTACTACTGGGCCCTGAGGACAAATCTGCCCTCCTGATTTCATGGCTATCA\x12?\x12\x14\n\n\x08\xad\xb0\xfd\x01\x10\xaa\x01 \x01\x12\x04\x08X\x10X(\x01\x12\x14\n\x07\x08\xac\xb0\xfd\x01 \x01\x12\x07\x08\x01\x10\x01\x1a\x01T(\x02\x12\x11\n\x07\x08\xab\xb0\xfd\x01 \x01\x12\x04\x08>\x10>(\x03\x1a\'LH00180:108:223KKHLT4:6:1101:48016:1224"\x97\x01(((((((((((((((((((((((((((((((((((((((((((\x18(((((((((((\x18(((((((((((((((((((((\x18((((((((((((((((((((((((((((((((((((((\x18((((((((((((((((((((((((((\x18((((((((<0\x9c\x01Z)\x1a\'LH00180:108:223KKHLT4:6:1101:48016:1224\x81\x01\xfe&\x7f\x93\xbf\xc9\xef?\x99\x02[\xf2\xdd\x85d\x03$?\xa2\x06\xca\x02\n\x1f\n\x15last_placed_stage_0bp\x12\x06\x1a\x04none\n\x1d\n\x10mapq_score_group\x12\t\x11\x00\x00\xc0\xff\xff\xff\xdfA\n!\n\x10secondary_scores\x12\r2\x0b\n\t\x11\xd3\t\x15\x04\x84\xc4s@\n\x1b\n\x11last_placed_stage\x12\x06\x1a\x04none\n\x1c\n\x0ffragment_length\x12\t\x11\x00\x00\x00\x00\x00 }@\n\x11\n\x0bproper_pair\x12\x02 \x01\n\x1e\n\x11mapq_explored_cap\x12\t\x11\xd1r\xc7{6\xf5U@\n<\n\x1cfragment_length_distribution\x12\x1c\x1a\x1a-I 347.232632 -D 84.280571\n\x1a\n\rmapq_uncapped\x12\t\x11\x00\x00\xc0\xff\xff\xff\xdfA\n\x1d\n\x10mapq_applied_cap\x12\t\x11\x96`\xdfX\xee9x@'
     while True:
         yield test
-    with open_func(path, "rb") as f:
-        while True:
-            try:
-                group_count = read_varint(f)
-            except EOFError:
-                break
-            if group_count == 0:
-                continue
-            try:
-                tag_len = read_varint(f)
-                group_tag = f.read(tag_len).decode()
-            except (EOFError, UnicodeDecodeError):
-                break
-            if group_tag != tag:
-                for _ in range(group_count - 1):
-                    skip_len = read_varint(f)
-                    f.seek(skip_len, 1)
-                continue
-            for _ in range(group_count - 1):
-                try:
-                    msg_size = read_varint(f)
-                    yield f.read(msg_size)
-                except EOFError:
-                    break
+    # with open_func(path, "rb") as f:
+    #     while True:
+    #         try:
+    #             group_count = read_varint(f)
+    #         except EOFError:
+    #             break
+    #         if group_count == 0:
+    #             continue
+    #         try:
+    #             tag_len = read_varint(f)
+    #             group_tag = f.read(tag_len).decode()
+    #         except (EOFError, UnicodeDecodeError):
+    #             break
+    #         if group_tag != tag:
+    #             for _ in range(group_count - 1):
+    #                 skip_len = read_varint(f)
+    #                 f.seek(skip_len, 1)
+    #             continue
+    #         for _ in range(group_count - 1):
+    #             try:
+    #                 msg_size = read_varint(f)
+    #                 yield f.read(msg_size)
+    #             except EOFError:
+    #                 break
 
 
 def process_alignment(raw_message, wanted_nodes, chrom_filter, alignment):
