@@ -79,49 +79,63 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter, alignment):
     alignment.Clear()
     alignment.ParseFromString(raw_message)
 
+    # 如果有染色体过滤
     if chrom_filter and not any(pos.name == chrom_filter for pos in alignment.refpos):
         return segment_dict, 0
 
-    read_sequence = alignment.sequence
-    read_quality_bytes = alignment.quality
-    mapping_quality = alignment.mapping_quality
-    read_offset = 0
-    reads = 1
+    # 下面这两块是全函数可复用的“工作区”
+    seq_buf  = bytearray(150)
+    qual_buf = bytearray(150)
 
-    for mapping in alignment.path.mapping:
-        node_id = mapping.position.node_id
+    read_seq = memoryview(alignment.sequence)       # bytes → memoryview，切片不复制
+    read_qual= memoryview(alignment.quality)        # bytes → memoryview
+    mapping_q= alignment.mapping_quality
+    roffset  = 0
+    reads    = 1
 
-        if node_id not in wanted_nodes:
-            for edit in mapping.edit:
-                read_offset += max(edit.from_length, len(edit.sequence))
+    for m in alignment.path.mapping:
+        nid = m.position.node_id
+        if nid not in wanted_nodes:
+            # 跳过不需要的节点，更新偏移
+            for e in m.edit:
+                roffset += max(e.from_length, len(e.sequence))
             continue
 
-        node_offset = mapping.position.offset
-        strand_char = b"-" if mapping.position.is_reverse else b"+"
-        sequence_parts = []
-        quality_bytes = bytearray()
+        # 重置每次 mapping 里 buffer 的“写入指针”
+        so = 0
+        qo = 0
 
-        for edit in mapping.edit:
-            if edit.from_length:
-                frag = read_sequence[read_offset: read_offset + edit.from_length]
-                sequence_parts.append(frag.lower() if edit.sequence else frag)
-                quality_bytes.extend(read_quality_bytes[read_offset: read_offset + edit.from_length])
-                read_offset += edit.from_length
-            elif edit.sequence:
-                ins_len = len(edit.sequence)
-                frag = read_sequence[read_offset: read_offset + ins_len]
-                sequence_parts.append(frag.lower())
-                quality_bytes.extend(read_quality_bytes[read_offset: read_offset + ins_len])
-                read_offset += ins_len
+        for e in m.edit:
+            if e.from_length:
+                ln = e.from_length
+                frag = read_seq[roffset:roffset+ln]
+                # mismatch? 只在 really needed 时 lower()
+                if e.sequence:
+                    seq_buf[so:so+ln] = frag.tobytes().lower()
+                else:
+                    seq_buf[so:so+ln] = frag
+                qual_buf[qo:qo+ln] = read_qual[roffset:roffset+ln]
+                roffset += ln
+                so += ln
+                qo += ln
+            elif e.sequence:
+                ln = len(e.sequence)
+                frag = read_seq[roffset:roffset+ln]
+                seq_buf[so:so+ln] = frag.tobytes().lower()
+                qual_buf[qo:qo+ln] = read_qual[roffset:roffset+ln]
+                roffset += ln
+                so += ln
+                qo += ln
 
+        # 只生成一次固定大小的 bytes，完全无中间 join/encode
         seg = Segment(
-            node_offset,
-            "".join(sequence_parts).encode().ljust(150, b'\x00')[:150],
-            bytes(quality_bytes).ljust(150, b'\x00')[:150],
-            mapping_quality,
-            strand_char
+            m.position.offset,
+            bytes(seq_buf[:so]).ljust(150, b'\x00'),
+            bytes(qual_buf[:qo]).ljust(150, b'\x00'),
+            mapping_q,
+            b"-" if m.position.is_reverse else b"+"
         )
-        segment_dict.setdefault(node_id, []).append(seg)
+        segment_dict.setdefault(nid, []).append(seg)
 
     return segment_dict, reads
 
@@ -251,9 +265,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
                 print(stat)
 
     for raw_msg in gam_record_iter(gam_path):
-        # segment_dict, read_count = process_alignment(raw_msg, wanted_nodes, chrom_filter, alignment)
-        segment_dict = {}
-        read_count = 1
+        segment_dict, read_count = process_alignment(raw_msg, wanted_nodes, chrom_filter, alignment)
         total_reads += read_count
 
         for node_id, segs in segment_dict.items():
@@ -264,7 +276,6 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
             flush_segment_buffer()
 
         if total_reads >= next_milestone:
-            flush_segment_buffer()
             elapsed = time.perf_counter() - start_time
             print(f"{total_reads} reads processed | {elapsed:.1f} seconds")
             next_milestone += milestone_step
