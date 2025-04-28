@@ -76,19 +76,17 @@ def gam_record_iter(path, tag="GAM"):
 
 def process_alignment(raw_message, wanted_nodes, chrom_filter, alignment):
     segment_dict = {}
-    # alignment.Clear()
+    alignment.Clear()
     alignment.ParseFromString(raw_message)
 
     if chrom_filter and not any(pos.name == chrom_filter for pos in alignment.refpos):
         return segment_dict, 0
 
-    read_sequence = memoryview(alignment.sequence.encode())  # avoid copy
-    read_quality = memoryview(alignment.quality)
+    read_sequence = alignment.sequence
+    read_quality_bytes = alignment.quality
     mapping_quality = alignment.mapping_quality
     read_offset = 0
-
-    seq_buffer = bytearray(150)
-    qual_buffer = bytearray(150)
+    reads = 1
 
     for mapping in alignment.path.mapping:
         node_id = mapping.position.node_id
@@ -100,37 +98,26 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter, alignment):
 
         node_offset = mapping.position.offset
         strand_char = b"-" if mapping.position.is_reverse else b"+"
-
-        seq_pos = 0
-        qual_pos = 0
+        sequence_parts = []
+        quality_bytes = bytearray()
 
         for edit in mapping.edit:
             if edit.from_length:
-                frag = read_sequence[read_offset : read_offset + edit.from_length]
-                frag_len = len(frag)
-                # lower if mismatch
-                if edit.sequence:
-                    seq_buffer[seq_pos:seq_pos+frag_len] = frag.tobytes().lower()
-                else:
-                    seq_buffer[seq_pos:seq_pos+frag_len] = frag
-                qual_buffer[qual_pos:qual_pos+frag_len] = read_quality[read_offset : read_offset + frag_len]
-                read_offset += frag_len
-                seq_pos += frag_len
-                qual_pos += frag_len
-
+                frag = read_sequence[read_offset: read_offset + edit.from_length]
+                sequence_parts.append(frag.lower() if edit.sequence else frag)
+                quality_bytes.extend(read_quality_bytes[read_offset: read_offset + edit.from_length])
+                read_offset += edit.from_length
             elif edit.sequence:
                 ins_len = len(edit.sequence)
-                frag = read_sequence[read_offset : read_offset + ins_len]
-                seq_buffer[seq_pos:seq_pos+ins_len] = frag.tobytes().lower()
-                qual_buffer[qual_pos:qual_pos+ins_len] = read_quality[read_offset : read_offset + ins_len]
+                frag = read_sequence[read_offset: read_offset + ins_len]
+                sequence_parts.append(frag.lower())
+                quality_bytes.extend(read_quality_bytes[read_offset: read_offset + ins_len])
                 read_offset += ins_len
-                seq_pos += ins_len
-                qual_pos += ins_len
 
         seg = Segment(
             node_offset,
-            bytes(seq_buffer[:seq_pos]).ljust(150, b'\x00'),
-            bytes(qual_buffer[:qual_pos]).ljust(150, b'\x00'),
+            "".join(sequence_parts).encode().ljust(150, b'\x00')[:150],
+            bytes(quality_bytes).ljust(150, b'\x00')[:150],
             mapping_quality,
             strand_char
         )
@@ -204,7 +191,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     print(f"Output file created: {dat_path}")
 
     # BUFFER_SEGMENTS = 30_000_000  # 每累积2000万条segments flush一次
-    BUFFER_SEGMENTS = 20_000  # 每累积2000万条segments flush一次
+    BUFFER_SEGMENTS = 10_000  # 每累积2000万条segments flush一次
 
     next_milestone = milestone_step
     total_reads = 0
@@ -267,15 +254,18 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         segment_dict = process_alignment(raw_msg, wanted_nodes, chrom_filter, alignment)
         total_reads += 1
 
-        # for node_id, segs in segment_dict.items():
-        #     segment_buffer[node_id].extend(segs)
-        #     total_segments += len(segs)
-        #
-        # if total_segments >= BUFFER_SEGMENTS:
-        #     flush_segment_buffer()
+        for node_id, segs in segment_dict.items():
+            segment_buffer[node_id].extend(segs)
+            total_segments += len(segs)
+
+        if total_segments >= BUFFER_SEGMENTS:
+            current_memory = process.memory_info()
+            print(
+                f"[Info] Memory usage before flush: RSS={current_memory.rss / 1024 / 1024:.2f} MB, VMS={current_memory.vms / 1024 / 1024:.2f} MB")
+
+            flush_segment_buffer()
 
         if total_reads >= next_milestone:
-            flush_segment_buffer()
             elapsed = time.perf_counter() - start_time
             print(f"{total_reads} reads processed | {elapsed:.1f} seconds")
             next_milestone += milestone_step
