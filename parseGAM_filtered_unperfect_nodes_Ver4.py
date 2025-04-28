@@ -79,65 +79,64 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter, alignment):
     alignment.Clear()
     alignment.ParseFromString(raw_message)
 
-    # 如果有染色体过滤
     if chrom_filter and not any(pos.name == chrom_filter for pos in alignment.refpos):
         return segment_dict, 0
 
-    # 下面这两块是全函数可复用的“工作区”
-    seq_buf  = bytearray(150)
-    qual_buf = bytearray(150)
+    read_sequence = memoryview(alignment.sequence.encode())  # avoid copy
+    read_quality = memoryview(alignment.quality)
+    mapping_quality = alignment.mapping_quality
+    read_offset = 0
 
-    read_seq = memoryview(alignment.sequence.encode('ascii'))      # bytes → memoryview，切片不复制
-    read_qual= memoryview(alignment.quality)        # bytes → memoryview
-    mapping_q= alignment.mapping_quality
-    roffset  = 0
-    reads    = 1
+    seq_buffer = bytearray(150)
+    qual_buffer = bytearray(150)
 
-    for m in alignment.path.mapping:
-        nid = m.position.node_id
-        if nid not in wanted_nodes:
-            # 跳过不需要的节点，更新偏移
-            for e in m.edit:
-                roffset += max(e.from_length, len(e.sequence))
+    for mapping in alignment.path.mapping:
+        node_id = mapping.position.node_id
+
+        if node_id not in wanted_nodes:
+            for edit in mapping.edit:
+                read_offset += max(edit.from_length, len(edit.sequence))
             continue
 
-        # 重置每次 mapping 里 buffer 的“写入指针”
-        so = 0
-        qo = 0
+        node_offset = mapping.position.offset
+        strand_char = b"-" if mapping.position.is_reverse else b"+"
 
-        for e in m.edit:
-            if e.from_length:
-                ln = e.from_length
-                frag = read_seq[roffset:roffset+ln]
-                # mismatch? 只在 really needed 时 lower()
-                if e.sequence:
-                    seq_buf[so:so+ln] = frag.tobytes().lower()
+        seq_pos = 0
+        qual_pos = 0
+
+        for edit in mapping.edit:
+            if edit.from_length:
+                frag = read_sequence[read_offset : read_offset + edit.from_length]
+                frag_len = len(frag)
+                # lower if mismatch
+                if edit.sequence:
+                    seq_buffer[seq_pos:seq_pos+frag_len] = frag.tobytes().lower()
                 else:
-                    seq_buf[so:so+ln] = frag
-                qual_buf[qo:qo+ln] = read_qual[roffset:roffset+ln]
-                roffset += ln
-                so += ln
-                qo += ln
-            elif e.sequence:
-                ln = len(e.sequence)
-                frag = read_seq[roffset:roffset+ln]
-                seq_buf[so:so+ln] = frag.tobytes().lower()
-                qual_buf[qo:qo+ln] = read_qual[roffset:roffset+ln]
-                roffset += ln
-                so += ln
-                qo += ln
+                    seq_buffer[seq_pos:seq_pos+frag_len] = frag
+                qual_buffer[qual_pos:qual_pos+frag_len] = read_quality[read_offset : read_offset + frag_len]
+                read_offset += frag_len
+                seq_pos += frag_len
+                qual_pos += frag_len
 
-        # 只生成一次固定大小的 bytes，完全无中间 join/encode
+            elif edit.sequence:
+                ins_len = len(edit.sequence)
+                frag = read_sequence[read_offset : read_offset + ins_len]
+                seq_buffer[seq_pos:seq_pos+ins_len] = frag.tobytes().lower()
+                qual_buffer[qual_pos:qual_pos+ins_len] = read_quality[read_offset : read_offset + ins_len]
+                read_offset += ins_len
+                seq_pos += ins_len
+                qual_pos += ins_len
+
         seg = Segment(
-            m.position.offset,
-            bytes(seq_buf[:so]).ljust(150, b'\x00'),
-            bytes(qual_buf[:qo]).ljust(150, b'\x00'),
-            mapping_q,
-            b"-" if m.position.is_reverse else b"+"
+            node_offset,
+            bytes(seq_buffer[:seq_pos]).ljust(150, b'\x00'),
+            bytes(qual_buffer[:qual_pos]).ljust(150, b'\x00'),
+            mapping_quality,
+            strand_char
         )
-        segment_dict.setdefault(nid, []).append(seg)
+        segment_dict.setdefault(node_id, []).append(seg)
 
-    return segment_dict, reads
+    return segment_dict
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -205,7 +204,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     print(f"Output file created: {dat_path}")
 
     # BUFFER_SEGMENTS = 30_000_000  # 每累积2000万条segments flush一次
-    BUFFER_SEGMENTS = 100_000  # 每累积2000万条segments flush一次
+    BUFFER_SEGMENTS = 10_000  # 每累积2000万条segments flush一次
 
     next_milestone = milestone_step
     total_reads = 0
@@ -265,8 +264,10 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
                 print(stat)
 
     for raw_msg in gam_record_iter(gam_path):
-        segment_dict, read_count = process_alignment(raw_msg, wanted_nodes, chrom_filter, alignment)
-        total_reads += read_count
+        segment_dict = process_alignment(raw_msg, wanted_nodes, chrom_filter, alignment)
+        # segment_dict = {}
+        # read_count = 1
+        total_reads += 1
 
         for node_id, segs in segment_dict.items():
             segment_buffer[node_id].extend(segs)
