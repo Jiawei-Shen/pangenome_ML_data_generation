@@ -76,7 +76,6 @@ def gam_record_iter(path, tag="GAM"):
 
 def process_alignment(raw_message, wanted_nodes, chrom_filter, alignment):
     segment_dict = {}
-    alignment.Clear()
     alignment.ParseFromString(raw_message)
 
     if chrom_filter and not any(pos.name == chrom_filter for pos in alignment.refpos):
@@ -122,7 +121,7 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter, alignment):
             strand_char
         )
         segment_dict.setdefault(node_id, []).append(seg)
-
+    alignment.Clear()
     return segment_dict
 
 
