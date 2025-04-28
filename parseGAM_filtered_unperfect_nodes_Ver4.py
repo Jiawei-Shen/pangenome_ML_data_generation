@@ -87,7 +87,7 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter, alignment):
     seq_buf  = bytearray(150)
     qual_buf = bytearray(150)
 
-    read_seq = memoryview(alignment.sequence)       # bytes → memoryview，切片不复制
+    read_seq = memoryview(alignment.sequence.encode('ascii'))      # bytes → memoryview，切片不复制
     read_qual= memoryview(alignment.quality)        # bytes → memoryview
     mapping_q= alignment.mapping_quality
     roffset  = 0
