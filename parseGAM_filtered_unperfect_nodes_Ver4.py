@@ -67,9 +67,10 @@ def gam_record_iter(path, tag="GAM"):
                 except EOFError:
                     break
 
-def process_alignment(raw_message, wanted_nodes, chrom_filter, alignment):
+
+def process_alignment(raw_message, wanted_nodes, chrom_filter):
     segment_dict = {}
-    alignment.Clear()
+    alignment = vg_pb2.Alignment()
     alignment.ParseFromString(raw_message)
 
     if chrom_filter and not any(pos.name == chrom_filter for pos in alignment.refpos):
@@ -224,7 +225,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         print(f"[Info] Memory usage after flush: {current_memory / 1024 / 1024:.2f} MB")
 
     for raw_msg in gam_record_iter(gam_path):
-        segment_dict, read_count = process_alignment(raw_msg, wanted_nodes, chrom_filter, alignment)
+        segment_dict, read_count = process_alignment(raw_msg, wanted_nodes, chrom_filter)
         total_reads += read_count
 
         for node_id, segs in segment_dict.items():
