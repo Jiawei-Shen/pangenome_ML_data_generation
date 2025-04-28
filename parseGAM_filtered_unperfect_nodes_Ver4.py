@@ -206,7 +206,8 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     # print(f"[Info] baseline_memory: {baseline_memory / 1024 / 1024:.2f} MB")
 
     def flush_segment_buffer():
-        nonlocal total_segments, baseline_memory
+        # nonlocal total_segments, baseline_memory
+        nonlocal total_segments
         for node_id, segs in segment_buffer.items():
             if not segs:
                 continue
@@ -241,9 +242,6 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
             flush_segment_buffer()
 
         if total_reads >= next_milestone:
-            current_memory = process.memory_info().rss
-            print(f"[Info] Memory usage: {current_memory / 1024 / 1024:.2f} MB")
-
             elapsed = time.perf_counter() - start_time
             print(f"{total_reads} reads processed | {elapsed:.1f} seconds")
             next_milestone += milestone_step
