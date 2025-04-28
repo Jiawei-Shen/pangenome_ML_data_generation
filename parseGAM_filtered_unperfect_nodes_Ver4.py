@@ -9,6 +9,7 @@ import psutil
 from collections import defaultdict
 import vg_pb2
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 class Segment:
     __slots__ = ('offset', 'seq', 'bq', 'rq', 'strand')
@@ -19,8 +20,10 @@ class Segment:
         self.rq     = rq
         self.strand = strand
 
+
 RECORD_STRUCT = struct.Struct("<h150s150shc")
 RECORD_SIZE = RECORD_STRUCT.size
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 def read_varint(stream):
@@ -36,9 +39,11 @@ def read_varint(stream):
             return value
         shift_amount += 7
 
+
 def file_is_gzip(path):
     with open(path, "rb") as fh:
         return fh.read(2) == b"\x1f\x8b"
+
 
 def gam_record_iter(path, tag="GAM"):
     open_func = gzip.open if file_is_gzip(path) else open
@@ -152,30 +157,31 @@ def initialize_output_files(stats_path, output_prefix):
     gc.collect()
 
     dat_path = output_prefix + ".dat"
-    #
-    # with open(dat_path, "wb") as f:
-    #     f.write(b"MYFMT\1")
-    #     f.write(struct.pack("<BBI16s", 0, 1, len(block_infos), b'\x00' * 16))
-    #
-    #     # 直接顺序写所有block
-    #     blank_record = RECORD_STRUCT.pack(0, b'\x00'*150, b'\x00'*150, 0, b'+')
-    #
-    #     for node_id, info in block_infos.items():
-    #         # 构建整个block的内容 (block header + n_records blank)
-    #         block_header = struct.pack("<I I H", node_id, info["n_records"], 0)
-    #         records_blob = blank_record * info["n_records"]
-    #         full_block = block_header + records_blob
-    #         f.write(full_block)
-    #
-    # # idx文件（照旧，单线程）
-    # idx_path = output_prefix + ".idx"
-    # with open(idx_path, "wb") as idx_file:
-    #     idx_file.write(struct.pack("<I", len(block_infos)))
-    #     for node_id, info in block_infos.items():
-    #         idx_file.write(struct.pack("<I Q I I H", node_id, info["offset"],
-    #                                    4 + 4 + 2 + info["n_records"] * RECORD_SIZE, info["n_records"], 0))
+
+    with open(dat_path, "wb") as f:
+        f.write(b"MYFMT\1")
+        f.write(struct.pack("<BBI16s", 0, 1, len(block_infos), b'\x00' * 16))
+
+        # 直接顺序写所有block
+        blank_record = RECORD_STRUCT.pack(0, b'\x00'*150, b'\x00'*150, 0, b'+')
+
+        for node_id, info in block_infos.items():
+            # 构建整个block的内容 (block header + n_records blank)
+            block_header = struct.pack("<I I H", node_id, info["n_records"], 0)
+            records_blob = blank_record * info["n_records"]
+            full_block = block_header + records_blob
+            f.write(full_block)
+
+    # idx文件（照旧，单线程）
+    idx_path = output_prefix + ".idx"
+    with open(idx_path, "wb") as idx_file:
+        idx_file.write(struct.pack("<I", len(block_infos)))
+        for node_id, info in block_infos.items():
+            idx_file.write(struct.pack("<I Q I I H", node_id, info["offset"],
+                                       4 + 4 + 2 + info["n_records"] * RECORD_SIZE, info["n_records"], 0))
 
     return block_infos, dat_path, wanted_nodes
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filter):
@@ -193,7 +199,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
 
     dat_fh = open(dat_path, "r+b")
     segment_buffer = defaultdict(list)
-    alignment = vg_pb2.Alignment()
+    # alignment = vg_pb2.Alignment()
 
     process = psutil.Process()
     baseline_memory = process.memory_info().rss
@@ -218,11 +224,10 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
             info["current_pos"] += len(segs)
 
         segment_buffer.clear()
-        gc.collect()
         total_segments = 0
 
-        current_memory = process.memory_info().rss
-        print(f"[Info] Memory usage after flush: {current_memory / 1024 / 1024:.2f} MB")
+        # current_memory = process.memory_info().rss
+        # print(f"[Info] Memory usage after flush: {current_memory / 1024 / 1024:.2f} MB")
 
     for raw_msg in gam_record_iter(gam_path):
         segment_dict, read_count = process_alignment(raw_msg, wanted_nodes, chrom_filter)
@@ -252,6 +257,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     print(f"  Nodes included: {len(block_infos)}")
     print(f"  Elapsed time: {elapsed:.2f} seconds")
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="GAM segment extractor into binary blocks (single-threaded).")
@@ -269,6 +275,7 @@ def main():
         milestone_step=args.milestone,
         chrom_filter=args.chr
     )
+
 
 if __name__ == "__main__":
     main()
