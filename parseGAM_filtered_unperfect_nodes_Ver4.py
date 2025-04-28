@@ -199,7 +199,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     print(f"[Info] baseline_memory: {baseline_memory / 1024 / 1024:.2f} MB")
 
     def flush_segment_buffer():
-        nonlocal total_segments, baseline_memory
+        nonlocal total_segments, baseline_memory, segment_buffer
         for node_id, segs in segment_buffer.items():
             if not segs:
                 continue
@@ -216,9 +216,11 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
 
             info["current_pos"] += len(segs)
 
-        segment_buffer.clear()
-        gc.collect()
+        # 关键变化
+        segment_buffer = defaultdict(list)  # 🆕 新建，不是.clear()
         total_segments = 0
+
+        gc.collect()
 
         current_memory = process.memory_info().rss
         print(f"[Info] Memory usage after flush: {current_memory / 1024 / 1024:.2f} MB")
