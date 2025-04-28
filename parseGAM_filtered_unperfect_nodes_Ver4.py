@@ -37,15 +37,17 @@ def read_varint(stream):
             return value
         shift_amount += 7
 
+
 def file_is_gzip(path):
     with open(path, "rb") as fh:
         return fh.read(2) == b"\x1f\x8b"
 
+
 def gam_record_iter(path, tag="GAM"):
-    # open_func = gzip.open if file_is_gzip(path) else open
-    test = b'\n\x97\x01GCTCCCAGGAAGAGTACAGACAAAACAATCTACCAAGGTTTTTTATTTTTTGTTTTTCGTTTGTTTGTAGCCCACAGAATAATACCTGGCATAAAACAGAAACTTAGTAAATATTTGCTGTGTAAATGCAAGAATGGAAAATAAGCACTTT\x12$\x12"\n\x07\x08\xc2\xa9`\x10\xd1\x02\x12\x06\x08\x80\x01\x10\x80\x01\x12\x07\x08\x01\x10\x01\x1a\x01C\x12\x04\x08\x16\x10\x16(\x01\x1a\'LH00180:108:223KKHLT4:6:1101:47886:1224"\x97\x01(((((\x18(((((((((\x18((((((\x18(((\x0c((((((\x18(((((\x18(((((((((((((((((((\x18((((((((((((((\x18(\x18((((((\x0c(((\x0c(((((((((((\x0c((((((((\x0c(((((((((\x18(((((((((\x0c(\x18(((((((((((((\x18(((((((<0\x9c\x01Z)\x1a\'LH00180:108:223KKHLT4:6:1101:47886:1224\x81\x01\xfe&\x7f\x93\xbf\xc9\xef?\x99\x02>OH\xda\xa9\x93%?\xa2\x06\xca\x02\n\x1b\n\x11last_placed_stage\x12\x06\x1a\x04none\n\x1c\n\x0ffragment_length\x12\t\x11\x00\x00\x00\x00\x00\x10u@\n\x11\n\x0bproper_pair\x12\x02 \x01\n\x1e\n\x11mapq_explored_cap\x12\t\x11\xbe\x85\xea\x15abQ@\n<\n\x1cfragment_length_distribution\x12\x1c\x1a\x1a-I 347.232632 -D 84.280571\n\x1a\n\rmapq_uncapped\x12\t\x11\x00\x00\xc0\xff\xff\xff\xdfA\n\x1d\n\x10mapq_applied_cap\x12\t\x11&\xfe{84Nw@\n\x1f\n\x15last_placed_stage_0bp\x12\x06\x1a\x04none\n\x1d\n\x10mapq_score_group\x12\t\x11\x00\x00\xc0\xff\xff\xff\xdfA\n!\n\x10secondary_scores\x12\r2\x0b\n\t\x11J\xe0+-\xea\xcfs@'
-    while True:
-        yield test
+    open_func = gzip.open if file_is_gzip(path) else open
+    # test = b'\n\x97\x01GCTCCCAGGAAGAGTACAGACAAAACAATCTACCAAGGTTTTTTATTTTTTGTTTTTCGTTTGTTTGTAGCCCACAGAATAATACCTGGCATAAAACAGAAACTTAGTAAATATTTGCTGTGTAAATGCAAGAATGGAAAATAAGCACTTT\x12$\x12"\n\x07\x08\xc2\xa9`\x10\xd1\x02\x12\x06\x08\x80\x01\x10\x80\x01\x12\x07\x08\x01\x10\x01\x1a\x01C\x12\x04\x08\x16\x10\x16(\x01\x1a\'LH00180:108:223KKHLT4:6:1101:47886:1224"\x97\x01(((((\x18(((((((((\x18((((((\x18(((\x0c((((((\x18(((((\x18(((((((((((((((((((\x18((((((((((((((\x18(\x18((((((\x0c(((\x0c(((((((((((\x0c((((((((\x0c(((((((((\x18(((((((((\x0c(\x18(((((((((((((\x18(((((((<0\x9c\x01Z)\x1a\'LH00180:108:223KKHLT4:6:1101:47886:1224\x81\x01\xfe&\x7f\x93\xbf\xc9\xef?\x99\x02>OH\xda\xa9\x93%?\xa2\x06\xca\x02\n\x1b\n\x11last_placed_stage\x12\x06\x1a\x04none\n\x1c\n\x0ffragment_length\x12\t\x11\x00\x00\x00\x00\x00\x10u@\n\x11\n\x0bproper_pair\x12\x02 \x01\n\x1e\n\x11mapq_explored_cap\x12\t\x11\xbe\x85\xea\x15abQ@\n<\n\x1cfragment_length_distribution\x12\x1c\x1a\x1a-I 347.232632 -D 84.280571\n\x1a\n\rmapq_uncapped\x12\t\x11\x00\x00\xc0\xff\xff\xff\xdfA\n\x1d\n\x10mapq_applied_cap\x12\t\x11&\xfe{84Nw@\n\x1f\n\x15last_placed_stage_0bp\x12\x06\x1a\x04none\n\x1d\n\x10mapq_score_group\x12\t\x11\x00\x00\xc0\xff\xff\xff\xdfA\n!\n\x10secondary_scores\x12\r2\x0b\n\t\x11J\xe0+-\xea\xcfs@'
+    # while True:
+    #     yield test
     with open_func(path, "rb") as f:
         while True:
             try:
