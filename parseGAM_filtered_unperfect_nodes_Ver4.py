@@ -5,7 +5,7 @@ import pickle
 import struct
 import time
 import gc
-import psutil
+# import psutil
 from collections import defaultdict
 import vg_pb2
 
@@ -201,9 +201,9 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     segment_buffer = defaultdict(list)
     # alignment = vg_pb2.Alignment()
 
-    process = psutil.Process()
-    baseline_memory = process.memory_info().rss
-    print(f"[Info] baseline_memory: {baseline_memory / 1024 / 1024:.2f} MB")
+    # process = psutil.Process()
+    # baseline_memory = process.memory_info().rss
+    # print(f"[Info] baseline_memory: {baseline_memory / 1024 / 1024:.2f} MB")
 
     def flush_segment_buffer():
         nonlocal total_segments, baseline_memory
