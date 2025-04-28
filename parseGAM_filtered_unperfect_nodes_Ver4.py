@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 import argparse
 import gzip
+import io
+import zlib
+import subprocess
 import pickle
 import struct
 import time
@@ -37,13 +40,30 @@ def read_varint(stream):
             return value
         shift_amount += 7
 
+
 def file_is_gzip(path):
     with open(path, "rb") as fh:
         return fh.read(2) == b"\x1f\x8b"
 
 def gam_record_iter(path, tag="GAM"):
-    open_func = gzip.open if file_is_gzip(path) else open
-    with open_func(path, "rb") as f:
+    """
+    流式 Yield 原始 GAM protobuf bytes。
+    - 如果文件是 gzip 格式，使用系统 gzip -dc 解压（C 程序里管理缓冲）；
+    - 否则直接 open(path, "rb")。
+    这样 Python 端只保留几十 KB 管道缓冲，不会爆内存，也不会 DecodeError。
+    """
+    # 1) 根据 file_is_gzip 判断
+    if file_is_gzip(path):
+        p = subprocess.Popen(
+            ["gzip", "-dc", path],
+            stdout=subprocess.PIPE,
+            bufsize=64*1024
+        )
+        f = p.stdout
+    else:
+        f = open(path, "rb")
+
+    try:
         while True:
             try:
                 group_count = read_varint(f)
@@ -51,22 +71,37 @@ def gam_record_iter(path, tag="GAM"):
                 break
             if group_count == 0:
                 continue
+
+            # 读 tag
             try:
                 tag_len = read_varint(f)
                 group_tag = f.read(tag_len).decode()
             except (EOFError, UnicodeDecodeError):
                 break
+
             if group_tag != tag:
+                # 跳过这一组
                 for _ in range(group_count - 1):
                     skip_len = read_varint(f)
                     f.seek(skip_len, 1)
                 continue
+
+            # 产出每条 protobuf raw bytes
             for _ in range(group_count - 1):
                 try:
                     msg_size = read_varint(f)
                     yield f.read(msg_size)
                 except EOFError:
                     break
+    finally:
+        try:
+            f.close()
+        except:
+            pass
+        if file_is_gzip(path):
+            p.wait()
+
+
 
 def process_alignment(raw_message, wanted_nodes, chrom_filter, alignment):
     segment_dict = {}
@@ -216,8 +251,8 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
                 batch_blob += RECORD_STRUCT.pack(seg.offset, seg.seq, seg.bq, seg.rq, seg.strand)
 
             pos = base_offset + info["current_pos"] * RECORD_SIZE
-            # dat_fh.seek(pos)
-            # dat_fh.write(batch_blob)
+            dat_fh.seek(pos)
+            dat_fh.write(batch_blob)
 
             info["current_pos"] += len(segs)
 
