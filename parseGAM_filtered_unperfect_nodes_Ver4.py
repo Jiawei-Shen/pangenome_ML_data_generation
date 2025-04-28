@@ -204,7 +204,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     print(f"Output file created: {dat_path}")
 
     # BUFFER_SEGMENTS = 30_000_000  # 每累积2000万条segments flush一次
-    BUFFER_SEGMENTS = 10_000  # 每累积2000万条segments flush一次
+    BUFFER_SEGMENTS = 100_000  # 每累积2000万条segments flush一次
 
     next_milestone = milestone_step
     total_reads = 0
