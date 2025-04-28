@@ -245,7 +245,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         total_reads += 1
 
         for node_id, segs in segment_dict.items():
-            # segment_buffer[node_id].extend(segs)
+            segment_buffer[node_id].extend(segs)
             total_segments += len(segs)
 
         if total_segments >= BUFFER_SEGMENTS:
