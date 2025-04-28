@@ -6,7 +6,6 @@ import struct
 import time
 import gc
 import psutil
-import tracemalloc
 from collections import defaultdict
 import vg_pb2
 
@@ -37,17 +36,12 @@ def read_varint(stream):
             return value
         shift_amount += 7
 
-
 def file_is_gzip(path):
     with open(path, "rb") as fh:
         return fh.read(2) == b"\x1f\x8b"
 
-
 def gam_record_iter(path, tag="GAM"):
     open_func = gzip.open if file_is_gzip(path) else open
-    # test = b'\n\x97\x01GCTCCCAGGAAGAGTACAGACAAAACAATCTACCAAGGTTTTTTATTTTTTGTTTTTCGTTTGTTTGTAGCCCACAGAATAATACCTGGCATAAAACAGAAACTTAGTAAATATTTGCTGTGTAAATGCAAGAATGGAAAATAAGCACTTT\x12$\x12"\n\x07\x08\xc2\xa9`\x10\xd1\x02\x12\x06\x08\x80\x01\x10\x80\x01\x12\x07\x08\x01\x10\x01\x1a\x01C\x12\x04\x08\x16\x10\x16(\x01\x1a\'LH00180:108:223KKHLT4:6:1101:47886:1224"\x97\x01(((((\x18(((((((((\x18((((((\x18(((\x0c((((((\x18(((((\x18(((((((((((((((((((\x18((((((((((((((\x18(\x18((((((\x0c(((\x0c(((((((((((\x0c((((((((\x0c(((((((((\x18(((((((((\x0c(\x18(((((((((((((\x18(((((((<0\x9c\x01Z)\x1a\'LH00180:108:223KKHLT4:6:1101:47886:1224\x81\x01\xfe&\x7f\x93\xbf\xc9\xef?\x99\x02>OH\xda\xa9\x93%?\xa2\x06\xca\x02\n\x1b\n\x11last_placed_stage\x12\x06\x1a\x04none\n\x1c\n\x0ffragment_length\x12\t\x11\x00\x00\x00\x00\x00\x10u@\n\x11\n\x0bproper_pair\x12\x02 \x01\n\x1e\n\x11mapq_explored_cap\x12\t\x11\xbe\x85\xea\x15abQ@\n<\n\x1cfragment_length_distribution\x12\x1c\x1a\x1a-I 347.232632 -D 84.280571\n\x1a\n\rmapq_uncapped\x12\t\x11\x00\x00\xc0\xff\xff\xff\xdfA\n\x1d\n\x10mapq_applied_cap\x12\t\x11&\xfe{84Nw@\n\x1f\n\x15last_placed_stage_0bp\x12\x06\x1a\x04none\n\x1d\n\x10mapq_score_group\x12\t\x11\x00\x00\xc0\xff\xff\xff\xdfA\n!\n\x10secondary_scores\x12\r2\x0b\n\t\x11J\xe0+-\xea\xcfs@'
-    # while True:
-    #     yield test
     with open_func(path, "rb") as f:
         while True:
             try:
@@ -73,10 +67,9 @@ def gam_record_iter(path, tag="GAM"):
                 except EOFError:
                     break
 
-
 def process_alignment(raw_message, wanted_nodes, chrom_filter, alignment):
     segment_dict = {}
-    alignment = vg_pb2.Alignment()
+    alignment.Clear()
     alignment.ParseFromString(raw_message)
 
     if chrom_filter and not any(pos.name == chrom_filter for pos in alignment.refpos):
@@ -86,6 +79,7 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter, alignment):
     read_quality_bytes = alignment.quality
     mapping_quality = alignment.mapping_quality
     read_offset = 0
+    reads = 1
 
     for mapping in alignment.path.mapping:
         node_id = mapping.position.node_id
@@ -122,8 +116,7 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter, alignment):
         )
         segment_dict.setdefault(node_id, []).append(seg)
 
-    return segment_dict
-
+    return segment_dict, reads
 
 # ─────────────────────────────────────────────────────────────────────────────
 def initialize_output_files(stats_path, output_prefix):
@@ -190,7 +183,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     print(f"Output file created: {dat_path}")
 
     BUFFER_SEGMENTS = 30_000_000  # 每累积2000万条segments flush一次
-    # BUFFER_SEGMENTS = 10_000  # 每累积2000万条segments flush一次
+    # BUFFER_SEGMENTS = 1_000  # 每累积2000万条segments flush一次
 
     next_milestone = milestone_step
     total_reads = 0
@@ -205,12 +198,8 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     baseline_memory = process.memory_info().rss
     print(f"[Info] baseline_memory: {baseline_memory / 1024 / 1024:.2f} MB")
 
-    # 在run_pipeline开始时加：
-    tracemalloc.start()
-    flush_counter = 0
-
     def flush_segment_buffer():
-        nonlocal total_segments, baseline_memory, segment_buffer, flush_counter
+        nonlocal total_segments, baseline_memory
         for node_id, segs in segment_buffer.items():
             if not segs:
                 continue
@@ -227,22 +216,16 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
 
             info["current_pos"] += len(segs)
 
-        # flush结束
-        segment_buffer = defaultdict(list)  # 重新new一个
-        total_segments = 0
-        flush_counter += 1
-
-        # 强制GC
+        segment_buffer.clear()
         gc.collect()
+        total_segments = 0
 
-        # 记录内存
-        current_memory = process.memory_info()
-        print(
-            f"[Info] Memory usage after flush #{flush_counter}: RSS={current_memory.rss / 1024 / 1024:.2f} MB, VMS={current_memory.vms / 1024 / 1024:.2f} MB")
+        current_memory = process.memory_info().rss
+        print(f"[Info] Memory usage after flush: {current_memory / 1024 / 1024:.2f} MB")
 
     for raw_msg in gam_record_iter(gam_path):
-        segment_dict = process_alignment(raw_msg, wanted_nodes, chrom_filter, alignment)
-        total_reads += 1
+        segment_dict, read_count = process_alignment(raw_msg, wanted_nodes, chrom_filter, alignment)
+        total_reads += read_count
 
         for node_id, segs in segment_dict.items():
             segment_buffer[node_id].extend(segs)
