@@ -204,7 +204,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     print(f"Output file created: {dat_path}")
 
     # BUFFER_SEGMENTS = 30_000_000  # 每累积2000万条segments flush一次
-    BUFFER_SEGMENTS = 100_000  # 每累积2000万条segments flush一次
+    BUFFER_SEGMENTS = 20_000  # 每累积2000万条segments flush一次
 
     next_milestone = milestone_step
     total_reads = 0
@@ -275,6 +275,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         #     flush_segment_buffer()
 
         if total_reads >= next_milestone:
+            flush_segment_buffer()
             elapsed = time.perf_counter() - start_time
             print(f"{total_reads} reads processed | {elapsed:.1f} seconds")
             next_milestone += milestone_step
