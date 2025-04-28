@@ -76,11 +76,14 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter, alignment):
     if chrom_filter and not any(pos.name == chrom_filter for pos in alignment.refpos):
         return segment_dict, 0
 
-    read_sequence = alignment.sequence
-    read_quality_bytes = alignment.quality
+    read_sequence = memoryview(alignment.sequence.encode())  # 用 memoryview 避免切片复制
+    read_quality = memoryview(alignment.quality)  # already bytes
     mapping_quality = alignment.mapping_quality
     read_offset = 0
     reads = 1
+
+    seq_buffer = bytearray(150)  # 固定大小，减少bytearray重建
+    qual_buffer = bytearray(150)
 
     for mapping in alignment.path.mapping:
         node_id = mapping.position.node_id
@@ -91,31 +94,48 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter, alignment):
             continue
 
         node_offset = mapping.position.offset
-        strand_char = b"-" if mapping.position.is_reverse else b"+"
-        sequence_parts = []
-        quality_bytes = bytearray()
+        strand_chr = b"-" if mapping.position.is_reverse else b"+"
+
+        seq_pos = 0
+        qual_pos = 0
 
         for edit in mapping.edit:
             if edit.from_length:
-                frag = read_sequence[read_offset: read_offset + edit.from_length]
-                sequence_parts.append(frag.lower() if edit.sequence else frag)
-                quality_bytes.extend(read_quality_bytes[read_offset: read_offset + edit.from_length])
-                read_offset += edit.from_length
+                # Copy sequence
+                frag = read_sequence[read_offset : read_offset + edit.from_length]
+                frag_len = len(frag)
+                if edit.sequence:
+                    # mismatch: lowercased (optional, you can skip if not necessary)
+                    seq_buffer[seq_pos:seq_pos+frag_len] = frag.tobytes().lower()
+                else:
+                    seq_buffer[seq_pos:seq_pos+frag_len] = frag
+                # Copy quality
+                qual_buffer[qual_pos:qual_pos+frag_len] = read_quality[read_offset:read_offset+frag_len]
+                read_offset += frag_len
+                seq_pos += frag_len
+                qual_pos += frag_len
+
             elif edit.sequence:
                 ins_len = len(edit.sequence)
-                frag = read_sequence[read_offset: read_offset + ins_len]
-                sequence_parts.append(frag.lower())
-                quality_bytes.extend(read_quality_bytes[read_offset: read_offset + ins_len])
+                frag = read_sequence[read_offset : read_offset + ins_len]
+                seq_buffer[seq_pos:seq_pos+ins_len] = frag.tobytes().lower()
+                qual_buffer[qual_pos:qual_pos+ins_len] = read_quality[read_offset:read_offset+ins_len]
                 read_offset += ins_len
+                seq_pos += ins_len
+                qual_pos += ins_len
 
+        # 截断到实际长度，不是整个150
         seg = Segment(
             node_offset,
-            "".join(sequence_parts).encode().ljust(150, b'\x00')[:150],
-            bytes(quality_bytes).ljust(150, b'\x00')[:150],
+            bytes(seq_buffer[:seq_pos]).ljust(150, b'\x00'),  # pad到150
+            bytes(qual_buffer[:qual_pos]).ljust(150, b'\x00'),
             mapping_quality,
-            strand_char
+            strand_chr
         )
         segment_dict.setdefault(node_id, []).append(seg)
+
+    # Optional (如果你真的想极限GC）
+    # gc.collect()
 
     return segment_dict, reads
 
