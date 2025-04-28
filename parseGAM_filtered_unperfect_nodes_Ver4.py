@@ -249,7 +249,6 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
                 print(stat)
 
     for raw_msg in gam_record_iter(gam_path):
-        print(raw_msg)
         segment_dict, read_count = process_alignment(raw_msg, wanted_nodes, chrom_filter, alignment)
         total_reads += read_count
 
@@ -259,6 +258,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
 
         if total_segments >= BUFFER_SEGMENTS:
             flush_segment_buffer()
+            print(raw_msg)
 
         if total_reads >= next_milestone:
             elapsed = time.perf_counter() - start_time
