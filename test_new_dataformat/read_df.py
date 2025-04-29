@@ -3,8 +3,8 @@ import struct
 import argparse
 
 # ─────────────────────────────────────────────────────────────────────────────
-RECORD_STRUCT = struct.Struct("<h150s150shc")  # 结构
-RECORD_SIZE = RECORD_STRUCT.size  # 305 bytes
+RECORD_STRUCT = struct.Struct("<h150s150s20shc")  # <-- 注意！已经改成新版结构
+RECORD_SIZE = RECORD_STRUCT.size  # 325 bytes
 
 # ─────────────────────────────────────────────────────────────────────────────
 def load_index(idx_path):
@@ -41,12 +41,14 @@ def read_segments(dat_path, node_index, node_id):
             raw = f.read(RECORD_SIZE)
             if not raw:
                 break
-            offset, seq, bq, rq, strand = RECORD_STRUCT.unpack(raw)
+            offset, seq, bq, cigar_bytes, rq, strand = RECORD_STRUCT.unpack(raw)
+
             record = {
                 "offset": offset,
-                "seq": seq.rstrip(b'\x00').decode(errors='ignore'),
+                "sequence": seq.rstrip(b'\x00').decode(errors='ignore'),
                 "base_quality": bq.rstrip(b'\x00').decode(errors='ignore'),
-                "read_quality": rq,
+                "cigar": cigar_bytes.rstrip(b'\x00').decode(errors='ignore'),
+                "mapping_quality": rq,
                 "strand": strand.decode()
             }
             records.append(record)
@@ -55,11 +57,11 @@ def read_segments(dat_path, node_index, node_id):
 
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="Read segments for a given node_id from binary .dat/.idx files.")
+    parser = argparse.ArgumentParser(description="Read segments for a given node_id from binary .dat/.idx files (new format with cigar).")
     parser.add_argument("dat_path", help="Path to .dat file")
     parser.add_argument("idx_path", help="Path to .idx file")
     parser.add_argument("node_id", type=int, help="Node ID to fetch")
-    parser.add_argument("--topn", type=int, default=10, help="Show top N records (default 5, use -1 to show all)")
+    parser.add_argument("--topn", type=int, default=10, help="Show top N records (default 10, use -1 to show all)")
     args = parser.parse_args()
 
     node_index = load_index(args.idx_path)
@@ -67,7 +69,6 @@ def main():
 
     print(f"Node {args.node_id} has {len(records)} records.")
 
-    # 使用 --topn 控制输出
     if args.topn == -1:
         for r in records:
             print(r)
