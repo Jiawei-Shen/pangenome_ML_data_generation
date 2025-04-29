@@ -61,7 +61,7 @@ def main():
     parser.add_argument("dat_path", help="Path to .dat file")
     parser.add_argument("idx_path", help="Path to .idx file")
     parser.add_argument("node_id", type=int, help="Node ID to fetch")
-    parser.add_argument("--topn", type=int, default=10, help="Show top N records (default 10, use -1 to show all)")
+    parser.add_argument("--topn", type=int, default=20, help="Show top N records (default 10, use -1 to show all)")
     args = parser.parse_args()
 
     node_index = load_index(args.idx_path)
