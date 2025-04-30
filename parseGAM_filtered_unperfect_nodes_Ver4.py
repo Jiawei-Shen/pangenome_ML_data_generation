@@ -199,21 +199,21 @@ def initialize_output_files(stats_path, output_prefix):
 
     dat_path = output_prefix + ".dat"
 
-    # with open(dat_path, "wb") as f:
-    #     f.write(b"MYFMT\1")
-    #     f.write(struct.pack("<BBI16s", 0, 1, len(block_infos), b'\x00' * 16))
-    #
-    #     blank_record = RECORD_STRUCT.pack(0, b'\x00'*150, b'\x00'*150, b'\x00'*20, 0, b'+')
-    #     for node_id, info in block_infos.items():
-    #         block_header = struct.pack("<I I H", node_id, info["n_records"], 0)
-    #         f.write(block_header + blank_record * info["n_records"])
-    #
-    # idx_path = output_prefix + ".idx"
-    # with open(idx_path, "wb") as idx_file:
-    #     idx_file.write(struct.pack("<I", len(block_infos)))
-    #     for node_id, info in block_infos.items():
-    #         idx_file.write(struct.pack("<I Q I I H", node_id, info["offset"],
-    #                                    4 + 4 + 2 + info["n_records"] * RECORD_SIZE, info["n_records"], 0))
+    with open(dat_path, "wb") as f:
+        f.write(b"MYFMT\1")
+        f.write(struct.pack("<BBI16s", 0, 1, len(block_infos), b'\x00' * 16))
+
+        blank_record = RECORD_STRUCT.pack(0, b'\x00'*150, b'\x00'*150, b'\x00'*20, 0, b'+')
+        for node_id, info in block_infos.items():
+            block_header = struct.pack("<I I H", node_id, info["n_records"], 0)
+            f.write(block_header + blank_record * info["n_records"])
+
+    idx_path = output_prefix + ".idx"
+    with open(idx_path, "wb") as idx_file:
+        idx_file.write(struct.pack("<I", len(block_infos)))
+        for node_id, info in block_infos.items():
+            idx_file.write(struct.pack("<I Q I I H", node_id, info["offset"],
+                                       4 + 4 + 2 + info["n_records"] * RECORD_SIZE, info["n_records"], 0))
 
     return block_infos, dat_path, wanted_nodes
 
