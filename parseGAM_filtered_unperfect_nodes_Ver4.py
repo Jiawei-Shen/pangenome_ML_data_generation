@@ -8,6 +8,7 @@ import gc
 from collections import defaultdict
 import vg_pb2
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 class Segment:
     __slots__ = ('offset', 'seq', 'bq', 'cigar', 'rq', 'strand')
@@ -19,8 +20,10 @@ class Segment:
         self.rq     = rq
         self.strand = strand
 
+
 RECORD_STRUCT = struct.Struct("<h150s150s20shc")
 RECORD_SIZE = RECORD_STRUCT.size
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 def read_varint(stream):
@@ -101,7 +104,6 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
     read_quality = alignment.quality
     mapping_quality = alignment.mapping_quality
     read_offset = 0
-    reads = 1
 
     for mapping in alignment.path.mapping:
         node_id = mapping.position.node_id
@@ -114,21 +116,39 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
         node_offset = mapping.position.offset
         strand_char = b"-" if mapping.position.is_reverse else b"+"
 
-        # Build CIGAR + Sequence/Quality collection
         sequence_parts = []
         quality_parts = bytearray()
-        cigar_string = build_cigar(mapping.edit)
+        cigar_parts = []
 
         for edit in mapping.edit:
-            edit_length = max(edit.from_length, len(edit.sequence))
-            sequence_fragment = read_sequence[read_offset : read_offset + edit_length]
-            quality_fragment = read_quality[read_offset : read_offset + edit_length]
+            from_len = edit.from_length
+            to_len = edit.to_length
+            edit_len = len(edit.sequence)
+
+            # Build CIGAR part
+            if from_len == to_len:
+                if edit_len == 0:
+                    cigar_parts.append(f"{from_len}M")
+                else:
+                    cigar_parts.append(f"{from_len}X")
+            elif from_len > 0 and to_len == 0:
+                cigar_parts.append(f"{from_len}D")
+            elif from_len == 0 and to_len > 0:
+                cigar_parts.append(f"{to_len}I")
+            else:
+                raise ValueError(f"Unexpected edit: from_length={from_len}, sequence_length={edit_len}")
+
+            # Append sequence and quality
+            edit_length = max(from_len, edit_len)
+            sequence_fragment = read_sequence[read_offset: read_offset + edit_length]
+            quality_fragment = read_quality[read_offset: read_offset + edit_length]
 
             sequence_parts.append(sequence_fragment.upper())
             quality_parts.extend(quality_fragment)
-
             read_offset += edit_length
 
+        # Construct final padded fields
+        cigar_string = "".join(cigar_parts)
         seq_final = "".join(sequence_parts).encode().ljust(150, b'\x00')[:150]
         bq_final = bytes(quality_parts).ljust(150, b'\x00')[:150]
         cigar_bytes = cigar_string.encode().ljust(20, b'\x00')[:20]
@@ -141,10 +161,9 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
             rq=mapping_quality,
             strand=strand_char
         )
-
         segment_dict.setdefault(node_id, []).append(seg)
 
-    return segment_dict, reads
+    return segment_dict
 
 # ─────────────────────────────────────────────────────────────────────────────
 def initialize_output_files(stats_path, output_prefix):
@@ -204,7 +223,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
     print(f"Output file created: {dat_path}")
 
-    BUFFER_SEGMENTS = 100_000
+    BUFFER_SEGMENTS = 300_000_000  # it takes about 180GB memory
 
     next_milestone = milestone_step
     total_reads = 0
@@ -236,8 +255,8 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         total_segments = 0
 
     for raw_msg in gam_record_iter(gam_path):
-        segment_dict, read_count = process_alignment(raw_msg, wanted_nodes, chrom_filter)
-        total_reads += read_count
+        segment_dict = process_alignment(raw_msg, wanted_nodes, chrom_filter)
+        total_reads += 1
 
         for node_id, segs in segment_dict.items():
             segment_buffer[node_id].extend(segs)
