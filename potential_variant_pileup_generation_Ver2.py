@@ -1,128 +1,107 @@
 #!/usr/bin/env python3
-"""
-Parallel pileup of read segments in .dat/.idx format,
-filter by mapping quality, and retain per-base quality matrix.
-
-Outputs, per node:
-  - "pileup": list of strings (rows of bases, '.' for gap)
-  - "bq_matrix": list of lists of ints (same shape, -1 for gap)
-  - "allele_frequencies": per-column base frequencies
-
-Usage:
-  python pileup_dat_v2.py --dat reads.dat --idx reads.idx --out res.json \
-       --min_mapq 20 --threads 8
-"""
-import argparse, struct, json
-import numpy as np
-from pathlib import Path
-from collections import Counter
+import struct
+import argparse
+from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 
-COMPLEMENT = str.maketrans("ACGTacgt", "TGCAtgca")
-RECORD_STRUCT = struct.Struct("<h150s150shc")  # offset, seq, bq, rq, strand
+RECORD_STRUCT = struct.Struct("<h150s150s20shc")
 RECORD_SIZE = RECORD_STRUCT.size
 
-def reverse_complement(seq: str) -> str:
-    return seq.translate(COMPLEMENT)[::-1]
+def reverse_complement(seq):
+    complement = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")
+    return seq.translate(complement)[::-1]
 
-def load_idx(idx_path):
-    d = {}
-    with open(idx_path, "rb") as f:
-        nb, = struct.unpack("<I", f.read(4))
-        for _ in range(nb):
-            bid, off, sz, nrec, _ = struct.unpack("<I Q I I H", f.read(22))
-            d[bid] = (off, sz, nrec)
-    return d
+def load_node_sequences(gfa_path):
+    node_sequences = {}
+    with open(gfa_path, "r") as f:
+        for line in f:
+            if line.startswith("S"):
+                fields = line.strip().split('\t')
+                if len(fields) >= 3:
+                    try:
+                        node_id = int(fields[1])
+                        node_sequences[node_id] = fields[2]
+                    except ValueError:
+                        continue
+    return node_sequences
 
-def load_node_segments(dat_path, node_id, idx, min_mapq):
-    off, _, nrec = idx[node_id]
-    segs = []
-    with open(dat_path, "rb") as f:
-        f.seek(off + 4+4+2)
-        for _ in range(nrec):
-            raw = f.read(RECORD_SIZE)
-            node_off, sb, bqb, rq, strand_c = RECORD_STRUCT.unpack(raw)
-            if rq < min_mapq:
-                continue
-            seq = sb.rstrip(b'\x00').decode('ascii')
-            bq = list(bqb[:len(seq)])
-            strand = strand_c.decode()
-            segs.append({"offset":node_off, "sequence":seq,
-                         "bq":bq, "strand":strand})
-    return segs
+def load_segments_from_dat_idx(dat_path, idx_path):
+    segments_by_node = defaultdict(list)
+    with open(idx_path, "rb") as idx_f, open(dat_path, "rb") as dat_f:
+        num_nodes = struct.unpack("<I", idx_f.read(4))[0]
+        for _ in range(num_nodes):
+            node_id, offset, block_size, n_records, _ = struct.unpack("<I Q I I H", idx_f.read(22))
+            dat_f.seek(offset + 10)  # skip block header
+            for _ in range(n_records):
+                data = dat_f.read(RECORD_SIZE)
+                if not data or data == b'\x00' * RECORD_SIZE:
+                    continue
+                offset_val, seq, bq, cigar, rq, strand = RECORD_STRUCT.unpack(data)
+                segments_by_node[node_id].append({
+                    'offset': offset_val,
+                    'seq': seq.rstrip(b'\x00').decode('ascii', errors='ignore'),
+                    'base_quality': bq.rstrip(b'\x00').decode('ascii', errors='ignore'),
+                    'cigar': cigar.rstrip(b'\x00').decode('ascii', errors='ignore'),
+                    'read_quality': rq,
+                    'strand': strand.decode()
+                })
+    return segments_by_node
 
-def pileup_with_qualities(segs):
-    if not segs:
-        return np.empty((0,0),dtype="<U1"), np.empty((0,0),dtype=int)
-    # compute width
-    w = max(s["offset"]+len(s["sequence"]) for s in segs)
-    pile_chars = []
-    pile_bq    = []
-    for s in segs:
-        off = s["offset"]; seq = s["sequence"]; bq = s["bq"]
-        if s["strand"] == "-":
-            seq = reverse_complement(seq)
-            bq  = bq[::-1]
-            off = w - off - len(seq)
-        # find or create a row
-        placed = False
-        for row_c, row_q in zip(pile_chars, pile_bq):
-            # check if this row can accommodate
-            if all((row_c[off+i] == '.') for i in range(len(seq))):
-                for i,ch in enumerate(seq):
-                    row_c[off+i] = ch.upper() if ch.upper() in "ACGT" else '.'
-                    row_q[off+i] = bq[i]
-                placed = True
-                break
-        if not placed:
-            new_c = ['.']*w
-            new_q = [-1]*w
-            for i,ch in enumerate(seq):
-                new_c[off+i] = ch.upper() if ch.upper() in "ACGT" else '.'
-                new_q[off+i] = bq[i]
-            pile_chars.append(new_c)
-            pile_bq.append(new_q)
-    return np.array(pile_chars,dtype="<U1"), np.array(pile_bq,dtype=int)
+def normalize_node_segments(args):
+    node_id, segments, node_seq = args
+    norm_segments = []
+    node_len = len(node_seq)
+    for seg in segments:
+        read_len = len(seg['seq'])
+        if seg['strand'] == '-':
+            new_offset = node_len - seg['offset'] - read_len
+            new_seq = reverse_complement(seg['seq'])
+            new_bq = seg['base_quality'][::-1]
+            norm_segments.append({
+                'offset': new_offset,
+                'seq': new_seq,
+                'base_quality': new_bq,
+                'read_quality': seg['read_quality'],
+                'strand': '+'
+            })
+        else:
+            norm_segments.append(seg)
+    return node_id, norm_segments
 
-def allele_freq(mat):
-    h,w=mat.shape; af={}
-    for c in range(w):
-        bases=[mat[r,c] for r in range(h) if mat[r,c] in "ACGT"]
-        if not bases: continue
-        cnt=Counter(bases); tot=sum(cnt.values())
-        af[c]={b:round(v/tot,4) for b,v in cnt.items()}
-    return af
+def normalize_all_segments(segments_by_node, node_sequences, workers=8):
+    tasks = []
+    for node_id, segs in segments_by_node.items():
+        node_seq = node_sequences.get(node_id)
+        if node_seq:
+            tasks.append((node_id, segs, node_seq))
 
-def process_node(nid, dat, idx, min_mapq):
-    segs = load_node_segments(dat, nid, idx, min_mapq)
-    mat_c, mat_q = pileup_with_qualities(segs)
-    af = allele_freq(mat_c)
-    return nid, {
-        "pileup": ["".join(row) for row in mat_c.tolist()],
-        "bq_matrix": mat_q.tolist(),
-        "allele_frequencies": {str(c):v for c,v in af.items()}
-    }
+    norm_dict = {}
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        for node_id, norm_segs in pool.map(normalize_node_segments, tasks):
+            norm_dict[node_id] = norm_segs
+    return norm_dict
 
 def main():
-    p=argparse.ArgumentParser()
-    p.add_argument("--dat",required=True)
-    p.add_argument("--idx",required=True)
-    p.add_argument("--out",required=True)
-    p.add_argument("--min_mapq",type=int,default=10)
-    p.add_argument("--threads",type=int,default=4)
-    args=p.parse_args()
+    parser = argparse.ArgumentParser(description="Normalize read segments to + strand from .dat/.idx and GFA")
+    parser.add_argument("dat", help="Path to .dat file")
+    parser.add_argument("idx", help="Path to .idx file")
+    parser.add_argument("gfa", help="Path to .gfa file")
+    parser.add_argument("--workers", type=int, default=8, help="Number of parallel processes")
+    args = parser.parse_args()
 
-    idx=load_idx(args.idx)
-    results={}
-    with ProcessPoolExecutor(max_workers=args.threads) as exe:
-        fs={exe.submit(process_node,n, args.dat, idx, args.min_mapq):n
-            for n in idx}
-        for f in fs:
-            nid,info=f.result()
-            results[str(nid)] = info
+    print("🔹 Loading segments from .dat/.idx...")
+    segments_by_node = load_segments_from_dat_idx(args.dat, args.idx)
 
-    with open(args.out,"w") as fo:
-        json.dump(results, fo, indent=2)
+    print("🔹 Loading node sequences from GFA...")
+    node_sequences = load_node_sequences(args.gfa)
 
-if __name__=="__main__":
+    print("🔹 Normalizing segments to + strand in parallel...")
+    normalized = normalize_all_segments(segments_by_node, node_sequences, workers=args.workers)
+
+    for node_id, segs in normalized.items():
+        print(f"\nNode {node_id} — {len(segs)} reads")
+        for seg in segs[:3]:  # preview only 3 per node
+            print(f"  Offset: {seg['offset']}  Strand: {seg['strand']}  Seq: {seg['seq'][:30]}...")
+
+if __name__ == "__main__":
     main()

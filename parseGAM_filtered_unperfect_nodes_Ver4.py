@@ -264,7 +264,6 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
 
         if total_segments >= BUFFER_SEGMENTS:
             flush_segment_buffer()
-            print("flushed!")
 
         if total_reads >= next_milestone:
             elapsed = time.perf_counter() - start_time
