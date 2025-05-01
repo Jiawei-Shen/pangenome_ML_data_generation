@@ -358,7 +358,7 @@ def main():
     parser.add_argument("--save-cache", help="Save node sequences to this JSON cache file (used if --gfa is provided)")
     parser.add_argument("-w", "--workers", type=int, default=8,
                         help="Number of worker processes to use")
-    parser.add_argument("-c", "--chunksize", type=int, default=50,
+    parser.add_argument("-c", "--chunksize", type=int, default=200,
                         help="Number of nodes processed by a worker before returning results (approx)")
     args = parser.parse_args()
 
