@@ -95,7 +95,6 @@ def process_node(task_info):
                 if 0 <= variant_position < node_length:
                     reads_by_variant[(variant_position, variant_type)].append((offset, sequence))
 
-    print(f"start pileup Node: {node_id}")
     pileups = {}
     window_size = 60
     half_window = window_size // 2
@@ -109,6 +108,7 @@ def process_node(task_info):
                     pileup_array[row_index, column_index] = BASE_TO_INDEX.get(sequence[seq_index].upper(), 4)
         pileups[f"{variant_position}_{variant_type}"] = pileup_array.tolist()
 
+    print(f"Node: {node_id}, pileups")
     return node_id, pileups
 
 def main():
@@ -152,12 +152,14 @@ def main():
 
     final_output = {}
     start_time = time.time()
+    milestone = 100_000
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
         for i, (node_id, pileup) in enumerate(executor.map(process_node, task_list), 1):
             final_output[node_id] = pileup
-            if i % 100_000 == 0:
+            if i > milestone:
                 elapsed = time.time() - start_time
                 print(f"✔ Processed {i} nodes — total time: {elapsed:.2f} sec")
+                milestone += milestone
 
     print("🔹 Step 4: Write JSON output")
     with open(args.output, "w") as out_file:
