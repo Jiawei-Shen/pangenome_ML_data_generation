@@ -123,6 +123,8 @@ def process_node(node_id, offset, n_records):
                 if 0 <= idx < len(rseq):
                     mat[i,j] = BASE_TO_INDEX.get(rseq[idx].upper(), 4)
         pileups[f"{vpos}_{vtype}"] = mat.tolist()
+
+    print(f"Done node_id: {node_id}")
     return node_id, pileups
 
 # ─────────────────────────────────────────────────────────────────────────────
