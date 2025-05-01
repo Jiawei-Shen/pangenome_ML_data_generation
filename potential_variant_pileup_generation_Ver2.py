@@ -1,17 +1,31 @@
 #!/usr/bin/env python3
-import struct
 import argparse
+import struct
+import json
+import numpy as np
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 
 RECORD_STRUCT = struct.Struct("<h150s150s20shc")
 RECORD_SIZE = RECORD_STRUCT.size
 
+BASE_TO_INDEX = {'A': 0, 'C': 1, 'G': 2, 'T': 3, 'N': 4}
+INDEX_TO_BASE = ['A', 'C', 'G', 'T', 'N']
+
 def reverse_complement(seq):
     complement = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")
     return seq.translate(complement)[::-1]
 
-def load_node_sequences(gfa_path):
+def parse_idx_file(idx_path):
+    node_ids = set()
+    with open(idx_path, "rb") as f:
+        num_nodes = struct.unpack("<I", f.read(4))[0]
+        for _ in range(num_nodes):
+            node_id, _, _, _, _ = struct.unpack("<I Q I I H", f.read(22))
+            node_ids.add(node_id)
+    return node_ids
+
+def load_node_sequences_from_gfa(gfa_path, target_node_ids):
     node_sequences = {}
     with open(gfa_path, "r") as f:
         for line in f:
@@ -20,88 +34,125 @@ def load_node_sequences(gfa_path):
                 if len(fields) >= 3:
                     try:
                         node_id = int(fields[1])
-                        node_sequences[node_id] = fields[2]
+                        if node_id in target_node_ids:
+                            node_sequences[node_id] = fields[2]
                     except ValueError:
                         continue
     return node_sequences
 
-def load_segments_from_dat_idx(dat_path, idx_path):
-    segments_by_node = defaultdict(list)
-    with open(idx_path, "rb") as idx_f, open(dat_path, "rb") as dat_f:
-        num_nodes = struct.unpack("<I", idx_f.read(4))[0]
-        for _ in range(num_nodes):
-            node_id, offset, block_size, n_records, _ = struct.unpack("<I Q I I H", idx_f.read(22))
-            dat_f.seek(offset + 10)  # skip block header
-            for _ in range(n_records):
-                data = dat_f.read(RECORD_SIZE)
-                if not data or data == b'\x00' * RECORD_SIZE:
-                    continue
-                offset_val, seq, bq, cigar, rq, strand = RECORD_STRUCT.unpack(data)
-                segments_by_node[node_id].append({
-                    'offset': offset_val,
-                    'seq': seq.rstrip(b'\x00').decode('ascii', errors='ignore'),
-                    'base_quality': bq.rstrip(b'\x00').decode('ascii', errors='ignore'),
-                    'cigar': cigar.rstrip(b'\x00').decode('ascii', errors='ignore'),
-                    'read_quality': rq,
-                    'strand': strand.decode()
-                })
-    return segments_by_node
+def decode_cigar(cigar_str):
+    import re
+    return re.findall(r'(\d+)([MXDI])', cigar_str)
 
-def normalize_node_segments(args):
-    node_id, segments, node_seq = args
-    norm_segments = []
-    node_len = len(node_seq)
-    for seg in segments:
-        read_len = len(seg['seq'])
-        if seg['strand'] == '-':
-            new_offset = node_len - seg['offset'] - read_len
-            new_seq = reverse_complement(seg['seq'])
-            new_bq = seg['base_quality'][::-1]
-            norm_segments.append({
-                'offset': new_offset,
-                'seq': new_seq,
-                'base_quality': new_bq,
-                'read_quality': seg['read_quality'],
-                'strand': '+'
-            })
+def detect_variants_from_cigar(offset, cigar_str):
+    variants = []
+    ref_pos = offset
+    for length, op in decode_cigar(cigar_str):
+        length = int(length)
+        if op in ('X', 'I', 'D'):
+            for i in range(length):
+                if op == 'I':
+                    variants.append((ref_pos - 1, 'I'))
+                elif op == 'D':
+                    variants.append((ref_pos, 'D'))
+                    ref_pos += 1
+                else:
+                    variants.append((ref_pos, 'X'))
+                    ref_pos += 1
         else:
-            norm_segments.append(seg)
-    return node_id, norm_segments
+            ref_pos += length
+    return variants
 
-def normalize_all_segments(segments_by_node, node_sequences, workers=8):
-    tasks = []
-    for node_id, segs in segments_by_node.items():
-        node_seq = node_sequences.get(node_id)
-        if node_seq:
-            tasks.append((node_id, segs, node_seq))
+def process_node(args):
+    node_id, node_sequence, dat_path = args
+    node_len = len(node_sequence)
+    pileups = {}
 
-    norm_dict = {}
-    with ProcessPoolExecutor(max_workers=workers) as pool:
-        for node_id, norm_segs in pool.map(normalize_node_segments, tasks):
-            norm_dict[node_id] = norm_segs
-    return norm_dict
+    with open(dat_path, "rb") as f:
+        f.seek(0, 2)
+        total_size = f.tell()
+        f.seek(0)
+        f.read(10)  # skip header
+
+        reads_by_variant = defaultdict(list)
+
+        while f.tell() < total_size:
+            try:
+                header = f.read(10)
+                if len(header) < 10:
+                    break
+                this_node_id, _, n_records = struct.unpack("<I I H", header)
+                for _ in range(n_records):
+                    data = f.read(RECORD_SIZE)
+                    offset_val, seq_raw, bq_raw, cigar_raw, rq, strand = RECORD_STRUCT.unpack(data)
+                    if this_node_id != node_id:
+                        continue
+
+                    seq = seq_raw.rstrip(b'\x00').decode('ascii', errors='ignore')
+                    cigar = cigar_raw.rstrip(b'\x00').decode('ascii', errors='ignore')
+                    strand = strand.decode()
+                    read_len = len(seq)
+
+                    if strand == '-':
+                        new_offset = node_len - offset_val - read_len
+                        seq = reverse_complement(seq)
+                        offset_val = new_offset
+
+                    variants = detect_variants_from_cigar(offset_val, cigar)
+                    for vpos, vtype in variants:
+                        if 0 <= vpos < node_len:
+                            reads_by_variant[(vpos, vtype)].append((offset_val, seq))
+            except Exception:
+                break
+
+    # Convert to 2D numpy pileup for each variant
+    for (vpos, vtype), reads in reads_by_variant.items():
+        center = vpos
+        window_size = 60
+        half = window_size // 2
+        pileup = np.full((len(reads), window_size), 4, dtype=np.uint8)  # default to 'N'
+        for i, (offset, seq) in enumerate(reads):
+            start_in_read = center - offset - half
+            for j in range(window_size):
+                idx = start_in_read + j
+                if 0 <= idx < len(seq):
+                    base = seq[idx].upper()
+                    pileup[i, j] = BASE_TO_INDEX.get(base, 4)
+        pileups[f"{vpos}_{vtype}"] = pileup.tolist()
+
+    return node_id, pileups
 
 def main():
-    parser = argparse.ArgumentParser(description="Normalize read segments to + strand from .dat/.idx and GFA")
+    parser = argparse.ArgumentParser(description="Pileup .dat/.idx reads centered on variants using GFA sequences")
     parser.add_argument("dat", help="Path to .dat file")
     parser.add_argument("idx", help="Path to .idx file")
     parser.add_argument("gfa", help="Path to .gfa file")
+    parser.add_argument("output", help="Path to output JSON file")
     parser.add_argument("--workers", type=int, default=8, help="Number of parallel processes")
     args = parser.parse_args()
 
-    print("🔹 Loading segments from .dat/.idx...")
-    segments_by_node = load_segments_from_dat_idx(args.dat, args.idx)
+    print("🔹 Step 1: Reading index file")
+    node_ids = parse_idx_file(args.idx)
 
-    print("🔹 Loading node sequences from GFA...")
-    node_sequences = load_node_sequences(args.gfa)
+    print("🔹 Step 2: Loading node sequences from GFA")
+    node_sequences = load_node_sequences_from_gfa(args.gfa, node_ids)
 
-    print("🔹 Normalizing segments to + strand in parallel...")
-    normalized = normalize_all_segments(segments_by_node, node_sequences, workers=args.workers)
+    print("🔹 Step 3: Detecting variants and piling up")
+    tasks = []
+    for node_id in node_ids:
+        if node_id in node_sequences:
+            tasks.append((node_id, node_sequences[node_id], args.dat))
 
-    for node_id, segs in normalized.items():
-        print(f"\nNode {node_id} — {len(segs)} reads")
-        for seg in segs[:3]:  # preview only 3 per node
-            print(f"  Offset: {seg['offset']}  Strand: {seg['strand']}  Seq: {seg['seq'][:30]}...")
+    final_pileup = {}
+    with ProcessPoolExecutor(max_workers=args.workers) as executor:
+        for node_id, pileups in executor.map(process_node, tasks):
+            final_pileup[node_id] = pileups
+            print(f"Node {node_id} has {len(pileups)} variant sites")
+
+    print(f"🔹 Step 4: Writing output to {args.output}")
+    with open(args.output, "w") as out:
+        json.dump(final_pileup, out, indent=2)
+
 
 if __name__ == "__main__":
     main()
