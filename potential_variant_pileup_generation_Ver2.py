@@ -59,11 +59,10 @@ def decode_cigar(cigar_string):
     import re
     return re.findall(r'(\d+)([MXDI])', cigar_string)
 
-# ─────────────────────────────────────────────────────────────────────────────
-def detect_variants_from_cigar(offset, cigar):
+def detect_variants_from_cigar(offset, cigar_string):
     variants = []
     pos = offset
-    for length_str, op in decode_cigar(cigar):
+    for length_str, op in decode_cigar(cigar_string):
         length = int(length_str)
         if op in ('X', 'I', 'D'):
             for _ in range(length):
@@ -81,16 +80,16 @@ def detect_variants_from_cigar(offset, cigar):
 
 # ─────────────────────────────────────────────────────────────────────────────
 def process_node(node_id, offset, n_records):
-    """Extract reads for node_id and build variant-centered pileups (filtering low MAPQ)."""
+    """Extract reads for node_id and build variant-centered pileups (MAPQ>=10 filter)."""
     sequence = GLOBAL_NODE_SEQS[node_id]
     node_len = len(sequence)
-    reads_by_variant = defaultdict(list)
+    # Phase 1: read and filter segments by mapping quality
+    segments = []
     ptr = offset + 10  # skip block header
     for _ in range(n_records):
         data = GLOBAL_DAT[ptr:ptr + RECORD_SIZE]
         ptr += RECORD_SIZE
         off, raw_seq, raw_bq, raw_cigar, mapq, strand = RECORD_STRUCT.unpack(data)
-        # filter out low mapping quality
         if mapq < 10:
             continue
         seq = raw_seq.rstrip(b'\x00').decode('ascii', errors='ignore')
@@ -100,9 +99,14 @@ def process_node(node_id, offset, n_records):
         if strand_char == '-':
             off = node_len - off - read_len
             seq = seq.translate(str.maketrans('ACGTacgtNn','TGCAtgcaNn'))[::-1]
+        segments.append((off, seq, cigar))
+    # Phase 2: detect variants and group reads
+    reads_by_variant = defaultdict(list)
+    for off, seq, cigar in segments:
         for vpos, vtype in detect_variants_from_cigar(off, cigar):
             if 0 <= vpos < node_len:
                 reads_by_variant[(vpos, vtype)].append((off, seq))
+    # Build pileup matrices
     pileups = {}
     window = 60
     half = window // 2
@@ -150,7 +154,7 @@ def main():
             json.dump({str(k): v for k, v in GLOBAL_NODE_SEQS.items()}, cf)
         print(f"✔ Saved node-sequence cache to {args.save_cache}")
 
-    # memory-map .dat
+    print("🔹 Memory-mapping .dat file")
     dat_file = open(args.dat, 'rb')
     GLOBAL_DAT = mmap.mmap(dat_file.fileno(), 0, access=mmap.ACCESS_READ)
 
