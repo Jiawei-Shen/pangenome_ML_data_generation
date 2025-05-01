@@ -181,7 +181,7 @@ def main():
                 results[nid] = pileup
             except Exception as e:
                 print(f"❌ Error on node {nid}: {e}")
-            if processed % 100_000 == 0 or processed == total:
+            if processed % 1== 0 or processed == total:
                 print(f"✔ {processed}/{total} done — elapsed {time.time()-start_time:.2f}s")
     # Step 4: write output
     print("🔹 Writing JSON output")
