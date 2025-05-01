@@ -356,7 +356,7 @@ def main():
     parser.add_argument("--gfa", help="GFA graph file path (needed if node sequence cache is not used/built)")
     parser.add_argument("--load-cache", help="Load node sequences from this JSON cache file")
     parser.add_argument("--save-cache", help="Save node sequences to this JSON cache file (used if --gfa is provided)")
-    parser.add_argument("-w", "--workers", type=int, default=os.cpu_count(),
+    parser.add_argument("-w", "--workers", type=int, default=8,
                         help="Number of worker processes to use")
     parser.add_argument("-c", "--chunksize", type=int, default=50,
                         help="Number of nodes processed by a worker before returning results (approx)")
