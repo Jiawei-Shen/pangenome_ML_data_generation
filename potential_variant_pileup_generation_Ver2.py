@@ -152,7 +152,7 @@ def main():
 
     # load or build node_sequences
     if args.load_cache and os.path.isfile(args.load_cache):
-        print(f"✔ Loading node sequences from cache: {args.load_cache}")
+        print(f"✔ Step 2: Loading node sequences from cache: {args.load_cache}")
         cached = json.load(open(args.load_cache))
         node_sequences = {int(k): v for k, v in cached.items()}
         print(f"✔ Loaded {len(node_sequences)} sequences from cache.")
