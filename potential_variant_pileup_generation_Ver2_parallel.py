@@ -180,6 +180,7 @@ def main():
             except Exception as e:
                 print(f"⚠ Error processing node {nid}: {e}", file=sys.stderr)
             completed += 1
+            print(completed)
             if completed % 1000 == 0 or completed == total:
                 elapsed = time.time() - start
                 print(f"✔ {completed}/{total} nodes processed — elapsed {elapsed:.2f}s")
