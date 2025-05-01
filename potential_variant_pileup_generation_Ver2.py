@@ -167,7 +167,7 @@ def main():
             continue
         _, pileup = process_node(nid, off, nrec)
         results[nid] = pileup
-        print(count, nid, nrec, GLOBAL_NODE_SEQS[nid], '\n')
+        # print(count, nid, nrec, GLOBAL_NODE_SEQS[nid], '\n')
         if count % 1000 == 0 or count == total:
             elapsed = time.time() - start
             print(f"✔ {count}/{total} nodes processed — elapsed {elapsed:.2f}s")
