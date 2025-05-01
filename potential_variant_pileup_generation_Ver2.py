@@ -119,6 +119,7 @@ def process_node(node_id, offset, n_records):
 
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
+    global GLOBAL_NODE_SEQS, GLOBAL_DAT
     parser = argparse.ArgumentParser(description="Single-threaded variant-centered pileup")
     parser.add_argument("dat", help=".dat file path")
     parser.add_argument("idx", help=".idx file path")
@@ -162,7 +163,7 @@ def main():
             continue
         _, pileup = process_node(nid, off, nrec)
         results[nid] = pileup
-        print(count, nid, nrec, len(GLOBAL_NODE_SEQS[nid]), '\n')
+        print(count, nid, nrec, GLOBAL_NODE_SEQS[nid], '\n')
         if count % 1000 == 0 or count == total:
             elapsed = time.time() - start
             print(f"✔ {count}/{total} nodes processed — elapsed {elapsed:.2f}s")
