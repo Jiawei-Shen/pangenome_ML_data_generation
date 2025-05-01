@@ -60,15 +60,15 @@ def decode_cigar(cigar_string):
     return re.findall(r'(\d+)([MXDI])', cigar_string)
 
 # ─────────────────────────────────────────────────────────────────────────────
-def detect_variants_from_cigar(offset, cigar_string):
+def detect_variants_from_cigar(offset, cigar):
     variants = []
     pos = offset
-    for length_str, op in decode_cigar(cigar_string):
+    for length_str, op in decode_cigar(cigar):
         length = int(length_str)
-        if op in ('X','I','D'):
+        if op in ('X', 'I', 'D'):
             for _ in range(length):
                 if op == 'I':
-                    variants.append((pos-1, 'I'))
+                    variants.append((pos - 1, 'I'))
                 elif op == 'D':
                     variants.append((pos, 'D'))
                     pos += 1
@@ -81,22 +81,24 @@ def detect_variants_from_cigar(offset, cigar_string):
 
 # ─────────────────────────────────────────────────────────────────────────────
 def process_node(node_id, offset, n_records):
-    """Extract reads for node_id and build variant-centered pileups."""
+    """Extract reads for node_id and build variant-centered pileups (filtering low MAPQ)."""
     sequence = GLOBAL_NODE_SEQS[node_id]
     node_len = len(sequence)
     reads_by_variant = defaultdict(list)
-    # skip block header of 10 bytes
-    ptr = offset + 10
+    ptr = offset + 10  # skip block header
     for _ in range(n_records):
-        data = GLOBAL_DAT[ptr: ptr + RECORD_SIZE]
+        data = GLOBAL_DAT[ptr:ptr + RECORD_SIZE]
         ptr += RECORD_SIZE
-        off, raw_seq, raw_bq, raw_cigar, rq, strand = RECORD_STRUCT.unpack(data)
+        off, raw_seq, raw_bq, raw_cigar, mapq, strand = RECORD_STRUCT.unpack(data)
+        # filter out low mapping quality
+        if mapq < 10:
+            continue
         seq = raw_seq.rstrip(b'\x00').decode('ascii', errors='ignore')
         cigar = raw_cigar.rstrip(b'\x00').decode('ascii', errors='ignore')
         strand_char = strand.decode()
-        length = len(seq)
+        read_len = len(seq)
         if strand_char == '-':
-            off = node_len - off - length
+            off = node_len - off - read_len
             seq = seq.translate(str.maketrans('ACGTacgtNn','TGCAtgcaNn'))[::-1]
         for vpos, vtype in detect_variants_from_cigar(off, cigar):
             if 0 <= vpos < node_len:
@@ -126,7 +128,6 @@ def main():
     parser.add_argument("--save-cache", help="Where to write node-sequence cache")
     args = parser.parse_args()
 
-    # Validate
     if not args.load_cache and not args.gfa:
         sys.exit("❌ Provide --gfa or --load-cache.")
     if not args.load_cache and not args.save_cache:
@@ -135,42 +136,37 @@ def main():
     print("🔹 Parsing index file")
     node_index = parse_idx_file(args.idx)
 
-    # Load or build cache
     cache_path = args.load_cache or args.save_cache
     if args.load_cache and os.path.isfile(cache_path):
         print(f"✔ Loading node sequences from {cache_path}")
         with open(cache_path) as cf:
             data = json.load(cf)
-        node_sequences = {int(k): v for k, v in data.items()}
+        GLOBAL_NODE_SEQS = {int(k): v for k, v in data.items()}
     else:
         print("🔹 Building node sequences from GFA")
-        node_sequences = load_node_sequences_from_gfa(args.gfa, node_index.keys())
+        GLOBAL_NODE_SEQS = load_node_sequences_from_gfa(args.gfa, node_index.keys())
         with open(args.save_cache, 'w') as cf:
-            json.dump({str(k): v for k, v in node_sequences.items()}, cf)
-        print(f"✔ Saved node-sequence cache to {args.save-cache}")
+            json.dump({str(k): v for k, v in GLOBAL_NODE_SEQS.items()}, cf)
+        print(f"✔ Saved node-sequence cache to {args.save_cache}")
 
-    # Initialize memory-mapped .dat and sequences
-    global GLOBAL_DAT, GLOBAL_NODE_SEQS
-    GLOBAL_NODE_SEQS = node_sequences
+    # memory-map .dat
     dat_file = open(args.dat, 'rb')
     GLOBAL_DAT = mmap.mmap(dat_file.fileno(), 0, access=mmap.ACCESS_READ)
 
-    # Single-threaded processing
-    print("🔹 Processing nodes in single-thread mode")
+    print("🔹 Processing nodes (single-threaded)")
     results = {}
     start = time.time()
     total = len(node_index)
-    for count, (node_id, (offset, nrec)) in enumerate(node_index.items(), start=1):
-        if node_id not in node_sequences:
+    for count, (nid, (off, nrec)) in enumerate(node_index.items(), start=1):
+        if nid not in GLOBAL_NODE_SEQS:
             continue
-        print(count, node_id, offset, nrec, "\n")
-        _, pileup = process_node(node_id, offset, nrec)
-        results[node_id] = pileup
+        _, pileup = process_node(nid, off, nrec)
+        results[nid] = pileup
+        print(count, nid, nrec, len(GLOBAL_NODE_SEQS[nid]), '\n')
         if count % 1000 == 0 or count == total:
             elapsed = time.time() - start
             print(f"✔ {count}/{total} nodes processed — elapsed {elapsed:.2f}s")
 
-    # Write output
     print("🔹 Writing JSON output")
     with open(args.output, 'w') as out_f:
         json.dump(results, out_f, indent=2)
