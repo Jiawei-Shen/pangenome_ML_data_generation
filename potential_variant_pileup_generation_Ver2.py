@@ -12,10 +12,12 @@ RECORD_SIZE = RECORD_STRUCT.size
 BASE_TO_INDEX = {'A': 0, 'C': 1, 'G': 2, 'T': 3, 'N': 4}
 INDEX_TO_BASE = ['A', 'C', 'G', 'T', 'N']
 
+# ─────────────────────────────────────────────────────────────────────────────
 def reverse_complement(seq):
     complement = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")
     return seq.translate(complement)[::-1]
 
+# ─────────────────────────────────────────────────────────────────────────────
 def parse_idx_file(idx_path):
     node_ids = set()
     with open(idx_path, "rb") as f:
@@ -23,8 +25,10 @@ def parse_idx_file(idx_path):
         for _ in range(num_nodes):
             node_id, _, _, _, _ = struct.unpack("<I Q I I H", f.read(22))
             node_ids.add(node_id)
+    print(f"✔ Loaded {len(node_ids)} node IDs from index file.")
     return node_ids
 
+# ─────────────────────────────────────────────────────────────────────────────
 def load_node_sequences_from_gfa(gfa_path, target_node_ids):
     node_sequences = {}
     with open(gfa_path, "r") as f:
@@ -38,12 +42,15 @@ def load_node_sequences_from_gfa(gfa_path, target_node_ids):
                             node_sequences[node_id] = fields[2]
                     except ValueError:
                         continue
+    print(f"✔ Loaded sequences for {len(node_sequences)} nodes from GFA.")
     return node_sequences
 
+# ─────────────────────────────────────────────────────────────────────────────
 def decode_cigar(cigar_str):
     import re
     return re.findall(r'(\d+)([MXDI])', cigar_str)
 
+# ─────────────────────────────────────────────────────────────────────────────
 def detect_variants_from_cigar(offset, cigar_str):
     variants = []
     ref_pos = offset
@@ -63,8 +70,10 @@ def detect_variants_from_cigar(offset, cigar_str):
             ref_pos += length
     return variants
 
+# ─────────────────────────────────────────────────────────────────────────────
 def process_node(args):
     node_id, node_sequence, dat_path = args
+    print(f"▶ Processing node {node_id} (length: {len(node_sequence)} bp)...")
     node_len = len(node_sequence)
     pileups = {}
 
@@ -83,7 +92,7 @@ def process_node(args):
                     break
                 this_node_id, _, n_records = struct.unpack("<I I H", header)
                 for _ in range(n_records):
-                    data = f.read(RECORD_SIZE)
+                    data = f.read(RECORD_STRUCT.size)
                     offset_val, seq_raw, bq_raw, cigar_raw, rq, strand = RECORD_STRUCT.unpack(data)
                     if this_node_id != node_id:
                         continue
@@ -105,12 +114,11 @@ def process_node(args):
             except Exception:
                 break
 
-    # Convert to 2D numpy pileup for each variant
     for (vpos, vtype), reads in reads_by_variant.items():
         center = vpos
         window_size = 60
         half = window_size // 2
-        pileup = np.full((len(reads), window_size), 4, dtype=np.uint8)  # default to 'N'
+        pileup = np.full((len(reads), window_size), 4, dtype=np.uint8)
         for i, (offset, seq) in enumerate(reads):
             start_in_read = center - offset - half
             for j in range(window_size):
@@ -120,8 +128,10 @@ def process_node(args):
                     pileup[i, j] = BASE_TO_INDEX.get(base, 4)
         pileups[f"{vpos}_{vtype}"] = pileup.tolist()
 
+    print(f"✔ Node {node_id}: {len(pileups)} variant sites processed.")
     return node_id, pileups
 
+# ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="Pileup .dat/.idx reads centered on variants using GFA sequences")
     parser.add_argument("dat", help="Path to .dat file")
@@ -147,12 +157,11 @@ def main():
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
         for node_id, pileups in executor.map(process_node, tasks):
             final_pileup[node_id] = pileups
-            print(f"Node {node_id} has {len(pileups)} variant sites")
 
     print(f"🔹 Step 4: Writing output to {args.output}")
     with open(args.output, "w") as out:
         json.dump(final_pileup, out, indent=2)
-
+    print("✅ Finished writing JSON output.")
 
 if __name__ == "__main__":
     main()
