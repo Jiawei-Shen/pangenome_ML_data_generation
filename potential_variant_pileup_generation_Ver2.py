@@ -4,6 +4,7 @@ import struct
 import json
 import os
 import sys
+import time
 import numpy as np
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
@@ -79,7 +80,7 @@ def process_node(task_info):
         file.read(10)  # skip block header
 
         for _ in range(n_records):
-            data = file.read(RECORD_SIZE)
+            data = file.read(RECORD_STRUCT.size)
             offset, seq_raw, bq_raw, cigar_raw, read_quality, strand = RECORD_STRUCT.unpack(data)
             sequence = seq_raw.rstrip(b'\x00').decode('ascii', errors='ignore')
             cigar_string = cigar_raw.rstrip(b'\x00').decode('ascii', errors='ignore')
@@ -143,11 +144,13 @@ def main():
 
     print("🔹 Step 3: Pileup with multiprocessing")
     task_list = []
+    overall_start_time = time.time()
     for task_index, (node_id, (offset, record_count)) in enumerate(node_index.items()):
         if node_id in node_sequences:
             task_list.append((node_id, node_sequences[node_id], args.dat, offset, record_count))
-            if task_index % 100_000 == 0 and task_index > 0:
-                print(f"▶ {task_index} nodes queued for processing...")
+            if task_index > 0 and task_index % 100_000 == 0:
+                total_elapsed = time.time() - overall_start_time
+                print(f"✔ {task_index} nodes prepared — total time: {total_elapsed:.2f} sec")
 
     final_output = {}
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
