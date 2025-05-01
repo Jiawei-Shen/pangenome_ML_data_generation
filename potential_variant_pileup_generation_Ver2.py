@@ -153,22 +153,25 @@ def main():
     start_time = time.time()
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
         futures = [executor.submit(process_node, task) for task in task_list]
-        for i, future in enumerate(as_completed(futures), 1):
+        processed_count = 0
+        for future in as_completed(futures):
+            processed_count += 1
             try:
                 node_id, pileup = future.result()
                 final_output[node_id] = pileup
-                print(i)
+                print(processed_count)
             except Exception as e:
-                print(f"❌ Error in task {i}: {e}")
-            if i % 1_000 == 0:
+                print(f"❌ Error in task {processed_count}: {e}")
+            if processed_count % 1_000 == 0:
                 elapsed = time.time() - start_time
-                print(f"✔ Processed {i} nodes — total time: {elapsed:.2f} sec")
+                print(f"✔ Processed {processed_count} nodes — total time: {elapsed:.2f} sec")
 
     print("🔹 Step 4: Write JSON output")
     with open(args.output, "w") as out_file:
         json.dump(final_output, out_file, indent=2)
 
     print("✅ Done. Output written to", args.output)
+
 
 if __name__ == "__main__":
     main()
