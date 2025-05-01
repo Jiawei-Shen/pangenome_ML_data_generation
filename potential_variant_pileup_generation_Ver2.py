@@ -5,175 +5,192 @@ import json
 import os
 import sys
 import time
+import mmap
 import numpy as np
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Global variables initialized once per worker
+GLOBAL_DAT = None            # memory-mapped .dat file
+GLOBAL_NODE_SEQS = None      # dict of node_id → sequence
 RECORD_STRUCT = struct.Struct("<h150s150s20shc")
 RECORD_SIZE = RECORD_STRUCT.size
 BASE_TO_INDEX = {'A': 0, 'C': 1, 'G': 2, 'T': 3, 'N': 4}
 
-def reverse_complement(sequence):
-    complement_map = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")
-    return sequence.translate(complement_map)[::-1]
+# ─────────────────────────────────────────────────────────────────────────────
+def _init_worker(cache_path, dat_path):
+    """
+    Worker initializer: load node sequences into GLOBAL_NODE_SEQS and memory-map the .dat file.
+    """
+    global GLOBAL_DAT, GLOBAL_NODE_SEQS
+    # Load node sequences from JSON cache
+    with open(cache_path, 'r') as cf:
+        seq_cache = json.load(cf)
+    GLOBAL_NODE_SEQS = {int(k): v for k, v in seq_cache.items()}
+    # Memory-map the .dat file for fast random access
+    dat_fh = open(dat_path, 'rb')
+    GLOBAL_DAT = mmap.mmap(dat_fh.fileno(), 0, access=mmap.ACCESS_READ)
 
+# ─────────────────────────────────────────────────────────────────────────────
 def parse_idx_file(idx_path):
+    """
+    Parse .idx and return dict of node_id → (offset, n_records).
+    """
     node_index = {}
-    with open(idx_path, "rb") as file:
-        num_nodes = struct.unpack("<I", file.read(4))[0]
+    with open(idx_path, 'rb') as f:
+        num_nodes = struct.unpack('<I', f.read(4))[0]
         for _ in range(num_nodes):
-            node_id, offset, block_size, n_records, _ = struct.unpack("<I Q I I H", file.read(22))
+            node_id, offset, block_size, n_records, _ = struct.unpack('<I Q I I H', f.read(22))
             node_index[node_id] = (offset, n_records)
     print(f"✔ Parsed {len(node_index)} nodes from index file.")
     return node_index
 
+# ─────────────────────────────────────────────────────────────────────────────
 def load_node_sequences_from_gfa(gfa_path, target_node_ids):
+    """
+    Parse GFA and extract sequences for target_node_ids.
+    """
     node_sequences = {}
     line_count = 0
-    with open(gfa_path, "r") as file:
-        for line in file:
+    with open(gfa_path, 'r') as f:
+        for line in f:
             line_count += 1
             if line_count % 10_000_000 == 0:
-                print(f"✔ Checked {line_count} lines in GFA")
-            if not line.startswith("S\t"):
+                print(f"✔ Checked {line_count} lines in GFA file")
+            if not line.startswith('S\t'):
                 continue
-            parts = line.split("\t", 2)
+            parts = line.split('\t', 2)
             try:
-                node_id = int(parts[1])
+                nid = int(parts[1])
             except:
                 continue
-            if node_id in target_node_ids:
-                node_sequences[node_id] = parts[2].rstrip("\n")
+            if nid in target_node_ids:
+                node_sequences[nid] = parts[2].rstrip('\n')
     print(f"✔ Loaded {len(node_sequences)} sequences from GFA.")
     return node_sequences
 
+# ─────────────────────────────────────────────────────────────────────────────
 def decode_cigar(cigar_string):
     import re
     return re.findall(r'(\d+)([MXDI])', cigar_string)
 
 def detect_variants_from_cigar(offset, cigar_string):
     variants = []
-    position = offset
+    pos = offset
     for length_str, op in decode_cigar(cigar_string):
         length = int(length_str)
-        if op in ("X", "I", "D"):
+        if op in ('X','I','D'):
             for _ in range(length):
-                if op == "I":
-                    variants.append((position - 1, "I"))
-                elif op == "D":
-                    variants.append((position, "D"))
-                    position += 1
+                if op == 'I':
+                    variants.append((pos-1, 'I'))
+                elif op == 'D':
+                    variants.append((pos, 'D'))
+                    pos += 1
                 else:
-                    variants.append((position, "X"))
-                    position += 1
+                    variants.append((pos, 'X'))
+                    pos += 1
         else:
-            position += length
+            pos += length
     return variants
 
-def process_node(task_info):
-    node_id, node_sequence, dat_path, dat_offset, n_records = task_info
-    node_length = len(node_sequence)
+# ─────────────────────────────────────────────────────────────────────────────
+def process_node(node_id, offset, n_records):
+    """
+    Worker function: extract records for node_id at given offset, build variant-centered pileups.
+    """
+    sequence = GLOBAL_NODE_SEQS[node_id]
+    node_len = len(sequence)
     reads_by_variant = defaultdict(list)
-
-    with open(dat_path, "rb") as file:
-        file.seek(dat_offset)
-        file.read(10)  # skip block header
-
-        for _ in range(n_records):
-            data = file.read(RECORD_STRUCT.size)
-            offset, seq_raw, bq_raw, cigar_raw, read_quality, strand = RECORD_STRUCT.unpack(data)
-            sequence = seq_raw.rstrip(b'\x00').decode('ascii', errors='ignore')
-            cigar_string = cigar_raw.rstrip(b'\x00').decode('ascii', errors='ignore')
-            strand = strand.decode()
-            read_length = len(sequence)
-
-            if strand == '-':
-                offset = node_length - offset - read_length
-                sequence = reverse_complement(sequence)
-
-            for variant_position, variant_type in detect_variants_from_cigar(offset, cigar_string):
-                if 0 <= variant_position < node_length:
-                    reads_by_variant[(variant_position, variant_type)].append((offset, sequence))
-
+    # Block header is 10 bytes; records start at offset + 10
+    base = offset + 10
+    for _ in range(n_records):
+        data = GLOBAL_DAT[base: base + RECORD_SIZE]
+        base += RECORD_SIZE
+        off, seq_raw, bq_raw, cigar_raw, rq, strand = RECORD_STRUCT.unpack(data)
+        seq = seq_raw.rstrip(b'\x00').decode('ascii', 'ignore')
+        cigar = cigar_raw.rstrip(b'\x00').decode('ascii', 'ignore')
+        strand_char = strand.decode()
+        read_len = len(seq)
+        # Normalize to + strand
+        if strand_char == '-':
+            off = node_len - off - read_len
+            seq = seq.translate(str.maketrans('ACGTacgtNn','TGCAtgcaNn'))[::-1]
+        for vpos, vtype in detect_variants_from_cigar(off, cigar):
+            if 0 <= vpos < node_len:
+                reads_by_variant[(vpos, vtype)].append((off, seq))
+    # Build pileup matrices
     pileups = {}
-    window_size = 60
-    half_window = window_size // 2
-    for (variant_position, variant_type), reads in reads_by_variant.items():
-        pileup_array = np.full((len(reads), window_size), 4, dtype=np.uint8)
-        for row_index, (read_offset, sequence) in enumerate(reads):
-            relative_start = variant_position - read_offset - half_window
-            for column_index in range(window_size):
-                seq_index = relative_start + column_index
-                if 0 <= seq_index < len(sequence):
-                    pileup_array[row_index, column_index] = BASE_TO_INDEX.get(sequence[seq_index].upper(), 4)
-        pileups[f"{variant_position}_{variant_type}"] = pileup_array.tolist()
-
-    print(f"Done processing Node: {node_id}")
+    window = 60
+    half = window // 2
+    for (vpos, vtype), reads in reads_by_variant.items():
+        mat = np.full((len(reads), window), 4, dtype=np.uint8)
+        for i, (roff, rseq) in enumerate(reads):
+            start = vpos - roff - half
+            for j in range(window):
+                idx = start + j
+                if 0 <= idx < len(rseq):
+                    mat[i, j] = BASE_TO_INDEX.get(rseq[idx].upper(), 4)
+        pileups[f"{vpos}_{vtype}"] = mat.tolist()
     return node_id, pileups
 
-
+# ─────────────────────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="Variant-centered pileup from .dat/.idx + GFA")
-    parser.add_argument("dat")
-    parser.add_argument("idx")
-    parser.add_argument("output", help="JSON output path")
-    parser.add_argument("--gfa", help="GFA path (required if no --load-cache)")
-    parser.add_argument("--load-cache", help="JSON cache of node sequences")
-    parser.add_argument("--save-cache", help="Where to write sequence cache")
-    parser.add_argument("--workers", type=int, default=8)
-    args = parser.parse_args()
-
-    if not args.load_cache and not args.gfa:
-        sys.exit("❌ Error: --gfa required if --load-cache is not provided.")
-    if args.save_cache and not args.gfa:
-        sys.exit("❌ Error: --save-cache requires --gfa.")
-
-    print("🔹 Step 1: Parse .idx")
+    p = argparse.ArgumentParser(description="Efficient variant-centered pileup (.dat/.idx + GFA)")
+    p.add_argument("dat", help=".dat file path")
+    p.add_argument("idx", help=".idx file path")
+    p.add_argument("output", help="JSON output path")
+    p.add_argument("--gfa", help="GFA path (required if no --load-cache)")
+    p.add_argument("--load-cache", help="JSON cache of node sequences")
+    p.add_argument("--save-cache", help="Path to write node-sequence cache")
+    p.add_argument("--workers", type=int, default=8, help="Number of processes")
+    args = p.parse_args()
+    # Validate cache/GFA
+    if not args.load_cache:
+        if not args.gfa or not args.save_cache:
+            sys.exit("❌ Must provide --gfa and --save-cache when no --load-cache")
+    # Parse index
+    print("🔹 Parsing .idx file")
     node_index = parse_idx_file(args.idx)
-
+    # Load or build node-sequence cache
+    cache_path = args.load_cache or args.save_cache
     if args.load_cache and os.path.isfile(args.load_cache):
-        print(f"✔ Loading node sequences from cache: {args.load_cache}")
-        with open(args.load_cache) as file:
-            cached = json.load(file)
-            node_sequences = {int(k): v for k, v in cached.items()}
+        print(f"✔ Loading sequence cache from {args.load_cache}")
     else:
-        print("🔹 Step 2: Parse GFA file")
-        node_sequences = load_node_sequences_from_gfa(args.gfa, node_index.keys())
-        if args.save_cache:
-            print(f"✔ Saving cache to: {args.save_cache}")
-            with open(args.save_cache, "w") as cache_file:
-                json.dump({str(k): v for k, v in node_sequences.items()}, cache_file)
-
-    print("🔹 Step 3: Pileup with multiprocessing")
-    task_list = [
-        (node_id, node_sequences[node_id], args.dat, offset, record_count)
-        for node_id, (offset, record_count) in node_index.items()
-        if node_id in node_sequences
-    ]
-
-    final_output = {}
+        print("🔹 Building sequence cache from GFA")
+        seqs = load_node_sequences_from_gfa(args.gfa, node_index.keys())
+        with open(args.save_cache, 'w') as cf:
+            json.dump({str(k): v for k, v in seqs.items()}, cf)
+        print(f"✔ Saved sequence cache to {args.save_cache}")
+    # Prepare task lists
+    node_ids = []
+    offsets = []
+    counts = []
+    for nid, (off, nrec) in node_index.items():
+        node_ids.append(nid)
+        offsets.append(off)
+        counts.append(nrec)
+    # Launch pool with initializer for mmap and seq load
+    print("🔹 Starting multiprocessing pileup")
     start_time = time.time()
-    with ProcessPoolExecutor(max_workers=args.workers) as executor:
-        futures = [executor.submit(process_node, task) for task in task_list]
-        processed_count = 0
-        for future in as_completed(futures):
-            processed_count += 1
-            try:
-                node_id, pileup = future.result()
-                final_output[node_id] = pileup
-                print(processed_count)
-            except Exception as e:
-                print(f"❌ Error in task {processed_count}: {e}")
-            if processed_count % 1_000 == 0:
+    results = {}
+    with ProcessPoolExecutor(
+        max_workers=args.workers,
+        initializer=_init_worker,
+        initargs=(cache_path, args.dat)
+    ) as executor:
+        for idx, (node_id, pileup) in enumerate(
+            executor.map(process_node, node_ids, offsets, counts, chunksize=100), start=1
+        ):
+            results[node_id] = pileup
+            if idx % 1_000 == 0:
                 elapsed = time.time() - start_time
-                print(f"✔ Processed {processed_count} nodes — total time: {elapsed:.2f} sec")
+                print(f"✔ Completed {idx} nodes — elapsed: {elapsed:.2f}s")
+    # Write final output
+    print("🔹 Writing JSON output")
+    with open(args.output, 'w') as out_f:
+        json.dump(results, out_f, indent=2)
+    print("✅ Done. Output:", args.output)
 
-    print("🔹 Step 4: Write JSON output")
-    with open(args.output, "w") as out_file:
-        json.dump(final_output, out_file, indent=2)
-
-    print("✅ Done. Output written to", args.output)
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
