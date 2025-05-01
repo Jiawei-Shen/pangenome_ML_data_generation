@@ -88,6 +88,10 @@ def process_group_serialized(args):
         alignment = vg_pb2.Alignment()
         alignment.ParseFromString(msg_bytes)
 
+        # Skip low mapping quality reads
+        if alignment.mapping_quality <= 10:
+            continue
+
         if chrom_name and not is_on_chromosome(alignment, chrom_name):
             continue
 

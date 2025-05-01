@@ -97,8 +97,12 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
     alignment = vg_pb2.Alignment()
     alignment.ParseFromString(raw_message)
 
+    # Filter out low mapping quality
+    if alignment.mapping_quality <= 10:
+        return segment_dict
+
     if chrom_filter and not any(pos.name == chrom_filter for pos in alignment.refpos):
-        return segment_dict, 0
+        return segment_dict
 
     read_sequence = alignment.sequence
     read_quality = alignment.quality
