@@ -154,7 +154,7 @@ def main():
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
         for i, (node_id, pileup) in enumerate(executor.map(process_node, task_list), 1):
             final_output[node_id] = pileup
-            if i % 1_000 == 0:
+            if i % 10 == 0:
                 elapsed = time.time() - start_time
                 print(f"✔ Processed {i} nodes — total time: {elapsed:.2f} sec")
 
