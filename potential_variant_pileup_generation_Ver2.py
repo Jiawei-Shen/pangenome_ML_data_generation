@@ -95,6 +95,7 @@ def process_node(task_info):
                 if 0 <= variant_position < node_length:
                     reads_by_variant[(variant_position, variant_type)].append((offset, sequence))
 
+    print(f"start pileup Node: {node_id}")
     pileups = {}
     window_size = 60
     half_window = window_size // 2
