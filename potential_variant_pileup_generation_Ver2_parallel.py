@@ -495,7 +495,7 @@ def main():
 
                  processed_count += 1
                  # Print progress update periodically
-                 if processed_count % 1000 == 0 or processed_count == total_tasks:
+                 if processed_count % 10000 == 0 or processed_count == total_tasks:
                      elapsed = time.time() - start_proc_time
                      rate = processed_count / elapsed if elapsed > 0 else 0
                      print(f"✔ {processed_count}/{total_tasks} nodes processed ({rate:.1f} nodes/s) — Elapsed: {elapsed:.2f}s")
