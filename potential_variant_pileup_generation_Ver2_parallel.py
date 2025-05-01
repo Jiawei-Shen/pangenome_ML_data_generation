@@ -170,6 +170,7 @@ def main():
             for nid, (off, nrec) in node_index.items()
             if nid in seqs
         }
+        print(f"Scheduling {len(future_to_nid)} nodes for processing", flush=True)
 
         completed = 0
         for fut in as_completed(future_to_nid):
