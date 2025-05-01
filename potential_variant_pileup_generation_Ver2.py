@@ -31,17 +31,22 @@ def parse_idx_file(idx_path):
 # ─────────────────────────────────────────────────────────────────────────────
 def load_node_sequences_from_gfa(gfa_path, target_node_ids):
     node_sequences = {}
+    line_count = 0
     with open(gfa_path, "r") as f:
         for line in f:
-            if line.startswith("S"):
-                fields = line.strip().split('\t')
-                if len(fields) >= 3:
-                    try:
-                        node_id = int(fields[1])
-                        if node_id in target_node_ids:
-                            node_sequences[node_id] = fields[2]
-                    except ValueError:
-                        continue
+            line_count += 1
+            if line_count % 1000000 == 0:
+                print(f"✔ Checked {line_count} lines in GFA file")
+            if not line.startswith("S"):
+                continue
+            fields = line.strip().split('\t')
+            if len(fields) >= 3:
+                try:
+                    node_id = int(fields[1])
+                    if node_id in target_node_ids:
+                        node_sequences[node_id] = fields[2]
+                except ValueError:
+                    continue
     print(f"✔ Loaded sequences for {len(node_sequences)} nodes from GFA.")
     return node_sequences
 
@@ -92,7 +97,7 @@ def process_node(args):
                     break
                 this_node_id, _, n_records = struct.unpack("<I I H", header)
                 for _ in range(n_records):
-                    data = f.read(RECORD_STRUCT.size)
+                    data = f.read(RECORD_SIZE)
                     offset_val, seq_raw, bq_raw, cigar_raw, rq, strand = RECORD_STRUCT.unpack(data)
                     if this_node_id != node_id:
                         continue
@@ -114,6 +119,7 @@ def process_node(args):
             except Exception:
                 break
 
+    # Convert to 2D numpy pileup for each variant
     for (vpos, vtype), reads in reads_by_variant.items():
         center = vpos
         window_size = 60
@@ -138,6 +144,7 @@ def main():
     parser.add_argument("idx", help="Path to .idx file")
     parser.add_argument("gfa", help="Path to .gfa file")
     parser.add_argument("output", help="Path to output JSON file")
+    parser.add_argument("--cache", help="Optional path to write a JSON cache of node sequences")
     parser.add_argument("--workers", type=int, default=8, help="Number of parallel processes")
     args = parser.parse_args()
 
@@ -146,6 +153,13 @@ def main():
 
     print("🔹 Step 2: Loading node sequences from GFA")
     node_sequences = load_node_sequences_from_gfa(args.gfa, node_ids)
+
+    if args.cache:
+        cache_path = args.cache
+        print(f"✔ Caching node sequences to {cache_path}...")
+        with open(cache_path, "w") as cf:
+            json.dump({str(k): v for k, v in node_sequences.items()}, cf)
+        print("✔ Cache written.")
 
     print("🔹 Step 3: Detecting variants and piling up")
     tasks = []
