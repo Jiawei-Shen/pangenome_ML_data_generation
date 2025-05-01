@@ -136,7 +136,7 @@ def main():
     parser.add_argument("--gfa", help="GFA path if no cache")
     parser.add_argument("--load-cache", help="JSON file of node sequences")
     parser.add_argument("--save-cache", help="Write JSON cache here if building")
-    parser.add_argument("--workers", type=int, default=8, help="Number of processes")
+    parser.add_argument("--workers", type=int, default=1, help="Number of processes")
     args = parser.parse_args()
     # Ensure cache/GFA
     if not args.load_cache:
