@@ -108,7 +108,6 @@ def process_node(task_info):
                     pileup_array[row_index, column_index] = BASE_TO_INDEX.get(sequence[seq_index].upper(), 4)
         pileups[f"{variant_position}_{variant_type}"] = pileup_array.tolist()
 
-    print(f"Node: {node_id}, {pileups}")
     return node_id, pileups
 
 def main():
