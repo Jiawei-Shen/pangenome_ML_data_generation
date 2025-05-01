@@ -7,7 +7,7 @@ import sys
 import time
 import numpy as np
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 RECORD_STRUCT = struct.Struct("<h150s150s20shc")
 RECORD_SIZE = RECORD_STRUCT.size
@@ -151,15 +151,18 @@ def main():
 
     final_output = {}
     start_time = time.time()
-    milestone = 1_000
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
-        for i, (node_id, pileup) in enumerate(executor.map(process_node, task_list), 1):
-            final_output[node_id] = pileup
-            print(i, '\n')
-            if i > milestone:
+        futures = [executor.submit(process_node, task) for task in task_list]
+        for i, future in enumerate(as_completed(futures), 1):
+            try:
+                node_id, pileup = future.result()
+                final_output[node_id] = pileup
+                print(i)
+            except Exception as e:
+                print(f"❌ Error in task {i}: {e}")
+            if i % 1_000 == 0:
                 elapsed = time.time() - start_time
                 print(f"✔ Processed {i} nodes — total time: {elapsed:.2f} sec")
-                milestone += milestone
 
     print("🔹 Step 4: Write JSON output")
     with open(args.output, "w") as out_file:
