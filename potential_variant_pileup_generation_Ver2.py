@@ -170,23 +170,42 @@ def main():
         node_ids.append(nid)
         offsets.append(off)
         counts.append(nrec)
-    # Launch pool with initializer for mmap and seq load
-    print("🔹 Starting multiprocessing pileup")
+    # ─────────────────────────────────────────────────────────────────────────────
+    print("🔹 Step 3: Pileup with multiprocessing")
     start_time = time.time()
+    total_nodes = len(node_index)
     results = {}
+    # Submit tasks and track futures
+    futures = {}
     with ProcessPoolExecutor(
         max_workers=args.workers,
         initializer=_init_worker,
         initargs=(cache_path, args.dat)
     ) as executor:
-        for idx, (node_id, pileup) in enumerate(
-            executor.map(process_node, node_ids, offsets, counts, chunksize=100), start=1
-        ):
-            results[node_id] = pileup
-            if idx % 1_000 == 0:
+        for node_id, (off, nrec) in node_index.items():
+            if node_id in GLOBAL_NODE_SEQS or os.path.isfile(cache_path):
+                future = executor.submit(process_node, node_id, off, nrec)
+                futures[future] = node_id
+        processed = 0
+        for future in as_completed(futures):
+            node_id = futures[future]
+            processed += 1
+            try:
+                _, pileup = future.result(timeout=600)
+                results[node_id] = pileup
+            except Exception as e:
+                print(f"❌ Error processing node {node_id}: {e}")
+            # Always print progress per node
+            print(f"Processed {processed}/{total_nodes} nodes (Node {node_id})")
+            if processed % 100_000 == 0:
                 elapsed = time.time() - start_time
-                print(f"✔ Completed {idx} nodes — elapsed: {elapsed:.2f}s")
+                print(f"✔ Completed {processed} nodes — elapsed: {elapsed:.2f}s")
+
     # Write final output
+    print("🔹 Step 4: Writing JSON output")
+    with open(args.output, 'w') as out_f:
+        json.dump(results, out_f, indent=2)
+    print("✅ Done. Output:", args.output)
     print("🔹 Writing JSON output")
     with open(args.output, 'w') as out_f:
         json.dump(results, out_f, indent=2)
