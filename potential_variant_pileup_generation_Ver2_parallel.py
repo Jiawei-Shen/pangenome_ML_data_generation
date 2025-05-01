@@ -7,50 +7,18 @@ import sys
 import time
 import numpy as np
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import re
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Globals for file access
-GLOBAL_DAT_FILE = None        # open file handle for .dat
-GLOBAL_NODE_SEQS = None       # dict of node_id → sequence
 RECORD_STRUCT = struct.Struct("<h150s150s20shc")
 RECORD_SIZE = RECORD_STRUCT.size
 BASE_TO_INDEX = {'A': 0, 'C': 1, 'G': 2, 'T': 3, 'N': 4}
 
 # ─────────────────────────────────────────────────────────────────────────────
 def reverse_complement(sequence):
-    complement_map = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")
-    return sequence.translate(complement_map)[::-1]
-
-def parse_idx_file(idx_path):
-    node_index = {}
-    with open(idx_path, 'rb') as f:
-        num_nodes = struct.unpack('<I', f.read(4))[0]
-        for _ in range(num_nodes):
-            node_id, offset, block_size, n_records, _ = struct.unpack('<I Q I I H', f.read(22))
-            node_index[node_id] = (offset, n_records)
-    print(f"✔ Parsed {len(node_index)} nodes from index file.")
-    return node_index
-
-def load_node_sequences_from_gfa(gfa_path, target_node_ids):
-    node_sequences = {}
-    with open(gfa_path, 'r') as f:
-        for line_counter, line in enumerate(f, start=1):
-            if line_counter % 10_000_000 == 0:
-                print(f"✔ Checked {line_counter} lines in GFA file")
-            if not line.startswith('S\t'):
-                continue
-            parts = line.split('\t', 2)
-            try:
-                nid = int(parts[1])
-            except ValueError:
-                continue
-            if nid in target_node_ids:
-                node_sequences[nid] = parts[2].rstrip('\n')
-    print(f"✔ Loaded {len(node_sequences)} sequences from GFA.")
-    return node_sequences
+    return sequence.translate(str.maketrans("ACGTacgtNn", "TGCAtgcaNn"))[::-1]
 
 def decode_cigar(cigar_string):
-    import re
     return re.findall(r'(\d+)([MXDI])', cigar_string)
 
 def detect_variants_from_cigar(offset, cigar_string):
@@ -72,98 +40,112 @@ def detect_variants_from_cigar(offset, cigar_string):
             pos += length
     return variants
 
-def process_node(node_id, offset, n_records):
-    sequence = GLOBAL_NODE_SEQS[node_id]
-    node_len = len(sequence)
-    segments = []
+# ─────────────────────────────────────────────────────────────────────────────
+def process_node_batch(node_batch, dat_path, node_seqs):
+    results = {}
+    with open(dat_path, 'rb') as dat_file:
+        for node_id, offset, n_records in node_batch:
+            if node_id not in node_seqs:
+                continue
+            sequence = node_seqs[node_id]
+            node_len = len(sequence)
+            segments = []
+            dat_file.seek(offset + 10)
+            for _ in range(n_records):
+                data = dat_file.read(RECORD_SIZE)
+                off, raw_seq, _, raw_cigar, mapq, strand = RECORD_STRUCT.unpack(data)
+                if mapq < 10:
+                    continue
+                seq = raw_seq.rstrip(b'\x00').decode('ascii', errors='ignore')
+                cigar = raw_cigar.rstrip(b'\x00').decode('ascii', errors='ignore')
+                strand_char = strand.decode()
+                if strand_char == '-':
+                    off = node_len - off - len(seq)
+                    seq = reverse_complement(seq)
+                segments.append((off, seq, cigar))
 
-    GLOBAL_DAT_FILE.seek(offset + 10)
-    for _ in range(n_records):
-        data = GLOBAL_DAT_FILE.read(RECORD_SIZE)
-        off, raw_seq, raw_bq, raw_cigar, mapq, strand = RECORD_STRUCT.unpack(data)
-        if mapq < 10:
-            continue
-        seq = raw_seq.rstrip(b'\x00').decode('ascii', errors='ignore')
-        cigar = raw_cigar.rstrip(b'\x00').decode('ascii', errors='ignore')
-        strand_char = strand.decode()
-        read_len = len(seq)
-        if strand_char == '-':
-            off = node_len - off - read_len
-            seq = reverse_complement(seq)
-        segments.append((off, seq, cigar))
+            reads_by_variant = defaultdict(list)
+            for off, seq, cigar in segments:
+                for vpos, vtype in detect_variants_from_cigar(off, cigar):
+                    if 0 <= vpos < node_len:
+                        reads_by_variant[(vpos, vtype)].append((off, seq))
 
-    reads_by_variant = defaultdict(list)
-    for off, seq, cigar in segments:
-        for vpos, vtype in detect_variants_from_cigar(off, cigar):
-            if 0 <= vpos < node_len:
-                reads_by_variant[(vpos, vtype)].append((off, seq))
+            pileups = {}
+            window, half = 60, 30
+            for (vpos, vtype), reads in reads_by_variant.items():
+                mat = np.full((len(reads), window), 4, dtype=np.uint8)
+                for i, (roff, rseq) in enumerate(reads):
+                    start = vpos - roff - half
+                    for j in range(window):
+                        idx = start + j
+                        if 0 <= idx < len(rseq):
+                            mat[i, j] = BASE_TO_INDEX.get(rseq[idx].upper(), 4)
+                pileups[f"{vpos}_{vtype}"] = mat.tolist()
 
-    pileups = {}
-    window = 60
-    half = window // 2
-    for (vpos, vtype), reads in reads_by_variant.items():
-        mat = np.full((len(reads), window), 4, dtype=np.uint8)
-        for i, (roff, rseq) in enumerate(reads):
-            start = vpos - roff - half
-            for j in range(window):
-                idx = start + j
-                if 0 <= idx < len(rseq):
-                    mat[i, j] = BASE_TO_INDEX.get(rseq[idx].upper(), 4)
-        pileups[f"{vpos}_{vtype}"] = mat.tolist()
-    return node_id, pileups
+            results[node_id] = pileups
+    return results
 
+# ─────────────────────────────────────────────────────────────────────────────
+def parse_idx_file(idx_path):
+    index = []
+    with open(idx_path, 'rb') as f:
+        num_nodes = struct.unpack('<I', f.read(4))[0]
+        for _ in range(num_nodes):
+            nid, offset, _, nrec, _ = struct.unpack('<I Q I I H', f.read(22))
+            index.append((nid, offset, nrec))
+    print(f"✔ Parsed {len(index)} nodes.")
+    return index
+
+def load_node_sequences(path):
+    with open(path) as f:
+        data = json.load(f)
+    return {int(k): v for k, v in data.items()}
+
+def chunk_list(lst, size):
+    for i in range(0, len(lst), size):
+        yield lst[i:i + size]
+
+# ─────────────────────────────────────────────────────────────────────────────
 def main():
-    global GLOBAL_NODE_SEQS, GLOBAL_DAT_FILE
-    parser = argparse.ArgumentParser(description="Single-threaded variant-centered pileup")
+    parser = argparse.ArgumentParser()
     parser.add_argument("dat", help=".dat file path")
     parser.add_argument("idx", help=".idx file path")
     parser.add_argument("output", help="JSON output path")
-    parser.add_argument("--gfa", help="GFA path if no cache")
-    parser.add_argument("--load-cache", help="JSON file of node sequences")
-    parser.add_argument("--save-cache", help="Where to write node-sequence cache")
+    parser.add_argument("--load-cache", required=True, help="JSON file of node sequences")
+    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--chunk-size", type=int, default=1000)
     args = parser.parse_args()
 
-    if not args.load_cache and not args.gfa:
-        sys.exit("❌ Provide --gfa or --load-cache.")
-    if not args.load_cache and not args.save_cache:
-        sys.exit("❌ Provide --save-cache when building from GFA.")
-
-    print("🔹 Parsing index file")
+    print("🔹 Loading index and sequences")
     node_index = parse_idx_file(args.idx)
+    node_seqs = load_node_sequences(args.load_cache)
 
-    cache_path = args.load_cache or args.save_cache
-    if args.load_cache and os.path.isfile(cache_path):
-        print(f"✔ Loading node sequences from {cache_path}")
-        with open(cache_path) as cf:
-            data = json.load(cf)
-        GLOBAL_NODE_SEQS = {int(k): v for k, v in data.items()}
-    else:
-        print("🔹 Building node sequences from GFA")
-        GLOBAL_NODE_SEQS = load_node_sequences_from_gfa(args.gfa, node_index.keys())
-        with open(args.save_cache, 'w') as cf:
-            json.dump({str(k): v for k, v in GLOBAL_NODE_SEQS.items()}, cf)
-        print(f"✔ Saved node-sequence cache to {args.save_cache}")
+    node_chunks = list(chunk_list(node_index, args.chunk_size))
+    total_chunks = len(node_chunks)
+    print(f"🔹 Dispatching {total_chunks} chunks using {args.workers} workers…")
 
-    print("🔹 Opening .dat file")
-    GLOBAL_DAT_FILE = open(args.dat, 'rb')
-
-    print("🔹 Processing nodes (single-threaded)")
-    results = {}
     start = time.time()
-    total = len(node_index)
-    for count, (nid, (off, nrec)) in enumerate(node_index.items(), start=1):
-        if nid not in GLOBAL_NODE_SEQS:
-            continue
-        _, pileup = process_node(nid, off, nrec)
-        results[nid] = pileup
-        if count % 1000 == 0 or count == total:
-            elapsed = time.time() - start
-            print(f"✔ {count}/{total} nodes processed — elapsed {elapsed:.2f}s")
+    with open(args.output, 'w') as outf:
+        outf.write("{\n")
+        first = True
+        with ProcessPoolExecutor(max_workers=args.workers) as executor:
+            futures = [
+                executor.submit(process_node_batch, chunk, args.dat, node_seqs)
+                for chunk in node_chunks
+            ]
+            for i, fut in enumerate(as_completed(futures), start=1):
+                batch_res = fut.result()
+                for nid, pileup in batch_res.items():
+                    if not first:
+                        outf.write(",\n")
+                    first = False
+                    json.dump(str(nid), outf)
+                    outf.write(": ")
+                    json.dump(pileup, outf)
+                print(f"✔ {i}/{total_chunks} chunks done ({i * args.chunk_size} nodes)", file=sys.stderr)
+        outf.write("\n}\n")
 
-    print("🔹 Writing JSON output")
-    with open(args.output, 'w') as out_f:
-        json.dump(results, out_f, indent=2)
-    print(f"✅ Done. Wrote output to {args.output}")
+    print(f"✅ Done. Elapsed time: {time.time() - start:.2f}s")
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
