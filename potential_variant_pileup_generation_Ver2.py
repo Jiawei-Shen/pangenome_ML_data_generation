@@ -152,7 +152,7 @@ def main():
 
     final_output = {}
     start_time = time.time()
-    milestone = 100_000
+    milestone = 1_000
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
         for i, (node_id, pileup) in enumerate(executor.map(process_node, task_list), 1):
             final_output[node_id] = pileup
