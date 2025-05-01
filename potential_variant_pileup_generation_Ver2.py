@@ -143,19 +143,20 @@ def main():
                 json.dump({str(k): v for k, v in node_sequences.items()}, cache_file)
 
     print("🔹 Step 3: Pileup with multiprocessing")
-    task_list = []
-    overall_start_time = time.time()
-    for task_index, (node_id, (offset, record_count)) in enumerate(node_index.items()):
-        if node_id in node_sequences:
-            task_list.append((node_id, node_sequences[node_id], args.dat, offset, record_count))
-            if task_index > 0 and task_index % 100_000 == 0:
-                total_elapsed = time.time() - overall_start_time
-                print(f"✔ {task_index} nodes prepared — total time: {total_elapsed:.2f} sec")
+    task_list = [
+        (node_id, node_sequences[node_id], args.dat, offset, record_count)
+        for node_id, (offset, record_count) in node_index.items()
+        if node_id in node_sequences
+    ]
 
     final_output = {}
+    start_time = time.time()
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
-        for node_id, pileup in executor.map(process_node, task_list):
+        for i, (node_id, pileup) in enumerate(executor.map(process_node, task_list), 1):
             final_output[node_id] = pileup
+            if i % 100_000 == 0:
+                elapsed = time.time() - start_time
+                print(f"✔ Processed {i} nodes — total time: {elapsed:.2f} sec")
 
     print("🔹 Step 4: Write JSON output")
     with open(args.output, "w") as out_file:
