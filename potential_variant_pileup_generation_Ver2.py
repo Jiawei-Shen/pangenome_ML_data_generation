@@ -163,7 +163,7 @@ def main():
     for count, (node_id, (offset, nrec)) in enumerate(node_index.items(), start=1):
         if node_id not in node_sequences:
             continue
-        print(count)
+        print(count, node_id, offset, nrec, "\n")
         _, pileup = process_node(node_id, offset, nrec)
         results[node_id] = pileup
         if count % 1000 == 0 or count == total:
