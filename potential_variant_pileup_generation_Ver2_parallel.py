@@ -337,7 +337,34 @@ def process_node_parallel(task_args):
         if pileup_rows:
             final_pileups[variant_key] = pileup_rows
 
-    # print(node_id, final_pileups, '\n\n')
+    # Inside process_node_parallel, before the print/return
+    try:
+        import pickle
+        import sys as pysys
+
+        # Estimate size - pickle.dumps is more accurate than sys.getsizeof for complex objects
+        pickled_result = pickle.dumps((node_id, final_pileups))
+        result_size_mb = len(pickled_result) / (1024 * 1024)
+
+        print(
+            f"Worker {os.getpid()} Node {node_id}: Result size approx {result_size_mb:.2f} MB. Variants: {len(final_pileups)}",
+            file=sys.stderr, flush=True)
+
+        # Optionally, add a check:
+        # if result_size_mb > 100: # Example threshold: 100MB
+        #    print(f"⚠️ Worker {os.getpid()} Node {node_id}: Result size is very large!", file=sys.stderr, flush=True)
+        # Consider returning summary data instead if it's too large
+        # return node_id, {"error": "result too large", "size_mb": result_size_mb}
+
+    except Exception as pickle_err:
+        # This explicitly catches pickling errors!
+        print(f"❌ Worker {os.getpid()}: Node {node_id}. FAILED TO PICKLE RESULT: {pickle_err}", file=sys.stderr,
+              flush=True)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        return node_id, {"error": "pickling failed"}  # Return an error indicator
+
+    print(node_id, final_pileups, '\n\n')  # Your existing print
     return node_id, final_pileups
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -356,7 +383,7 @@ def main():
     # --- End Re-added Cache Arguments ---
     parser.add_argument("--window", type=int, default=DEFAULT_WINDOW_SIZE, help="Pileup window size around variant")
     parser.add_argument("-w", "--workers", type=int, default=os.cpu_count(), help="Number of worker processes to use")
-    parser.add_argument("-c", "--chunksize", type=int, default=100, help="Approximate number of nodes per worker task")
+    parser.add_argument("-c", "--chunksize", type=int, default=1, help="Approximate number of nodes per worker task")
     args = parser.parse_args()
 
     # --- Input Validation ---
