@@ -479,6 +479,7 @@ def main():
                                  initializer=init_worker,
                                  initargs=(args.dat,)) as executor:
             future_results = executor.map(process_node_parallel, tasks, chunksize=args.chunksize)
+            print(future_results)
             for node_id, pileup_dict in future_results:
                  nodes_processed_count += 1
                  if pileup_dict:
