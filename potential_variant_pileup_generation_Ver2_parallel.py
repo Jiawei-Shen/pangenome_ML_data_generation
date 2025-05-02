@@ -337,7 +337,7 @@ def process_node_parallel(task_args):
         if pileup_rows:
             final_pileups[variant_key] = pileup_rows
 
-    print(node_id, final_pileups, '\n\n')
+    # print(node_id, final_pileups, '\n\n')
     return node_id, final_pileups
 
 # ─────────────────────────────────────────────────────────────────────────────
