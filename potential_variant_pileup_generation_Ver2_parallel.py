@@ -356,7 +356,7 @@ def main():
     # --- End Re-added Cache Arguments ---
     parser.add_argument("--window", type=int, default=DEFAULT_WINDOW_SIZE, help="Pileup window size around variant")
     parser.add_argument("-w", "--workers", type=int, default=os.cpu_count(), help="Number of worker processes to use")
-    parser.add_argument("-c", "--chunksize", type=int, default=1, help="Approximate number of nodes per worker task")
+    parser.add_argument("-c", "--chunksize", type=int, default=100, help="Approximate number of nodes per worker task")
     args = parser.parse_args()
 
     # --- Input Validation ---
@@ -478,7 +478,7 @@ def main():
         with ProcessPoolExecutor(max_workers=num_workers,
                                  initializer=init_worker,
                                  initargs=(args.dat,)) as executor:
-            print("start")
+            print(f"start, {len(tasks)}")
             future_results = executor.map(process_node_parallel, tasks, chunksize=args.chunksize)
             print(future_results)
             for node_id, pileup_dict in future_results:
