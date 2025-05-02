@@ -374,7 +374,7 @@ def main():
     parser.add_argument("--gfa", help="GFA graph file path (needed if node sequence cache is not used/built)")
     parser.add_argument("--load-cache", help="Load node sequences from this JSON cache file")
     parser.add_argument("--save-cache", help="Save node sequences to this JSON cache file (used if --gfa is provided)")
-    parser.add_argument("-w", "--workers", type=int, default=8, # Consider os.cpu_count()
+    parser.add_argument("-w", "--workers", type=int, default=4, # Consider os.cpu_count()
                         help="Number of worker processes to use")
     # *** ADDED window argument ***
     parser.add_argument("--window", type=int, default=75,
