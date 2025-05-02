@@ -359,6 +359,7 @@ def process_node_parallel(task_args):
         pileups[f"{vpos}_{vtype}"] = pileup_matrix.tolist()
 
     # Optional: print(f"[Worker {os.getpid()}] Finished node {node_id}. Found {len(pileups)} variant sites.")
+    print(node_id, pileups, '\n')
     return node_id, pileups
 
 # ─────────────────────────────────────────────────────────────────────────────
