@@ -9,31 +9,30 @@ import numpy as np
 from collections import defaultdict
 import re # Import re at the top level
 from concurrent.futures import ProcessPoolExecutor
-# Maybe import cpu_count to default workers
-# from os import cpu_count
+# from os import cpu_count # Uncomment if using cpu_count for default workers
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Constants (moved globals here or made local where appropriate)
+# Constants
 RECORD_STRUCT = struct.Struct("<h150s150s20shc")
 RECORD_SIZE = RECORD_STRUCT.size
-BASE_TO_INDEX = {'A': 0, 'C': 1, 'G': 2, 'T': 3, 'N': 4}
+BASE_TO_INDEX = {'A': 0, 'C': 1, 'G': 2, 'T': 3, 'N': 4} # N used for padding/unknown
 
 # Global for worker process state (file handle)
-# Each worker process will have its own instance of this global
 worker_dat_file = None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helper Functions (remain mostly unchanged, ensure defined at top level)
+# Helper Functions
 
 def reverse_complement(sequence):
+    """Computes the reverse complement of a DNA sequence."""
     complement_map = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")
     return sequence.translate(complement_map)[::-1]
 
 def parse_idx_file(idx_path):
+    """Parses the .idx file to get node offsets and record counts."""
     node_index = {}
     try:
         with open(idx_path, 'rb') as f:
-            # Check file size for basic validation
             file_size = os.fstat(f.fileno()).st_size
             if file_size < 4:
                  print(f"❌ Error: Index file {idx_path} is too small.", file=sys.stderr)
@@ -45,25 +44,26 @@ def parse_idx_file(idx_path):
                 sys.exit(1)
             num_nodes = struct.unpack('<I', num_nodes_bytes)[0]
 
-            # Check if file size matches expected size based on num_nodes
             expected_min_size = 4 + num_nodes * 22
             if file_size < expected_min_size:
                 print(f"❌ Error: Index file {idx_path} appears truncated. Expected at least {expected_min_size} bytes for {num_nodes} nodes, found {file_size}.", file=sys.stderr)
-                # Continue cautiously or exit, depending on desired robustness
-                # sys.exit(1) # Or just warn
+                # Optionally continue if partial processing is desired
+                # sys.exit(1)
 
             print(f"🔹 Reading index for {num_nodes} nodes...")
             for i in range(num_nodes):
                 record_bytes = f.read(22)
                 if len(record_bytes) < 22:
                      print(f"❌ Error: Index file ended prematurely while reading record {i+1}/{num_nodes}.", file=sys.stderr)
-                     break # Stop processing further records
-                node_id, offset, block_size, n_records, _ = struct.unpack('<I Q I I H', record_bytes)
-                node_index[node_id] = (offset, n_records)
+                     break
+                # <I Q I I H => node_id, offset, block_size, n_records, padding
+                node_id, offset, _, n_records, _ = struct.unpack('<I Q I I H', record_bytes)
+                if n_records > 0: # Only store nodes that have records
+                    node_index[node_id] = (offset, n_records)
 
-        print(f"✔ Parsed {len(node_index)} nodes from index file.")
-        if len(node_index) != num_nodes:
-             print(f"⚠️ Warning: Expected {num_nodes} nodes based on header, but parsed {len(node_index)}. File might be corrupt or truncated.", file=sys.stderr)
+        print(f"✔ Parsed {len(node_index)} nodes with records from index file.")
+        if len(node_index) != num_nodes and file_size >= expected_min_size:
+             print(f"⚠️ Warning: Index header indicated {num_nodes} nodes, but {num_nodes - len(node_index)} had 0 records or were missing. Processing {len(node_index)} nodes.", file=sys.stderr)
         return node_index
     except FileNotFoundError:
         print(f"❌ Error: Index file not found at {idx_path}", file=sys.stderr)
@@ -74,48 +74,48 @@ def parse_idx_file(idx_path):
 
 
 def load_node_sequences_from_gfa(gfa_path, target_node_ids):
+    """Loads sequences for specified node IDs from a GFA file."""
     node_sequences = {}
-    target_node_set = set(target_node_ids) # Use a set for faster lookups
+    target_node_set = set(target_node_ids)
     try:
         with open(gfa_path, 'r') as f:
             print(f"🔹 Reading GFA file: {gfa_path}")
             line_counter = 0
             parsed_count = 0
+            start_time = time.time()
             for line in f:
                 line_counter += 1
-                if line_counter % 10_000_000 == 0:
-                    print(f"  Checked {line_counter:,} lines in GFA file...")
+                if line_counter % 20_000_000 == 0: # Print progress less often
+                    elapsed = time.time() - start_time
+                    print(f"  Checked {line_counter:,} lines in GFA file... ({elapsed:.1f}s)", end='\r')
 
                 if not line.startswith('S\t'):
                     continue
 
                 parts = line.strip().split('\t')
+                # GFA S line: S <Name> <Sequence> [Optional tags]
                 if len(parts) < 3:
-                    # print(f"⚠️ Warning: Skipping malformed S line {line_counter}: {line.strip()}", file=sys.stderr)
-                    continue # Skip malformed lines
+                    continue
 
                 try:
-                    # Handle potential non-integer node IDs gracefully if needed
-                    # For now, assume they should be integers
+                    # Node ID might not always be numeric in GFA, but assume integer based on .idx
                     nid = int(parts[1])
                 except ValueError:
-                    # print(f"⚠️ Warning: Skipping S line {line_counter} with non-integer ID: {parts[1]}", file=sys.stderr)
-                    continue # Skip nodes with non-integer IDs
+                    continue # Skip nodes with non-integer IDs if index uses integers
 
                 if nid in target_node_set:
-                    # Store sequence, remove potential trailing newline just in case
                     node_sequences[nid] = parts[2]
                     parsed_count += 1
-                    # Optional: remove from set to stop searching if all found
-                    # target_node_set.remove(nid)
-                    # if not target_node_set:
-                    #    print(f"✔ Found all {len(target_node_ids)} target sequences.")
-                    #    break
+                    # Optimization: Remove found node ID from set
+                    target_node_set.remove(nid)
+                    if not target_node_set:
+                       print(f"\n✔ Found all {len(target_node_ids)} target sequences after checking {line_counter:,} lines.")
+                       break # Stop reading GFA if all targets found
 
-            print(f"✔ Checked {line_counter:,} lines in GFA.")
+            print(f"\n✔ Checked {line_counter:,} total lines in GFA.")
             print(f"✔ Loaded {len(node_sequences)} target sequences from GFA.")
-            if len(node_sequences) != len(target_node_ids):
-                 print(f"⚠️ Warning: Found sequences for {len(node_sequences)} out of {len(target_node_ids)} target nodes.", file=sys.stderr)
+            if target_node_set: # Check if any targets were *not* found
+                 print(f"⚠️ Warning: Could not find sequences for {len(target_node_set)} target nodes in the GFA file (e.g., node {next(iter(target_node_set))}).", file=sys.stderr)
 
     except FileNotFoundError:
         print(f"❌ Error: GFA file not found at {gfa_path}", file=sys.stderr)
@@ -127,22 +127,26 @@ def load_node_sequences_from_gfa(gfa_path, target_node_ids):
     return node_sequences
 
 def decode_cigar(cigar_string):
-    # Using pre-compiled regex might be slightly faster if called extremely often,
-    # but re.findall caches implicitly, so improvement might be negligible.
-    # CIGAR_REGEX = re.compile(r'(\d+)([MXDI])')
-    # return CIGAR_REGEX.findall(cigar_string)
-    if not cigar_string or cigar_string == '*': # Handle empty or null CIGAR
+    """Decodes a CIGAR string into a list of (length, operation) tuples."""
+    if not cigar_string or cigar_string == '*':
         return []
     try:
-        return re.findall(r'(\d+)([MIDX=])', cigar_string) # Include M, =, X
+        # Allow M, I, D, X, = (standard operations involved in alignment differences)
+        # Others like S, H, P, N are ignored by findall
+        return re.findall(r'(\d+)([MIDX=])', cigar_string)
     except Exception as e:
         print(f"⚠️ Warning: Could not parse CIGAR string '{cigar_string}': {e}", file=sys.stderr)
         return []
 
 
-def detect_variants_from_cigar(offset, cigar_string):
+def detect_variants_from_cigar(offset, cigar_string, node_len):
+    """
+    Identifies potential variant positions relative to the node sequence based on CIGAR.
+    Returns a list of tuples: (position_on_node, variant_type).
+    Variant Types: 'X' (mismatch), 'I' (insertion *after* position), 'D' (deletion *at* position).
+    """
     variants = []
-    pos = offset # Position on the reference node sequence
+    ref_pos = offset # Current position on the reference node sequence (0-based)
     cigar_ops = decode_cigar(cigar_string)
 
     for length_str, op in cigar_ops:
@@ -150,24 +154,37 @@ def detect_variants_from_cigar(offset, cigar_string):
             length = int(length_str)
         except ValueError:
             print(f"⚠️ Warning: Invalid length in CIGAR operation '{length_str}{op}' in string '{cigar_string}'", file=sys.stderr)
-            continue # Skip this operation
+            continue
 
         if op == 'M' or op == '=': # Match or sequence match
-            pos += length
+            ref_pos += length
         elif op == 'X': # Sequence mismatch
-            # Report one variant event per base for simplicity here
+            # Report variant site for each mismatch position
             for i in range(length):
-                variants.append((pos + i, 'X'))
-            pos += length
+                current_pos = ref_pos + i
+                if 0 <= current_pos < node_len: # Check boundary
+                   variants.append((current_pos, 'X'))
+            ref_pos += length
         elif op == 'I': # Insertion to the reference
-            # Variant occurs *after* the reference position `pos - 1`
-            variants.append((pos - 1, 'I'))
-            # Insertions do not consume reference bases, so pos does not change here.
+            # Insertion occurs *after* the reference position `ref_pos - 1`
+            # We need to associate it with a valid reference position.
+            # Conventionally, it's often linked to the base *before* the insertion.
+            current_pos = ref_pos - 1
+            if current_pos >= -1 and current_pos < node_len: # Allow pos -1 if insertion is at the beginning
+                 variants.append((current_pos, 'I'))
+            # Insertions do not consume reference bases
         elif op == 'D': # Deletion from the reference
-            # Deletion starts *at* the reference position `pos`
-            variants.append((pos, 'D'))
-            pos += length # Deletions consume reference bases
-        # Other CIGAR ops like S, H, P, N are ignored for variant detection here
+            # Deletion starts *at* the reference position `ref_pos`
+            # Report variant site for the start of the deletion
+            if 0 <= ref_pos < node_len: # Check boundary for start pos
+                 variants.append((ref_pos, 'D'))
+            ref_pos += length # Deletions consume reference bases
+
+        # Check if current ref_pos has exceeded node length prematurely (e.g., bad CIGAR/offset)
+        # This might indicate an issue upstream, but helps prevent invalid variant positions later.
+        # if ref_pos > node_len:
+        #    print(f"⚠️ Warning: CIGAR processing resulted in ref_pos ({ref_pos}) exceeding node_len ({node_len}). CIGAR: '{cigar_string}', offset: {offset}", file=sys.stderr)
+        #    break # Stop processing CIGAR for this read
 
     return variants
 
@@ -177,178 +194,178 @@ def detect_variants_from_cigar(offset, cigar_string):
 def init_worker(dat_file_path):
     """Initializer for each worker process: opens the .dat file."""
     global worker_dat_file
-    # print(f"[Worker {os.getpid()}] Initializing and opening {dat_file_path}") # Debug print
     try:
         worker_dat_file = open(dat_file_path, 'rb')
+        # Optional: print(f"[Worker {os.getpid()}] Initialized with {dat_file_path}")
     except FileNotFoundError:
          print(f"❌ Error [Worker {os.getpid()}]: DAT file not found at {dat_file_path}", file=sys.stderr)
-         # Exit the worker process cleanly if the file isn't found
-         sys.exit(1)
+         sys.exit(1) # Worker cannot proceed
     except Exception as e:
         print(f"❌ Error [Worker {os.getpid()}] opening DAT file {dat_file_path}: {e}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(1) # Worker cannot proceed
 
 
 def process_node_parallel(task_args):
     """
     Function executed by each worker process.
-    Processes a single node to find variants and generate pileups.
+    Processes reads for a single node, identifies variants, and generates pileups.
     """
-    node_id, offset, n_records, sequence = task_args
+    node_id, file_offset, n_records, sequence, window_size = task_args # Added window_size
     global worker_dat_file
 
     if worker_dat_file is None:
-         # This shouldn't happen if initializer worked, but good safeguard
          print(f"❌ Error [Worker {os.getpid()}]: Worker DAT file handle not initialized for node {node_id}.", file=sys.stderr)
-         # Return an empty result or raise an error, depending on desired handling
-         return node_id, {} # Return empty dict for this node
+         return node_id, {}
 
-    # Make sure sequence is not None or empty if needed later
     if not sequence:
-         # print(f"⚠️ Warning [Worker {os.getpid()}]: Empty sequence provided for node {node_id}. Skipping pileup generation.", file=sys.stderr)
+         # This might happen if GFA loading failed for this specific node
+         # print(f"ℹ️ Info [Worker {os.getpid()}]: No sequence for node {node_id}, skipping.", file=sys.stderr)
          return node_id, {} # Cannot process without sequence
 
     node_len = len(sequence)
-    segments = []
+    if node_len == 0:
+        # print(f"ℹ️ Info [Worker {os.getpid()}]: Empty sequence for node {node_id}, skipping.", file=sys.stderr)
+        return node_id, {} # Cannot process empty sequence
+
+    segments = [] # Store (offset_on_node, read_sequence, cigar_string)
 
     try:
         # Seek to the correct position for this node's records
-        # The first 10 bytes (node_id, offset, block_size) are metadata in the block
-        worker_dat_file.seek(offset + 10)
+        # Assuming index offset points directly to the start of the block,
+        # and the first 10 bytes are metadata (node_id, block_offset, block_size).
+        # If the .dat format is different, this needs adjustment.
+        # Let's assume offset is the start of the block, and we skip metadata
+        block_metadata_size = 10 # Example: size of node_id (4) + offset (8?) + block_size (4?) -> Adjust if known!
+        # Correction: The index file format unpacks as <I Q I I H (22 bytes total)
+        # node_id (4), offset (8), block_size (4), n_records (4), padding (2)
+        # The offset (Q, 8 bytes) likely points to the START of the data block in the .dat file.
+        # The first N bytes of that block might be metadata before the actual records start.
+        # Let's ASSUME the first record starts immediately at 'file_offset'. If there's block metadata, adjust seek.
+        # Example: If there's a 4-byte node_id at the start of the block:
+        # worker_dat_file.seek(file_offset + 4)
+        # For now, assume no extra metadata offset:
+        worker_dat_file.seek(file_offset)
 
         for record_idx in range(n_records):
             try:
                 data = worker_dat_file.read(RECORD_SIZE)
                 if len(data) < RECORD_SIZE:
-                    # print(f"⚠️ Warning [Worker {os.getpid()}]: Short read ({len(data)} bytes) for node {node_id}, record {record_idx+1}/{n_records}. Stopping reads for this node.", file=sys.stderr)
-                    break # Stop reading if data is incomplete
+                    # print(f"⚠️ Warning [Worker {os.getpid()}]: Short read ({len(data)} bytes) for node {node_id}, record {record_idx+1}/{n_records}. Assuming end of records for node.", file=sys.stderr)
+                    break
 
-                # Unpack record data
-                off, raw_seq, raw_bq, raw_cigar, mapq, strand_byte = RECORD_STRUCT.unpack(data)
+                # Unpack record data: off, seq, bq, cigar, mapq, strand
+                off, raw_seq, _, raw_cigar, mapq, strand_byte = RECORD_STRUCT.unpack(data)
 
                 # Basic filtering
-                if mapq < 10:
+                if mapq < 10: # Example MAPQ filter
                     continue
 
-                # Decode fields, handling potential errors
+                # Decode fields
                 try:
-                    # Use 'replace' or 'ignore' for bytes that aren't valid ASCII
+                    # Use 'replace' or 'ignore' for potential non-ASCII bytes
                     seq = raw_seq.rstrip(b'\x00').decode('ascii', errors='ignore')
                     cigar = raw_cigar.rstrip(b'\x00').decode('ascii', errors='ignore')
                     strand_char = strand_byte.decode('ascii')
                 except UnicodeDecodeError as ude:
                     # print(f"⚠️ Warning [Worker {os.getpid()}]: Unicode decode error in record {record_idx+1} for node {node_id}: {ude}. Skipping record.", file=sys.stderr)
-                    continue # Skip record if decoding fails
+                    continue
+
+                if not seq or not cigar: # Skip reads with empty sequence or CIGAR
+                    continue
 
                 read_len = len(seq)
 
-                # Adjust offset and reverse complement sequence for reverse strand reads
-                # Handle potential edge case where node_len might be 0 or off/read_len calculation is invalid
-                if strand_char == '-' and node_len > 0:
-                    # Original calculation: off = node_len - off - read_len
-                    # Let's verify this logic. If a read maps to the reverse strand,
-                    # the 'offset' usually refers to the *start* of the alignment on the
-                    # forward strand representation of the node.
-                    # If the alignment starts at `off` (0-based) on forward strand and has length `read_len`,
-                    # on the reverse complement node sequence, the alignment effectively starts at
-                    # `node_len - (off + read_len)`. Let's stick to the original calculation for now,
-                    # assuming it matches the data's convention. Need example data to be 100% sure.
-                     adj_off = node_len - off - read_len # Calculate adjusted offset first
-                     if adj_off < 0:
-                        # print(f"⚠️ Warning [Worker {os.getpid()}]: Negative adjusted offset ({adj_off}) for node {node_id}, record {record_idx+1}. Original off={off}, node_len={node_len}, read_len={read_len}. Using original offset.", file=sys.stderr)
-                        # Decide how to handle: skip, use original `off`, use 0? Using original `off` might be wrong.
-                        # Using 0 might be safer if the coordinate system is unclear. Let's use 0 for now.
-                        # adj_off = 0
-                        # Or perhaps better to skip this read if coordinates seem inconsistent
-                        # print(f"   Skipping read due to inconsistent coordinates.")
-                        continue # Skip this read
+                # *** CORRECTED Reverse Strand Handling ***
+                # The offset 'off' should refer to the position on the forward strand node sequence.
+                # If the read aligns to the reverse strand, we only need to reverse complement the read sequence.
+                current_seq = seq
+                if strand_char == '-':
+                    current_seq = reverse_complement(seq)
+                    # Do NOT adjust offset based on node_len here. 'off' is the coordinate.
 
-                     seq = reverse_complement(seq) # Reverse complement the sequence
-                     off = adj_off # Use the adjusted offset for further calculations
+                # Validate offset before adding segment
+                # Offset should be within the node bounds considering the alignment length from CIGAR later
+                # A simple check: offset should be non-negative. More complex checks could parse CIGAR length.
+                if off < 0:
+                    # print(f"⚠️ Warning [Worker {os.getpid()}]: Negative offset ({off}) encountered for node {node_id}, record {record_idx+1}. Skipping read.", file=sys.stderr)
+                    continue
+                # Potentially add check: off < node_len?
 
-
-                segments.append((off, seq, cigar))
+                segments.append((off, current_seq, cigar)) # Store offset, potentially RC'd sequence, CIGAR
 
             except struct.error as se:
                  print(f"❌ Error [Worker {os.getpid()}]: Failed to unpack record {record_idx+1} for node {node_id}: {se}. Stopping reads for this node.", file=sys.stderr)
-                 break # Stop processing this node if unpacking fails
+                 break
             except Exception as e_inner:
                  print(f"❌ Error [Worker {os.getpid()}]: Unexpected error processing record {record_idx+1} for node {node_id}: {e_inner}", file=sys.stderr)
-                 # Continue to next record or break depending on severity
-                 continue
-
+                 continue # Skip problematic record
 
     except IOError as ioe:
-         print(f"❌ Error [Worker {os.getpid()}]: I/O error reading data for node {node_id} at offset {offset}: {ioe}", file=sys.stderr)
-         return node_id, {} # Return empty result for this node
+         print(f"❌ Error [Worker {os.getpid()}]: I/O error reading data for node {node_id} at offset {file_offset}: {ioe}", file=sys.stderr)
+         return node_id, {}
     except Exception as e_outer:
-        # Catch any other unexpected error during the reading loop
         print(f"❌ Error [Worker {os.getpid()}]: Unexpected error seeking/reading node {node_id}: {e_outer}", file=sys.stderr)
         return node_id, {}
 
-
     # --- Variant Detection and Pileup Generation ---
     reads_by_variant = defaultdict(list)
-    for off, seq, cigar in segments:
-        # Ensure offset is non-negative before passing to variant detection
-        if off < 0:
-            # print(f"⚠️ Warning [Worker {os.getpid()}]: Skipping segment with negative offset ({off}) for node {node_id}.", file=sys.stderr)
-            continue
+    for read_offset, read_seq, cigar in segments:
+        # Detect variants based on CIGAR string relative to this read's alignment
+        variants_in_read = detect_variants_from_cigar(read_offset, cigar, node_len)
 
-        # Detect variants based on CIGAR string
-        variants = detect_variants_from_cigar(off, cigar)
-        for vpos, vtype in variants:
-            # Ensure variant position is within node boundaries
-            # For Insertions ('I'), vpos is the base *before* the insertion. Check vpos >= -1?
-            # For Deletions ('D') and Mismatches ('X'), vpos is the first affected base. Check vpos >= 0.
-            is_valid_pos = False
-            if vtype == 'I' and vpos >= -1 and vpos < node_len: # Insertion after vpos
-                 is_valid_pos = True
-            elif vtype in ('D', 'X') and vpos >= 0 and vpos < node_len: # Deletion/Mismatch starting at vpos
-                 is_valid_pos = True
-
-            if is_valid_pos:
-                reads_by_variant[(vpos, vtype)].append((off, seq))
-            #else:
-            #    print(f"Debug: Variant ({vpos}, {vtype}) outside node bounds [0, {node_len}) for node {node_id}")
+        # Store the read sequence associated with each variant it covers
+        for vpos, vtype in variants_in_read:
+            # Key: tuple (variant_position_on_node, variant_type)
+            # Value: list of (read_alignment_start_offset, read_sequence) tuples
+            reads_by_variant[(vpos, vtype)].append((read_offset, read_seq))
 
 
     # --- Generate Pileups ---
     pileups = {}
-    window = 60
-    half = window // 2
-    for (vpos, vtype), reads in reads_by_variant.items():
-        if not reads: # Skip if no reads support this variant somehow
+    # Use the window_size passed from args
+    half_window = window_size // 2
+
+    for (vpos, vtype), supporting_reads in reads_by_variant.items():
+        if not supporting_reads:
              continue
 
-        mat = np.full((len(reads), window), BASE_TO_INDEX['N'], dtype=np.uint8) # Fill with 'N' index
-        for i, (read_offset, read_seq) in enumerate(reads):
-            read_len = len(read_seq)
-            # Calculate the start position in the read sequence corresponding to the
-            # start of the pileup window (vpos - half).
-            # pileup_window_start_on_node = vpos - half
-            # pileup_window_start_in_read = pileup_window_start_on_node - read_offset
-            start_in_read = vpos - read_offset - half
+        # Create pileup matrix for this variant
+        # Shape: (number_of_supporting_reads, window_size)
+        # Initialize with 'N' index
+        pileup_matrix = np.full((len(supporting_reads), window_size), BASE_TO_INDEX['N'], dtype=np.uint8)
 
-            for j in range(window): # j is the index within the pileup window (0 to window-1)
-                # Calculate the corresponding index in the read sequence
-                read_idx = start_in_read + j
+        for i, (read_offset, read_seq) in enumerate(supporting_reads):
+            read_len = len(read_seq)
+
+            # Calculate the index *in the read* corresponding to the *start* of the window on the node.
+            # Window start on node = vpos - half_window
+            # Position of window start relative to read start = (vpos - half_window) - read_offset
+            window_start_in_read = vpos - read_offset - half_window
+
+            # Fill the row in the pileup matrix
+            for j in range(window_size): # j is the column index in the pileup matrix (0 to window_size-1)
+                # Corresponding position on the node = (vpos - half_window) + j
+                # Corresponding index in the read = window_start_in_read + j
+                read_idx = window_start_in_read + j
+
+                # Check if this position falls within the bounds of the current read
                 if 0 <= read_idx < read_len:
                     base = read_seq[read_idx].upper()
-                    mat[i, j] = BASE_TO_INDEX.get(base, BASE_TO_INDEX['N'])
-                # else: base is outside the read, defaults to 'N' (index 4)
+                    pileup_matrix[i, j] = BASE_TO_INDEX.get(base, BASE_TO_INDEX['N'])
+                # else: Position is outside the read, leave as 'N' (already initialized)
 
-        # Store pileup matrix as list of lists for JSON serialization
-        pileups[f"{vpos}_{vtype}"] = mat.tolist()
+        # Store pileup matrix (as list of lists for JSON)
+        # Key format: "position_variantType" (e.g., "123_X", "455_I", "678_D")
+        pileups[f"{vpos}_{vtype}"] = pileup_matrix.tolist()
 
-    # print(f"[Worker {os.getpid()}] Finished processing node {node_id}. Found {len(pileups)} variants.") # Debug print
+    # Optional: print(f"[Worker {os.getpid()}] Finished node {node_id}. Found {len(pileups)} variant sites.")
     return node_id, pileups
 
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="Parallel variant-centered pileup generation.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter # Show defaults
+        description="Parallel variant-centered read segment pileup generation.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("dat", help=".dat file path (read alignment data)")
     parser.add_argument("idx", help=".idx file path (index for .dat file)")
@@ -356,9 +373,12 @@ def main():
     parser.add_argument("--gfa", help="GFA graph file path (needed if node sequence cache is not used/built)")
     parser.add_argument("--load-cache", help="Load node sequences from this JSON cache file")
     parser.add_argument("--save-cache", help="Save node sequences to this JSON cache file (used if --gfa is provided)")
-    parser.add_argument("-w", "--workers", type=int, default=8,
+    parser.add_argument("-w", "--workers", type=int, default=8, # Consider os.cpu_count()
                         help="Number of worker processes to use")
-    parser.add_argument("-c", "--chunksize", type=int, default=200,
+    # *** ADDED window argument ***
+    parser.add_argument("--window", type=int, default=75,
+                        help="Pileup window size centered on the variant position")
+    parser.add_argument("-c", "--chunksize", type=int, default=100, # Adjusted default chunksize
                         help="Number of nodes processed by a worker before returning results (approx)")
     args = parser.parse_args()
 
@@ -369,18 +389,20 @@ def main():
     if not os.path.isfile(args.idx):
          print(f"❌ Error: Index file not found: {args.idx}", file=sys.stderr)
          sys.exit(1)
+    # Validate window size
+    if args.window <= 0 or args.window % 2 == 0:
+        print(f"❌ Error: Pileup window size (--window) must be a positive odd integer. Found: {args.window}", file=sys.stderr)
+        sys.exit(1)
 
+    # Cache/GFA validation
     if not args.load_cache and not args.gfa:
-        print("❌ Error: You must provide either a GFA file (`--gfa`) to build node sequences or a pre-built cache file (`--load-cache`).", file=sys.stderr)
+        print("❌ Error: You must provide either a GFA file (`--gfa`) or a node sequence cache (`--load-cache`).", file=sys.stderr)
         sys.exit(1)
     if args.gfa and not args.save_cache and not args.load_cache:
-        # If using GFA and no cache exists, force saving it for future runs.
-        # Determine a default cache name or require --save-cache.
-        # Let's require it for clarity.
-        print("❌ Error: When providing a GFA file (`--gfa`) without loading a cache (`--load-cache`), you must also specify where to save the new cache using `--save-cache`.", file=sys.stderr)
+        print("❌ Error: When providing `--gfa` without `--load-cache`, you must also specify `--save-cache`.", file=sys.stderr)
         sys.exit(1)
     if args.load_cache and not os.path.isfile(args.load_cache):
-        print(f"❌ Error: Specified cache file to load does not exist: {args.load_cache}", file=sys.stderr)
+        print(f"❌ Error: Cache file to load does not exist: {args.load_cache}", file=sys.stderr)
         sys.exit(1)
     if args.gfa and not os.path.isfile(args.gfa):
          print(f"❌ Error: GFA file not found: {args.gfa}", file=sys.stderr)
@@ -393,143 +415,125 @@ def main():
     if not node_index:
          print("❌ Error: Failed to parse node index. Exiting.", file=sys.stderr)
          sys.exit(1)
-    print(f"✔ Index parsing took {time.time() - start_time:.2f} seconds.")
+    print(f"✔ Index parsing took {time.time() - start_time:.2f} seconds. {len(node_index)} nodes to process.")
 
 
     # --- Load or Build Node Sequences ---
     node_sequences = {}
-    cache_path = args.load_cache or args.save_cache # Determine the relevant cache path
-
     if args.load_cache and os.path.isfile(args.load_cache):
         print(f"🔹 Loading node sequences from cache: {args.load_cache}...")
         start_time = time.time()
         try:
             with open(args.load_cache, 'r') as cf:
-                # Load keys as integers directly
                 loaded_data = json.load(cf)
+                # Ensure keys are integers after loading from JSON
                 node_sequences = {int(k): v for k, v in loaded_data.items()}
             print(f"✔ Loaded {len(node_sequences)} sequences from cache in {time.time() - start_time:.2f} seconds.")
-        except json.JSONDecodeError as jde:
-             print(f"❌ Error decoding JSON from cache file {args.load_cache}: {jde}", file=sys.stderr)
-             sys.exit(1)
         except Exception as e:
              print(f"❌ Error loading cache file {args.load_cache}: {e}", file=sys.stderr)
-             sys.exit(1)
+             sys.exit(1) # Critical error if cache load fails
     elif args.gfa:
-        print(f"🔹 Building node sequence cache from GFA: {args.gfa}...")
+        print(f"🔹 Loading/Building node sequences from GFA: {args.gfa}...")
         start_time = time.time()
-        # We only need sequences for nodes present in the index file
+        # Load sequences only for nodes present in the index
         node_sequences = load_node_sequences_from_gfa(args.gfa, node_index.keys())
-        print(f"✔ Sequence loading from GFA took {time.time() - start_time:.2f} seconds.")
+        print(f"✔ Sequence loading/building took {time.time() - start_time:.2f} seconds.")
         if args.save_cache:
             print(f"🔹 Saving node sequence cache to: {args.save_cache}...")
             start_time = time.time()
             try:
+                # Ensure keys are saved as strings in JSON
+                save_data = {str(k): v for k, v in node_sequences.items()}
                 with open(args.save_cache, 'w') as cf:
-                    # Ensure keys are saved as strings in JSON
-                    json.dump({str(k): v for k, v in node_sequences.items()}, cf)
-                print(f"✔ Saved cache in {time.time() - start_time:.2f} seconds.")
-            except IOError as ioe:
-                 print(f"❌ Error saving cache file {args.save_cache}: {ioe}", file=sys.stderr)
-                 # Continue execution even if saving cache fails? Or exit? Let's continue.
+                    json.dump(save_data, cf) # No indent for smaller file size
+                print(f"✔ Saved cache ({len(save_data)} nodes) in {time.time() - start_time:.2f} seconds.")
             except Exception as e:
-                 print(f"❌ Error during cache saving to {args.save_cache}: {e}", file=sys.stderr)
-
-    else:
-        # This case should have been caught by earlier validation, but double-check
-        print("❌ Internal Error: No sequence source available. Exiting.", file=sys.stderr)
-        sys.exit(1)
-
-    if not node_sequences:
-         print("⚠️ Warning: No node sequences were loaded or built. Output will likely be empty.", file=sys.stderr)
-         # Decide whether to exit or continue
-         # sys.exit(1)
-
+                 print(f"❌ Error saving cache file {args.save_cache}: {e}", file=sys.stderr)
+                 # Non-critical, continue execution
 
     # --- Prepare Tasks for Parallel Processing ---
     print("🔹 Preparing tasks for parallel processing...")
     tasks = []
     nodes_missing_sequence = 0
+    nodes_with_records = 0
     for node_id, (offset, n_records) in node_index.items():
         sequence = node_sequences.get(node_id)
-        if sequence is not None:
-            # Add task only if sequence exists
-            tasks.append((node_id, offset, n_records, sequence))
+        if sequence:
+            # *** ADDED args.window to task arguments ***
+            tasks.append((node_id, offset, n_records, sequence, args.window))
+            nodes_with_records += 1
         else:
-            # print(f"Node {node_id} found in index but not in sequence data. Skipping.")
             nodes_missing_sequence += 1
 
     if nodes_missing_sequence > 0:
-        print(f"⚠️ Warning: Skipped {nodes_missing_sequence} nodes present in index but missing from sequence data.")
-
+        print(f"⚠️ Warning: Skipped {nodes_missing_sequence} nodes present in index but missing sequence data (from GFA/cache).")
     if not tasks:
-        print("❌ Error: No tasks to process (no nodes with available sequence data found). Exiting.", file=sys.stderr)
+        print("❌ Error: No tasks to process (no nodes found with both sequence data and records in index). Exiting.", file=sys.stderr)
         sys.exit(1)
 
     total_tasks = len(tasks)
-    num_workers = min(args.workers, total_tasks) # Don't need more workers than tasks
-    if num_workers <= 0:
-        num_workers = 1 # Ensure at least one worker
+    num_workers = min(args.workers, total_tasks, os.cpu_count() or args.workers) # Be reasonable with workers
+    if num_workers <= 0: num_workers = 1
 
-    print(f"🔹 Processing {total_tasks} nodes using {num_workers} workers (chunksize: {args.chunksize})...")
+    print(f"🔹 Processing {total_tasks} nodes using {num_workers} workers (window: {args.window}, chunksize: {args.chunksize})...")
 
     # --- Execute in Parallel ---
-    results = {}
+    results = {} # Store {node_id: pileup_dict}
     start_proc_time = time.time()
 
-    # Use ProcessPoolExecutor with context manager for proper cleanup
     try:
         with ProcessPoolExecutor(max_workers=num_workers,
                                  initializer=init_worker,
                                  initargs=(args.dat,)) as executor:
-            # map processes tasks in order and returns results as they complete
-            # Pass the list of task tuples
+
+            # Use executor.map for simplicity, results arrive in submission order (approx)
             future_results = executor.map(process_node_parallel, tasks, chunksize=args.chunksize)
 
             processed_count = 0
+            variants_found_count = 0
             # Iterate through results as they become available
             for node_id, pileup_dict in future_results:
-                 if pileup_dict is not None: # Store result if valid
-                     results[node_id] = pileup_dict
-                 # else: Error likely occurred in worker, message printed there.
-
                  processed_count += 1
-                 # Print progress update periodically
-                 if processed_count % 10000 == 0 or processed_count == total_tasks:
+                 if pileup_dict: # Store result only if pileups were generated
+                     results[node_id] = pileup_dict
+                     variants_found_count += len(pileup_dict)
+
+                 # Progress Update
+                 if processed_count % (args.chunksize * num_workers / 2) == 0 or processed_count == total_tasks: # Update periodically
                      elapsed = time.time() - start_proc_time
                      rate = processed_count / elapsed if elapsed > 0 else 0
-                     print(f"✔ {processed_count}/{total_tasks} nodes processed ({rate:.1f} nodes/s) — Elapsed: {elapsed:.2f}s")
+                     eta = (total_tasks - processed_count) / rate if rate > 0 else 0
+                     print(f"  Processed: {processed_count}/{total_tasks} nodes ({rate:.1f}/s) | Variants Found: {variants_found_count} | Elapsed: {elapsed:.1f}s | ETA: {eta:.1f}s", end='\r')
 
     except Exception as pool_exc:
          print(f"\n❌ An error occurred during parallel processing: {pool_exc}", file=sys.stderr)
-         # Depending on the error, 'results' might be partially filled.
-         # Decide if you want to save partial results or exit.
-         # For simplicity, we'll proceed to save whatever results we got.
          print("⚠️ Attempting to write any partial results obtained...", file=sys.stderr)
-
+    finally:
+        # Ensure newline after progress indicator
+        print() # Moves to the next line after the final progress update
 
     total_elapsed_time = time.time() - start_proc_time
     print(f"✔ Parallel processing finished in {total_elapsed_time:.2f} seconds.")
 
     # --- Write Output ---
-    print(f"🔹 Writing {len(results)} results to JSON output: {args.output}")
+    if not results:
+        print("⚠️ No pileups were generated. Output file will be empty or not created if it doesn't exist.")
+        print("✅ Done.")
+        sys.exit(0) # Exit cleanly, no results to write
+
+    print(f"🔹 Writing pileups for {len(results)} nodes (total {variants_found_count} variant sites) to JSON: {args.output}")
     start_write_time = time.time()
     try:
         with open(args.output, 'w') as out_f:
-            # Save node IDs as strings for compatibility, consistent with cache saving
-            json.dump({str(k): v for k, v in results.items()}, out_f, indent=2)
+            # Save node IDs as strings for JSON keys
+            json.dump({str(k): v for k, v in results.items()}, out_f) # No indent for smaller file size
         write_elapsed_time = time.time() - start_write_time
         print(f"✔ Output written in {write_elapsed_time:.2f} seconds.")
         print(f"✅ Done. Output saved to {args.output}")
-    except IOError as ioe:
-         print(f"❌ Error writing output JSON to {args.output}: {ioe}", file=sys.stderr)
-         sys.exit(1)
     except Exception as e:
-         print(f"❌ Unexpected error writing output JSON: {e}", file=sys.stderr)
+         print(f"❌ Error writing output JSON to {args.output}: {e}", file=sys.stderr)
          sys.exit(1)
 
 
 if __name__ == '__main__':
-    # Good practice: protect the main execution block
-    # This is necessary for multiprocessing on some platforms (like Windows)
     main()
