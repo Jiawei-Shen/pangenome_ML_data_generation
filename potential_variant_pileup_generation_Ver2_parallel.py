@@ -483,7 +483,7 @@ def main():
                  nodes_processed_count += 1
                  if pileup_dict:
                      results[node_id] = pileup_dict # Store using integer key
-                 if nodes_processed_count % max(1, total_tasks // 20) == 0 or nodes_processed_count == total_tasks:
+                 if nodes_processed_count % max(1, total_tasks // 20000) == 0 or nodes_processed_count == total_tasks:
                      elapsed = time.time() - start_proc_time
                      rate = nodes_processed_count / elapsed if elapsed > 0 else 0
                      print(f"  Processed {nodes_processed_count}/{total_tasks} nodes ({len(results)} with pileups). Rate: {rate:.1f} nodes/s. Elapsed: {elapsed:.2f}s")
