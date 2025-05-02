@@ -499,7 +499,6 @@ def process_node_parallel(task_args):
 
 
     # print(f"[Worker {os.getpid()}] Finished node {node_id}. Generated pileups for {len(final_pileups)} variants.")
-    print(node_id, final_pileups, '\n\n')
     return node_id, final_pileups
 
 # ─────────────────────────────────────────────────────────────────────────────
