@@ -450,9 +450,12 @@ def main():
             tasks.append((node_id, file_read_offset, n_records, sequence, args.window))
         else:
             nodes_missing_sequence += 1
-    if skipped_nodes_no_records > 0: print(f"ℹ️ Note: {skipped_nodes_no_records} nodes were filtered due to 0 records in index.")
-    if nodes_missing_sequence > 0: print(f"⚠️ Warning: Skipped {nodes_missing_sequence} nodes present in index (with records) but sequence data was not found/loaded.")
-    if not tasks: print("❌ Error: No tasks to process (no nodes with both index records and sequence data found). Exiting.", file=sys.stderr); sys.exit(1)
+    if skipped_nodes_no_records > 0:
+        print(f"ℹ️ Note: {skipped_nodes_no_records} nodes were filtered due to 0 records in index.")
+    if nodes_missing_sequence > 0:
+        print(f"⚠️ Warning: Skipped {nodes_missing_sequence} nodes present in index (with records) but sequence data was not found/loaded.")
+    if not tasks:
+        print("❌ Error: No tasks to process (no nodes with both index records and sequence data found). Exiting.", file=sys.stderr); sys.exit(1)
 
     total_tasks = len(tasks)
     num_workers = min(args.workers, total_tasks, os.cpu_count() or 1)
