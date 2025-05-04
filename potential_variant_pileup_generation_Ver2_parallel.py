@@ -263,8 +263,10 @@ def process_node_parallel(task_args):
     # (Function unchanged - kept for brevity)
     node_id, file_read_offset, n_records, node_sequence, window_size = task_args
     global worker_dat_file
-    if worker_dat_file is None: return node_id, {}
-    if not node_sequence: return node_id, {}
+    if worker_dat_file is None:
+        return node_id, {}
+    if not node_sequence:
+        return node_id, {}
 
     node_len = len(node_sequence)
     half_window = window_size // 2
@@ -307,16 +309,22 @@ def process_node_parallel(task_args):
 
             except struct.error as se: break
             except Exception as e_inner: continue
-    except IOError as ioe: return node_id, {}
-    except Exception as e_outer: return node_id, {}
+    except IOError as ioe:
+        return node_id, {}
+    except Exception as e_outer:
+        return node_id, {}
 
     final_pileups = {}
-    if not reads_by_variant: return node_id, {}
+    if not reads_by_variant:
+        return node_id, {}
 
     for variant_key, supporting_reads in reads_by_variant.items():
-        if not supporting_reads: continue
-        try: vpos = int(variant_key.split('_')[0])
-        except (ValueError, IndexError): continue
+        if not supporting_reads:
+            continue
+        try:
+            vpos = int(variant_key.split('_')[0])
+        except (ValueError, IndexError):
+            continue
 
         if node_len <= window_size:
             window_start = 0
@@ -335,7 +343,8 @@ def process_node_parallel(task_args):
         pileup_rows = []
         for read_offset, read_seq, read_cigar_ops in supporting_reads: # Renamed cigar_ops
             row = create_pileup_row(read_seq, read_offset, read_cigar_ops, window_start, window_end)
-            if row: pileup_rows.append(row)
+            if row:
+                pileup_rows.append(row)
         if pileup_rows:
             # Store window start/end with pileup? Might be useful later.
             # final_pileups[variant_key] = {"window": [window_start, window_end], "pileup": pileup_rows}
