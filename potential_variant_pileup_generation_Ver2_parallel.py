@@ -8,7 +8,8 @@ import time
 import numpy as np # Using numpy for efficient pileup matrix creation (optional)
 from collections import defaultdict
 import re # Import re at the top level
-from concurrent.futures import ProcessPoolExecutor
+# Import ProcessPoolExecutor and as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 # from os import cpu_count # Can uncomment to default workers
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -26,7 +27,7 @@ DEFAULT_WINDOW_SIZE = 100
 worker_dat_file = None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helper Functions (Unchanged from previous version)
+# Helper Functions (Unchanged from your provided script)
 
 def reverse_complement(sequence):
     """Computes the reverse complement of a DNA sequence."""
@@ -212,7 +213,7 @@ def load_node_sequences_from_gfa(gfa_path, target_node_ids):
              for line in f:
                  line_counter += 1
                  if line_counter % 5_000_000 == 0:
-                     print(f"  Checked {line_counter:,} lines... found {nodes_found_count}/{len(target_node_ids)} target sequences.")
+                     print(f"  Checked {line_counter:,} lines... found {nodes_found_count}/{len(target_node_ids)} target sequences.", end='\r')
                  if not line.startswith('S\t'): continue
                  parts = line.strip().split('\t')
                  if len(parts) < 3: continue
@@ -225,9 +226,9 @@ def load_node_sequences_from_gfa(gfa_path, target_node_ids):
                          nodes_found_count += 1
                          target_node_set.remove(nid)
                          if not target_node_set:
-                            print(f"✔ Found all {len(target_node_ids)} target sequences after {line_counter:,} lines.")
+                            print(f"\n✔ Found all {len(target_node_ids)} target sequences after {line_counter:,} lines.")
                             break
-             print(f"✔ Finished checking {line_counter:,} lines in GFA.")
+             print(f"\n✔ Finished checking {line_counter:,} lines in GFA.") # Ensure newline after progress
              print(f"✔ Loaded sequences for {len(node_sequences)} target nodes.")
              if target_node_set:
                   print(f"⚠️ Warning: Did not find sequences for {len(target_node_set)} target node(s), e.g., {list(target_node_set)[:5]}.", file=sys.stderr)
@@ -259,7 +260,7 @@ def process_node_parallel(task_args):
     """
     Function executed by each worker process. Processes a single node.
     """
-    # (Function unchanged - kept for brevity, assumes correctness from previous step)
+    # (Function unchanged - kept for brevity)
     node_id, file_read_offset, n_records, node_sequence, window_size = task_args
     global worker_dat_file
     if worker_dat_file is None: return node_id, {}
@@ -325,6 +326,7 @@ def process_node_parallel(task_args):
             center_pos = vpos
             window_start = max(0, center_pos - half_window)
             window_end = min(node_len, window_start + window_size)
+            # Ensure window doesn't shrink at the start if variant is near beginning
             window_start = max(0, window_end - window_size)
             actual_window_len = window_end - window_start
 
@@ -335,9 +337,13 @@ def process_node_parallel(task_args):
             row = create_pileup_row(read_seq, read_offset, read_cigar_ops, window_start, window_end)
             if row: pileup_rows.append(row)
         if pileup_rows:
-            final_pileups[variant_key] = pileup_rows
+            # Store window start/end with pileup? Might be useful later.
+            # final_pileups[variant_key] = {"window": [window_start, window_end], "pileup": pileup_rows}
+            final_pileups[variant_key] = pileup_rows # Keep original format for now
 
-    # print(node_id, final_pileups, '\n\n')
+
+    # Consider removing this print or making it conditional for less verbose output
+    # if final_pileups: print(f"[Worker {os.getpid()}] Node {node_id}: Found {len(final_pileups)} variant sites.")
     return node_id, final_pileups
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -356,53 +362,47 @@ def main():
     # --- End Re-added Cache Arguments ---
     parser.add_argument("--window", type=int, default=DEFAULT_WINDOW_SIZE, help="Pileup window size around variant")
     parser.add_argument("-w", "--workers", type=int, default=os.cpu_count(), help="Number of worker processes to use")
-    parser.add_argument("-c", "--chunksize", type=int, default=100, help="Approximate number of nodes per worker task")
+    # --- chunksize is not directly used by submit/as_completed, keep for progress reporting ---
+    parser.add_argument("-c", "--chunksize", type=int, default=100, help="Value used for progress update frequency")
     args = parser.parse_args()
 
-    # --- Input Validation ---
+    # --- Input Validation (Unchanged) ---
     if not os.path.isfile(args.dat): print(f"❌ Error: DAT file not found: {args.dat}", file=sys.stderr); sys.exit(1)
     if not os.path.isfile(args.idx): print(f"❌ Error: Index file not found: {args.idx}", file=sys.stderr); sys.exit(1)
-    # --- Cache/GFA Validation ---
     if not args.load_cache and not args.gfa:
         print("❌ Error: You must provide either a GFA file (`--gfa`) to build node sequences or a pre-built cache file (`--load-cache`).", file=sys.stderr)
         sys.exit(1)
     if args.load_cache and args.gfa:
         print("ℹ️ Info: Both --gfa and --load-cache provided. Will use the cache file if it exists.")
     if args.load_cache and not os.path.isfile(args.load_cache):
-        # If cache specified but not found, *and* GFA *is* provided, proceed to build from GFA.
         if args.gfa:
             print(f"⚠️ Warning: Specified cache file '{args.load_cache}' not found. Will build sequences from GFA '{args.gfa}'.")
         else:
              print(f"❌ Error: Specified cache file to load does not exist: {args.load_cache}, and no GFA provided.", file=sys.stderr)
-             sys.exit(1) # Cannot proceed without sequences
+             sys.exit(1)
     if args.gfa and not os.path.isfile(args.gfa):
-        # If GFA is needed (no cache specified or cache not found) but GFA doesn't exist.
         if not (args.load_cache and os.path.isfile(args.load_cache)):
              print(f"❌ Error: GFA file not found: {args.gfa}", file=sys.stderr)
              sys.exit(1)
-    # --- End Cache/GFA Validation ---
     if args.window <= 0: print(f"❌ Error: Window size (--window={args.window}) must be positive.", file=sys.stderr); sys.exit(1)
 
-    # --- Load Index ---
+    # --- Load Index (Unchanged) ---
     print("🔹 Parsing index file...")
     start_time = time.time()
     node_index = parse_idx_file(args.idx)
     if not node_index: print("❌ Error: Failed to parse node index. Exiting.", file=sys.stderr); sys.exit(1)
     print(f"✔ Index parsing took {time.time() - start_time:.2f} seconds.")
-    target_ids = node_index.keys() # Get target IDs needed from index
+    target_ids = node_index.keys()
 
-    # --- Load or Build Node Sequences (with Cache Logic) ---
+    # --- Load or Build Node Sequences (Unchanged) ---
     node_sequences = {}
     loaded_from_cache = False
-
-    # Try loading from cache first if specified and exists
     if args.load_cache and os.path.isfile(args.load_cache):
         print(f"🔹 Loading node sequences from cache: {args.load_cache}...")
         start_time = time.time()
         try:
             with open(args.load_cache, 'r') as cf:
                 loaded_data = json.load(cf)
-                # Convert keys back to integers and filter for needed IDs
                 node_sequences = {int(k): v for k, v in loaded_data.items() if int(k) in target_ids}
             print(f"✔ Loaded {len(node_sequences)} required sequences from cache in {time.time() - start_time:.2f} seconds.")
             loaded_from_cache = True
@@ -411,21 +411,17 @@ def main():
         except Exception as e:
              print(f"❌ Error loading cache file {args.load_cache}: {e}. Will attempt to build from GFA if provided.", file=sys.stderr)
 
-    # If not loaded from cache, try building from GFA if provided
     if not loaded_from_cache:
-        if args.gfa: # GFA must be provided if not loading from valid cache
+        if args.gfa:
             print(f"🔹 Building node sequence cache from GFA: {args.gfa}...")
             start_time = time.time()
             node_sequences = load_node_sequences_from_gfa(args.gfa, target_ids)
             print(f"✔ Sequence loading from GFA took {time.time() - start_time:.2f} seconds.")
-
-            # Save to cache if requested
             if args.save_cache:
                 print(f"🔹 Saving {len(node_sequences)} node sequences to cache: {args.save_cache}...")
                 start_time = time.time()
                 try:
                     with open(args.save_cache, 'w') as cf:
-                        # Save keys as strings in JSON
                         json.dump({str(k): v for k, v in node_sequences.items()}, cf)
                     print(f"✔ Saved cache in {time.time() - start_time:.2f} seconds.")
                 except IOError as ioe:
@@ -433,33 +429,27 @@ def main():
                 except Exception as e:
                      print(f"❌ Error during cache saving to {args.save_cache}: {e}", file=sys.stderr)
         else:
-            # This case should be prevented by initial validation, but is a fallback.
              print("❌ Error: Cannot load sequences. No valid cache file provided or found, and no GFA file specified.", file=sys.stderr)
              sys.exit(1)
 
-    # Final check if sequences were obtained
     if not node_sequences:
          print("❌ Error: Failed to load or build any required node sequences. Exiting.", file=sys.stderr)
          sys.exit(1)
 
-    # --- Prepare Tasks for Parallel Processing ---
+    # --- Prepare Tasks (Unchanged) ---
     print("🔹 Preparing tasks for parallel processing...")
     tasks = []
     nodes_missing_sequence = 0
     skipped_nodes_no_records = 0
-
     for node_id, (file_read_offset, n_records) in node_index.items():
         if n_records <= 0:
             skipped_nodes_no_records += 1
             continue
-
-        sequence = node_sequences.get(node_id) # Get sequence using integer key
+        sequence = node_sequences.get(node_id)
         if sequence is not None:
             tasks.append((node_id, file_read_offset, n_records, sequence, args.window))
         else:
-            # Node in index (with records) but sequence missing from cache/GFA
             nodes_missing_sequence += 1
-
     if skipped_nodes_no_records > 0: print(f"ℹ️ Note: {skipped_nodes_no_records} nodes were filtered due to 0 records in index.")
     if nodes_missing_sequence > 0: print(f"⚠️ Warning: Skipped {nodes_missing_sequence} nodes present in index (with records) but sequence data was not found/loaded.")
     if not tasks: print("❌ Error: No tasks to process (no nodes with both index records and sequence data found). Exiting.", file=sys.stderr); sys.exit(1)
@@ -467,10 +457,11 @@ def main():
     total_tasks = len(tasks)
     num_workers = min(args.workers, total_tasks, os.cpu_count() or 1)
     if num_workers <= 0: num_workers = 1
-    print(f"🔹 Processing {total_tasks} nodes using {num_workers} workers (chunksize: {args.chunksize})...")
+    print(f"🔹 Processing {total_tasks} nodes using {num_workers} workers...") # Chunksize note removed
 
-    # --- Execute in Parallel ---
+    # --- Execute in Parallel using submit and as_completed --- MODIFIED SECTION ---
     results = {}
+    futures = [] # List to hold Future objects
     start_proc_time = time.time()
     nodes_processed_count = 0
 
@@ -478,24 +469,53 @@ def main():
         with ProcessPoolExecutor(max_workers=num_workers,
                                  initializer=init_worker,
                                  initargs=(args.dat,)) as executor:
-            future_results = executor.map(process_node_parallel, tasks, chunksize=args.chunksize)
-            for node_id, pileup_dict in future_results:
+            # Submit all tasks
+            print(f"🔹 Submitting {total_tasks} tasks...")
+            for task_args in tasks:
+                future = executor.submit(process_node_parallel, task_args)
+                futures.append(future)
+            print(f"✔ All {len(futures)} tasks submitted.")
+
+            # Process results as they complete
+            print(f"🔹 Waiting for results...")
+            # Use args.chunksize here only to determine progress update frequency
+            progress_update_interval = max(1, int(args.chunksize * num_workers / 2)) # Heuristic
+
+            for future in as_completed(futures):
                  nodes_processed_count += 1
-                 if pileup_dict:
-                     results[node_id] = pileup_dict # Store using integer key
-                 if nodes_processed_count % max(1, total_tasks // 20) == 0 or nodes_processed_count == total_tasks:
+                 try:
+                     # Get the result from the completed future
+                     node_id, pileup_dict = future.result()
+
+                     # Aggregate results if not empty
+                     if pileup_dict:
+                         results[node_id] = pileup_dict # Store using integer key
+
+                 except Exception as exc:
+                      # Handle potential exceptions raised in the worker process
+                      print(f"\n❌ Task resulted in an exception: {exc}", file=sys.stderr)
+                      # Consider logging more details if possible/needed
+
+                 # Progress Reporting
+                 if nodes_processed_count % progress_update_interval == 0 or nodes_processed_count == total_tasks:
                      elapsed = time.time() - start_proc_time
                      rate = nodes_processed_count / elapsed if elapsed > 0 else 0
-                     print(f"  Processed {nodes_processed_count}/{total_tasks} nodes ({len(results)} with pileups). Rate: {rate:.1f} nodes/s. Elapsed: {elapsed:.2f}s")
+                     eta = (total_tasks - nodes_processed_count) / rate if rate > 0 else 0
+                     print(f"  Processed: {nodes_processed_count}/{total_tasks} tasks ({len(results)} nodes with results). Rate: {rate:.1f}/s. ETA: {eta:.1f}s.", end='\r')
+
     except Exception as pool_exc:
-         print(f"\n❌ An error occurred during parallel processing: {pool_exc}", file=sys.stderr)
+         print(f"\n❌ An error occurred during parallel processing setup or management: {pool_exc}", file=sys.stderr)
          print("⚠️ Attempting to write any partial results obtained...", file=sys.stderr)
+    finally:
+        print() # Ensure the cursor moves to the next line after progress updates finish
+
+    # --- END MODIFIED SECTION ---
 
     total_elapsed_time = time.time() - start_proc_time
     print(f"✔ Parallel processing finished in {total_elapsed_time:.2f} seconds.")
     print(f"✔ Found pileups for {len(results)} nodes.")
 
-    # --- Write Output ---
+    # --- Write Output (Unchanged) ---
     print(f"🔹 Writing {len(results)} node results to JSON: {args.output}")
     start_write_time = time.time()
     try:
