@@ -486,6 +486,7 @@ def main():
             for task_args in tasks:
                 future = executor.submit(process_node_parallel, task_args)
                 futures.append(future)
+                print(futures)
             print(f"✔ All {len(futures)} tasks submitted.")
 
             # Process results as they complete
