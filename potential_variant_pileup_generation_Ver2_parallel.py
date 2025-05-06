@@ -359,10 +359,10 @@ def main():
     parser.add_argument("--load-cache", help="JSON cache file for node sequences")
     parser.add_argument("--save-cache", help="JSON cache file to save node sequences")
     parser.add_argument("--window", type=int, default=DEFAULT_WINDOW_SIZE, help="Pileup window size")
-    parser.add_argument("-w", "--workers", type=int, default=8, help="Number of worker processes")
-    parser.add_argument("--progress-interval", type=int, default=10000,
+    parser.add_argument("-w", "--workers", type=int, default=os.cpu_count(), help="Number of worker processes")
+    parser.add_argument("--progress-interval", type=int, default=1000,
                         help="Write results to file and print progress every N completed tasks.")
-    parser.add_argument("--max-active-futures", type=int, default=100,
+    parser.add_argument("--max-active-futures", type=int, default=0,
                         help="Max futures in flight (0 for num_workers * 2, min 1)")
 
     args = parser.parse_args()
@@ -568,9 +568,10 @@ def main():
                         not future_to_node_id:  # Update on the very last one too
                     elapsed = time.time() - overall_start_time
                     rate = nodes_completed_count / elapsed if elapsed > 0 else 0
-                    print(
-                        f"  Progress: {nodes_completed_count}/{total_tasks_to_process} done. {len(future_to_node_id)} active. Rate: {rate:.1f}/s. Written: {total_nodes_with_pileups_written}",
-                        end='\r', flush=True)
+                    print(f"  Progress: {nodes_completed_count}/{total_tasks_to_process} done. {len(future_to_node_id)} active. Rate: {rate:.1f}/s. Written: {total_nodes_with_pileups_written}")
+                    # print(
+                    #     f"  Progress: {nodes_completed_count}/{total_tasks_to_process} done. {len(future_to_node_id)} active. Rate: {rate:.1f}/s. Written: {total_nodes_with_pileups_written}",
+                    #     end='\r', flush=True)
 
                 break  # Break from inner as_completed loop to re-evaluate while & get fresh active_futures_list
             else:  # Inner loop completed without break (all futures in current snapshot processed)
