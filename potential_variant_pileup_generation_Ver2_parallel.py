@@ -197,8 +197,8 @@ def load_node_sequences_from_gfa(gfa_path, target_node_ids_set):
                 line_counter += 1
                 if not current_target_ids_set: break
                 if line_counter % 1_000_000 == 0: print(
-                    f"  GFA Checked {line_counter:,} lines... found {nodes_found_count}/{len(target_node_ids_set)} target sequences.")
-                    # end='\r', flush=True)
+                    f"  GFA Checked {line_counter:,} lines... found {nodes_found_count}/{len(target_node_ids_set)} target sequences.",
+                    end='\r', flush=True)
                 if not line.startswith('S\t'): continue
                 parts = line.strip().split('\t')
                 if len(parts) < 3: continue
@@ -524,9 +524,13 @@ def main():
                     elapsed = time.time() - overall_start_time
                     rate = nodes_completed_count / elapsed if elapsed > 0 else 0
                     # ETA calculation is more complex here as submission isn't all at once
+                    # print(
+                    #     f"  Progress: {nodes_completed_count}/{total_tasks_to_process} done. {len(future_to_node_id)} active. {tasks_submitted_count} submitted. Rate: {rate:.1f}/s. Elapsed: {elapsed:.2f}s",
+                    #     end='\r', flush=True)
+
                     print(
-                        f"  Progress: {nodes_completed_count}/{total_tasks_to_process} done. {len(future_to_node_id)} active. {tasks_submitted_count} submitted. Rate: {rate:.1f}/s. Elapsed: {elapsed:.2f}s",
-                        end='\r', flush=True)
+                        f"  Progress: {nodes_completed_count}/{total_tasks_to_process} done. {len(future_to_node_id)} active. {tasks_submitted_count} submitted. Rate: {rate:.1f}/s. Elapsed: {elapsed:.2f}s")
+
 
                 # After processing one future from as_completed, we break from this inner loop.
                 # This allows the outer 'while future_to_node_id:' loop to re-evaluate
