@@ -496,8 +496,7 @@ def main():
                     rate = nodes_completed_count / elapsed if elapsed > 0 else 0
                     mem_rss_mb = main_process.memory_info().rss / (1024 * 1024)
                     print(
-                        f"  Progress: {nodes_completed_count}/{total_tasks_to_process} done. {len(future_to_node_id)} active. Rate: {rate:.1f}/s. Mem: {mem_rss_mb:.1f}MB. Written: {total_nodes_with_pileups_written}",
-                        end='\r')
+                        f"  Progress: {nodes_completed_count}/{total_tasks_to_process} done. {len(future_to_node_id)} active. Rate: {rate:.1f}/s. Mem: {mem_rss_mb:.1f}MB. Written: {total_nodes_with_pileups_written}")
                 break
             else:
                 if not future_to_node_id: break
