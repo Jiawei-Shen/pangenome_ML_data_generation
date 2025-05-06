@@ -38,7 +38,7 @@ def parse_cigar(cigar_string):
     try:
         return [(int(length), op) for length, op in re.findall(r'(\d+)([MIDNSHPX=])', cigar_string)]
     except Exception as e:
-        print(f"⚠️ Warning: Could not parse CIGAR string '{cigar_string}': {e}", file=sys.stderr, flush=True)
+        print(f"⚠️ Warning: Could not parse CIGAR string '{cigar_string}': {e}", file=sys.stderr)
         return []
 
 
@@ -83,9 +83,9 @@ def detect_variants_core(ref_seq, read_seq, start_offset, cigar_ops):
     except IndexError:
         print(
             f"⚠️ Warning: IndexError during variant detection. RefLen={ref_len}, ReadLen={read_len}, Offset={start_offset}, CIGAR='{''.join(map(str, cigar_ops))}', RefPtr={ref_ptr}, ReadPtr={read_ptr}",
-            file=sys.stderr, flush=True)
+            file=sys.stderr)
     except Exception as e:
-        print(f"❌ Error: Unexpected error in detect_variants_core: {e}", file=sys.stderr, flush=True)
+        print(f"❌ Error: Unexpected error in detect_variants_core: {e}", file=sys.stderr)
 
 
 def create_pileup_row(read_seq, read_offset, cigar_ops, window_start, window_end):
@@ -135,9 +135,9 @@ def create_pileup_row(read_seq, read_offset, cigar_ops, window_start, window_end
     except IndexError:
         print(
             f"⚠️ Warning: IndexError during pileup creation. ReadLen={read_len}, Offset={read_offset}, CIGAR='{''.join(map(str, cigar_ops))}', RefPtr={ref_ptr}, ReadPtr={read_ptr}, Win=[{window_start}:{window_end}]",
-            file=sys.stderr, flush=True); return pileup_row if row_filled else None
+            file=sys.stderr); return pileup_row if row_filled else None
     except Exception as e:
-        print(f"❌ Error: Unexpected error in create_pileup_row: {e}", file=sys.stderr, flush=True); return None
+        print(f"❌ Error: Unexpected error in create_pileup_row: {e}", file=sys.stderr); return None
 
 
 def parse_idx_file(idx_path):
@@ -145,37 +145,35 @@ def parse_idx_file(idx_path):
     try:
         with open(idx_path, 'rb') as f:
             file_size = os.fstat(f.fileno()).st_size
-            if file_size < 4: print(f"❌ Error: Index file {idx_path} is too small.", file=sys.stderr,
-                                    flush=True); sys.exit(1)
+            if file_size < 4: print(f"❌ Error: Index file {idx_path} is too small.", file=sys.stderr); sys.exit(1)
             num_nodes_bytes = f.read(4)
             if len(num_nodes_bytes) < 4: print(f"❌ Error: Could not read number of nodes from {idx_path}.",
-                                               file=sys.stderr, flush=True); sys.exit(1)
+                                               file=sys.stderr); sys.exit(1)
             num_nodes_header = struct.unpack('<I', num_nodes_bytes)[0]
             expected_min_size = 4 + num_nodes_header * 22
             if file_size < expected_min_size: print(
                 f"⚠️ Warning: Index file {idx_path} may be truncated. Expected {expected_min_size}, found {file_size}.",
-                file=sys.stderr, flush=True)
-            print(f"🔹 Reading index for up to {num_nodes_header} nodes (from header)...", flush=True)
+                file=sys.stderr)
+            print(f"🔹 Reading index for up to {num_nodes_header} nodes (from header)...")
             nodes_parsed_count = 0
             for i in range(num_nodes_header):
                 record_bytes = f.read(22)
                 if len(record_bytes) < 22: print(
                     f"❌ Error: Index file ended prematurely reading record {i + 1}/{num_nodes_header}.",
-                    file=sys.stderr, flush=True); break
+                    file=sys.stderr); break
                 node_id, offset, _, n_records, _ = struct.unpack('<I Q I I H', record_bytes)
                 if n_records > 0: node_index[node_id] = (offset, n_records); nodes_parsed_count += 1
-            print(f"✔ Parsed {nodes_parsed_count} nodes with records from index file.", flush=True)
+            print(f"✔ Parsed {nodes_parsed_count} nodes with records from index file.")
             if nodes_parsed_count == 0 and num_nodes_header > 0:
-                print(f"⚠️ Warning: Header {num_nodes_header} nodes, but 0 with records found.", file=sys.stderr,
-                      flush=True)
+                print(f"⚠️ Warning: Header {num_nodes_header} nodes, but 0 with records found.", file=sys.stderr)
             elif len(node_index) != num_nodes_header and nodes_parsed_count > 0 and file_size >= expected_min_size:
                 print(f"⚠️ Warning: Header {num_nodes_header} nodes, parsed {nodes_parsed_count} with records.",
-                      file=sys.stderr, flush=True)
+                      file=sys.stderr)
             return node_index
     except FileNotFoundError:
-        print(f"❌ Error: Index file not found at {idx_path}", file=sys.stderr, flush=True); sys.exit(1)
+        print(f"❌ Error: Index file not found at {idx_path}", file=sys.stderr); sys.exit(1)
     except Exception as e:
-        print(f"❌ Error parsing index file {idx_path}: {e}", file=sys.stderr, flush=True); sys.exit(1)
+        print(f"❌ Error parsing index file {idx_path}: {e}", file=sys.stderr); sys.exit(1)
 
 
 def load_node_sequences_from_gfa(gfa_path, target_node_ids_set):
@@ -184,15 +182,14 @@ def load_node_sequences_from_gfa(gfa_path, target_node_ids_set):
     current_target_ids_set = set(target_node_ids_set)
     try:
         with open(gfa_path, 'r') as f:
-            print(f"🔹 Reading GFA file: {gfa_path} for up to {len(current_target_ids_set)} target sequences...",
-                  flush=True)
+            print(f"🔹 Reading GFA file: {gfa_path} for up to {len(current_target_ids_set)} target sequences...")
             line_counter = 0
             for line in f:
                 line_counter += 1
                 if not current_target_ids_set: break
                 if line_counter % 1_000_000 == 0: print(
                     f"  GFA Checked {line_counter:,} lines... found {nodes_found_count}/{len(target_node_ids_set)} target sequences.",
-                    end='\r', flush=True)
+                    end='\r')
                 if not line.startswith('S\t'): continue
                 parts = line.strip().split('\t')
                 if len(parts) < 3: continue
@@ -206,15 +203,15 @@ def load_node_sequences_from_gfa(gfa_path, target_node_ids_set):
                         node_sequences[nid] = seq;
                         nodes_found_count += 1
                         current_target_ids_set.remove(nid)
-            print(f"\n✔ Finished GFA. Checked {line_counter:,} lines.", flush=True)
-            print(f"✔ Loaded sequences for {len(node_sequences)} target nodes from GFA.", flush=True)
+            print(f"\n✔ Finished GFA. Checked {line_counter:,} lines.")
+            print(f"✔ Loaded sequences for {len(node_sequences)} target nodes from GFA.")
             if current_target_ids_set: print(
                 f"⚠️ Warning (GFA): Did not find sequences for {len(current_target_ids_set)} target node(s), e.g., {list(current_target_ids_set)[:5]}.",
-                file=sys.stderr, flush=True)
+                file=sys.stderr)
     except FileNotFoundError:
-        print(f"❌ Error: GFA file not found at {gfa_path}", file=sys.stderr, flush=True); sys.exit(1)
+        print(f"❌ Error: GFA file not found at {gfa_path}", file=sys.stderr); sys.exit(1)
     except Exception as e:
-        print(f"❌ Error reading GFA file {gfa_path}: {e}", file=sys.stderr, flush=True); sys.exit(1)
+        print(f"❌ Error reading GFA file {gfa_path}: {e}", file=sys.stderr); sys.exit(1)
     return node_sequences
 
 
@@ -223,10 +220,9 @@ def init_worker(dat_file_path):
     try:
         worker_dat_file = open(dat_file_path, 'rb')
     except FileNotFoundError:
-        print(f"❌ Error [Worker {os.getpid()}]: DAT file not found: {dat_file_path}", file=sys.stderr,
-              flush=True); sys.exit(1)
+        print(f"❌ Error [Worker {os.getpid()}]: DAT file not found: {dat_file_path}", file=sys.stderr); sys.exit(1)
     except Exception as e:
-        print(f"❌ Error [Worker {os.getpid()}] opening DAT: {e}", file=sys.stderr, flush=True); sys.exit(1)
+        print(f"❌ Error [Worker {os.getpid()}] opening DAT: {e}", file=sys.stderr); sys.exit(1)
 
 
 def process_node_parallel(task_args):
@@ -308,7 +304,7 @@ def generate_task_args(node_info_list, node_sequences_dict, window_size_arg):
         if sequence:
             tasks_yielded_count += 1
             yield (node_id, file_offset, n_records, sequence, window_size_arg)
-    print(f"\nℹ️ Task generator finished. Yielded {tasks_yielded_count} tasks for processing.", flush=True)
+    print(f"\nℹ️ Task generator finished. Yielded {tasks_yielded_count} tasks for processing.")
 
 
 def write_results_to_jsonl(filepath, results_batch_dict):
@@ -321,9 +317,8 @@ def write_results_to_jsonl(filepath, results_batch_dict):
                 json.dump(record_to_write, outfile)
                 outfile.write('\n')
                 count_written_this_batch += 1
-        # print(f"\n  Appended {count_written_this_batch} node results to {filepath}", flush=True) # Verbose
     except Exception as e:
-        print(f"\n❌ Error writing results batch to {filepath}: {e}", file=sys.stderr, flush=True)
+        print(f"\n❌ Error writing results batch to {filepath}: {e}", file=sys.stderr)
     return count_written_this_batch
 
 
@@ -343,45 +338,40 @@ def main():
                         help="Write results to file and print progress every N completed tasks.")
     parser.add_argument("--max-active-futures", type=int, default=0,
                         help="Max futures in flight (0 for num_workers * 2, min 1)")
+
     args = parser.parse_args()
 
-    # --- Basic File/Arg Validation ---
-    if not os.path.isfile(args.dat): print(f"❌ DAT not found: {args.dat}", file=sys.stderr, flush=True); sys.exit(1)
-    if not os.path.isfile(args.idx): print(f"❌ IDX not found: {args.idx}", file=sys.stderr, flush=True); sys.exit(1)
-    if not args.load_cache and not args.gfa: print("❌ Must provide --gfa or --load-cache.", file=sys.stderr,
-                                                   flush=True); sys.exit(1)
+    if not os.path.isfile(args.dat): print(f"❌ DAT not found: {args.dat}", file=sys.stderr); sys.exit(1)
+    if not os.path.isfile(args.idx): print(f"❌ IDX not found: {args.idx}", file=sys.stderr); sys.exit(1)
+    if not args.load_cache and not args.gfa: print("❌ Must provide --gfa or --load-cache.", file=sys.stderr); sys.exit(
+        1)
     if args.load_cache and not os.path.isfile(args.load_cache) and not args.gfa: print(
-        f"❌ Cache {args.load_cache} not found and no GFA fallback.", file=sys.stderr, flush=True); sys.exit(1)
+        f"❌ Cache {args.load_cache} not found and no GFA fallback.", file=sys.stderr); sys.exit(1)
     if args.gfa and not os.path.isfile(args.gfa) and not (args.load_cache and os.path.isfile(args.load_cache)): print(
-        f"❌ GFA {args.gfa} not found and no valid cache.", file=sys.stderr, flush=True); sys.exit(1)
-    if args.window <= 0: print("❌ Window must be > 0.", file=sys.stderr, flush=True); sys.exit(1)
+        f"❌ GFA {args.gfa} not found and no valid cache.", file=sys.stderr); sys.exit(1)
+    if args.window <= 0: print("❌ Window must be > 0.", file=sys.stderr); sys.exit(1)
 
-    print(f"Script started at {time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    print(f"Script started at {time.strftime('%Y-%m-%d %H:%M:%S')}")
     overall_start_time = time.time()
-
-    # Get current process for memory monitoring
     main_process = psutil.Process(os.getpid())
 
-    try:  # Clear the output file at the beginning
+    try:
         with open(args.output, 'w') as f:
             f.write("")
-        print(f"🔹 Output file {args.output} initialized/cleared.", flush=True)
+        print(f"🔹 Output file {args.output} initialized/cleared.")
     except Exception as e:
-        print(f"❌ Error initializing output file {args.output}: {e}", file=sys.stderr, flush=True); sys.exit(1)
+        print(f"❌ Error initializing output file {args.output}: {e}", file=sys.stderr); sys.exit(1)
 
-    # 1. Load full node_index
     node_index_dict = parse_idx_file(args.idx)
-    if not node_index_dict: print("❌ No nodes in index. Exiting.", file=sys.stderr, flush=True); sys.exit(1)
+    if not node_index_dict: print("❌ No nodes in index. Exiting.", file=sys.stderr); sys.exit(1)
     all_indexed_nodes_info = [(nid, data[0], data[1]) for nid, data in node_index_dict.items()]
-    if not all_indexed_nodes_info: print("❌ No processable nodes in index. Exiting.", file=sys.stderr,
-                                         flush=True); sys.exit(1)
+    if not all_indexed_nodes_info: print("❌ No processable nodes in index. Exiting.", file=sys.stderr); sys.exit(1)
     target_ids_for_sequences = {info[0] for info in all_indexed_nodes_info}
 
-    # 2. Load ALL necessary node_sequences ONCE
     all_node_sequences = {}
     loaded_from_cache = False
     if args.load_cache and os.path.isfile(args.load_cache):
-        print(f"🔹 Loading node sequences from cache: {args.load_cache}...", flush=True)
+        print(f"🔹 Loading node sequences from cache: {args.load_cache}...")
         cache_load_start = time.time()
         try:
             with open(args.load_cache, 'r') as cf:
@@ -393,49 +383,43 @@ def main():
                     continue
                 if k_int in target_ids_for_sequences: all_node_sequences[k_int] = seq_val
             print(
-                f"✔ Loaded {len(all_node_sequences)} relevant sequences from cache in {time.time() - cache_load_start:.2f}s.",
-                flush=True)
+                f"✔ Loaded {len(all_node_sequences)} relevant sequences from cache in {time.time() - cache_load_start:.2f}s.")
             loaded_from_cache = True
         except Exception as e:
-            print(f"❌ Error loading/parsing cache {args.load_cache}: {e}. Will try GFA if provided.", file=sys.stderr,
-                  flush=True)
+            print(f"❌ Error loading/parsing cache {args.load_cache}: {e}. Will try GFA if provided.", file=sys.stderr)
             all_node_sequences = {}
     if not loaded_from_cache or len(all_node_sequences) < len(target_ids_for_sequences):
         if args.gfa:
             print(
-                f"🔹 {'Attempting to load remaining' if loaded_from_cache and len(all_node_sequences) > 0 else 'Loading ALL'} sequences from GFA: {args.gfa}...",
-                flush=True)
+                f"🔹 {'Attempting to load remaining' if loaded_from_cache and len(all_node_sequences) > 0 else 'Loading ALL'} sequences from GFA: {args.gfa}...")
             still_needed_ids = target_ids_for_sequences - set(
                 all_node_sequences.keys()) if loaded_from_cache else target_ids_for_sequences
             if still_needed_ids:
                 gfa_sequences = load_node_sequences_from_gfa(args.gfa, still_needed_ids)
                 all_node_sequences.update(gfa_sequences)
             elif not still_needed_ids and loaded_from_cache:
-                print("ℹ️ All required sequences were already found in cache.", flush=True)
+                print("ℹ️ All required sequences were already found in cache.")
             if args.save_cache and (not loaded_from_cache or (still_needed_ids and gfa_sequences)):
-                print(f"🔹 Saving {len(all_node_sequences)} sequences to cache: {args.save_cache}...", flush=True)
+                print(f"🔹 Saving {len(all_node_sequences)} sequences to cache: {args.save_cache}...")
                 try:
                     with open(args.save_cache, 'w') as cf:
                         json.dump({str(k): v for k, v in all_node_sequences.items()}, cf, indent=2)
-                    print(f"✔ Saved cache to {args.save_cache}", flush=True)
+                    print(f"✔ Saved cache to {args.save_cache}")
                 except Exception as e:
-                    print(f"❌ Error saving cache: {e}", file=sys.stderr, flush=True)
+                    print(f"❌ Error saving cache: {e}", file=sys.stderr)
         elif not all_node_sequences:
-            print("❌ No sequence source for required nodes. Exiting.", file=sys.stderr, flush=True); sys.exit(1)
-    if not all_node_sequences: print("❌ Failed to load any required sequences. Exiting.", file=sys.stderr,
-                                     flush=True); sys.exit(1)
+            print("❌ No sequence source for required nodes. Exiting.", file=sys.stderr); sys.exit(1)
+    if not all_node_sequences: print("❌ Failed to load any required sequences. Exiting.", file=sys.stderr); sys.exit(1)
 
     process_node_info_list = [info for info in all_indexed_nodes_info if info[0] in all_node_sequences]
     total_tasks_to_process = len(process_node_info_list)
-    if not process_node_info_list: print("❌ No nodes to process after matching index with sequences. Exiting.",
-                                         flush=True); sys.exit(1)
+    if not process_node_info_list: print(
+        "❌ No nodes to process after matching index with sequences. Exiting."); sys.exit(1)
     if total_tasks_to_process < len(all_indexed_nodes_info): print(
-        f"ℹ️ Will process {total_tasks_to_process} nodes with sequences (out of {len(all_indexed_nodes_info)} indexed).",
-        flush=True)
+        f"ℹ️ Will process {total_tasks_to_process} nodes with sequences (out of {len(all_indexed_nodes_info)} indexed).")
 
     task_arg_generator = generate_task_args(process_node_info_list, all_node_sequences, args.window)
 
-    # --- Execute in Parallel ---
     total_nodes_with_pileups_written = 0
     results_this_interval = {}
     nodes_processed_since_last_write = 0
@@ -446,11 +430,9 @@ def main():
     max_active_futures = max(1, max_active_futures)
     progress_write_interval = args.progress_interval
 
-    print(f"🔹 Concurrently submitting and processing {total_tasks_to_process} tasks using {num_workers} workers.",
-          flush=True)
-    print(f"   Max active futures to manage: {max_active_futures}", flush=True)
-    print(f"   Will write to output file and print memory approx every {progress_write_interval} completed tasks.",
-          flush=True)
+    print(f"🔹 Concurrently submitting and processing {total_tasks_to_process} tasks using {num_workers} workers.")
+    print(f"   Max active futures to manage: {max_active_futures}")
+    print(f"   Will write to output file and print memory approx every {progress_write_interval} completed tasks.")
 
     nodes_completed_count = 0
     tasks_submitted_count = 0
@@ -464,8 +446,7 @@ def main():
                 tasks_submitted_count += 1
             except StopIteration:
                 break
-        if tasks_submitted_count > 0: print(f"  Initial submission: {tasks_submitted_count} tasks in flight.",
-                                            flush=True)
+        if tasks_submitted_count > 0: print(f"  Initial submission: {tasks_submitted_count} tasks in flight.")
 
         while future_to_node_id:
             active_futures_list = list(future_to_node_id.keys())
@@ -478,15 +459,15 @@ def main():
                     _ret_node_id, pileup_dict = future.result()
                     if _ret_node_id != original_node_id: print(
                         f"⚠️ Main: Node ID mismatch! Original: {original_node_id}, Returned: {_ret_node_id}",
-                        file=sys.stderr, flush=True)
+                        file=sys.stderr)
                     if pileup_dict and not (isinstance(pileup_dict, dict) and "error" in pileup_dict) and pileup_dict:
                         results_this_interval[original_node_id] = pileup_dict
                     elif isinstance(pileup_dict, dict) and "error" in pileup_dict:
                         print(f"  ℹ️ Worker for node {original_node_id} reported error: {pileup_dict['error']}",
-                              file=sys.stderr, flush=True)
+                              file=sys.stderr)
                 except Exception as exc:
                     print(f"\n❌ Task for node {original_node_id} generated exception during result retrieval: {exc}",
-                          file=sys.stderr, flush=True)
+                          file=sys.stderr)
 
                 if len(future_to_node_id) < max_active_futures:
                     try:
@@ -508,8 +489,6 @@ def main():
                     results_this_interval.clear()
                     nodes_processed_since_last_write = 0
 
-                # Condition for printing progress
-                # Print if interval reached, or all tasks completed, or no more active futures
                 if nodes_completed_count % progress_write_interval == 0 or \
                         nodes_completed_count == total_tasks_to_process or \
                         not future_to_node_id:
@@ -518,20 +497,19 @@ def main():
                     mem_rss_mb = main_process.memory_info().rss / (1024 * 1024)
                     print(
                         f"  Progress: {nodes_completed_count}/{total_tasks_to_process} done. {len(future_to_node_id)} active. Rate: {rate:.1f}/s. Mem: {mem_rss_mb:.1f}MB. Written: {total_nodes_with_pileups_written}",
-                        end='\r', flush=True)
+                        end='\r')
                 break
             else:
                 if not future_to_node_id: break
 
-    if results_this_interval:  # Final write for any remaining results
-        # print(f"\n  Writing final batch of {len(results_this_interval)} results...", flush=True) # Optional
+    if results_this_interval:  # Final write
         num_written_this_batch = write_results_to_jsonl(args.output, results_this_interval)
         total_nodes_with_pileups_written += num_written_this_batch
         results_this_interval.clear()
 
-    print()  # Newline after progress bar
+    print()
     total_script_elapsed = time.time() - overall_start_time
-    mem_rss_mb = main_process.memory_info().rss / (1024 * 1024)  # Final memory
+    mem_rss_mb = main_process.memory_info().rss / (1024 * 1024)
     print(
         f"\n🏁 Finished processing in {total_script_elapsed:.2f} seconds. Final main process memory: {mem_rss_mb:.1f}MB.")
     print(f"🔹 Found and wrote pileups for {total_nodes_with_pileups_written} nodes overall to {args.output}")
