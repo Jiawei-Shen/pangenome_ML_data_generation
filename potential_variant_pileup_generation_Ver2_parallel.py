@@ -10,6 +10,7 @@ import math  # For math.ceil
 from collections import defaultdict
 import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import psutil  # For memory usage reporting
 
 # --- Constants ---
 RECORD_STRUCT = struct.Struct("<h150s150s20shc")
@@ -22,9 +23,8 @@ DEFAULT_WINDOW_SIZE = 100
 worker_dat_file = None  # Global for worker
 
 
-# --- Helper Functions (ellipsis indicates these are from previous versions, assumed correct) ---
+# --- Helper Functions (assumed correct from previous versions) ---
 def reverse_complement(sequence):
-    # ... (implementation from previous script) ...
     if not isinstance(sequence, str): return ""
     try:
         complement_map = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")
@@ -34,7 +34,6 @@ def reverse_complement(sequence):
 
 
 def parse_cigar(cigar_string):
-    # ... (implementation from previous script) ...
     if not cigar_string or cigar_string == '*': return []
     try:
         return [(int(length), op) for length, op in re.findall(r'(\d+)([MIDNSHPX=])', cigar_string)]
@@ -44,7 +43,6 @@ def parse_cigar(cigar_string):
 
 
 def detect_variants_core(ref_seq, read_seq, start_offset, cigar_ops):
-    # ... (implementation from previous script) ...
     ref_len = len(ref_seq);
     read_len = len(read_seq)
     ref_ptr = start_offset;
@@ -91,7 +89,6 @@ def detect_variants_core(ref_seq, read_seq, start_offset, cigar_ops):
 
 
 def create_pileup_row(read_seq, read_offset, cigar_ops, window_start, window_end):
-    # ... (implementation from previous script) ...
     window_len = window_end - window_start
     if window_len <= 0: return None
     pileup_row = [N_INDEX] * window_len;
@@ -144,7 +141,6 @@ def create_pileup_row(read_seq, read_offset, cigar_ops, window_start, window_end
 
 
 def parse_idx_file(idx_path):
-    # ... (implementation from previous script) ...
     node_index = {}
     try:
         with open(idx_path, 'rb') as f:
@@ -183,7 +179,6 @@ def parse_idx_file(idx_path):
 
 
 def load_node_sequences_from_gfa(gfa_path, target_node_ids_set):
-    # ... (implementation from previous script) ...
     node_sequences = {};
     nodes_found_count = 0
     current_target_ids_set = set(target_node_ids_set)
@@ -224,7 +219,6 @@ def load_node_sequences_from_gfa(gfa_path, target_node_ids_set):
 
 
 def init_worker(dat_file_path):
-    # ... (implementation from previous script) ...
     global worker_dat_file
     try:
         worker_dat_file = open(dat_file_path, 'rb')
@@ -236,7 +230,6 @@ def init_worker(dat_file_path):
 
 
 def process_node_parallel(task_args):
-    # ... (implementation from previous script, assumed to be the core logic for one task) ...
     node_id, file_read_offset, n_records, node_sequence, window_size = task_args
     global worker_dat_file
     if worker_dat_file is None: return node_id, {"error": "worker_dat_file not initialized"}
@@ -284,7 +277,7 @@ def process_node_parallel(task_args):
     except Exception as e:
         return node_id, {"error": f"Outer error: {e}"}
 
-    if not reads_by_variant: return node_id, {}  # Return empty dict if no variants for this node
+    if not reads_by_variant: return node_id, {}
     for variant_key, supporting_reads in reads_by_variant.items():
         if not supporting_reads: continue
         try:
@@ -305,44 +298,30 @@ def process_node_parallel(task_args):
             row = create_pileup_row(rs, ro, rco, window_start, window_end)
             if row: pileup_rows.append(row)
         if pileup_rows: final_pileups[variant_key] = pileup_rows
-    return node_id, final_pileups  # Might be empty if no pileup_rows generated
+    return node_id, final_pileups
 
 
-# --- NEW Generator function ---
 def generate_task_args(node_info_list, node_sequences_dict, window_size_arg):
-    """
-    Generator that yields task arguments one by one.
-    Avoids creating a massive list of all task arguments in memory.
-    """
     tasks_yielded_count = 0
     for node_id, file_offset, n_records in node_info_list:
-        sequence = node_sequences_dict.get(node_id)  # Use integer node_id
-        if sequence:  # Only yield tasks for which we have a sequence
+        sequence = node_sequences_dict.get(node_id)
+        if sequence:
             tasks_yielded_count += 1
             yield (node_id, file_offset, n_records, sequence, window_size_arg)
     print(f"\nℹ️ Task generator finished. Yielded {tasks_yielded_count} tasks for processing.", flush=True)
 
 
-# --- NEW function to write results in JSON Lines format ---
 def write_results_to_jsonl(filepath, results_batch_dict):
-    """
-    Appends a dictionary of results to a file in JSON Lines format.
-    Each result for a node becomes a separate JSON object on a new line.
-    Example line: {"node_id_str": pileup_data_for_that_node}
-    """
-    if not results_batch_dict:
-        return 0
-
+    if not results_batch_dict: return 0
     count_written_this_batch = 0
     try:
-        with open(filepath, 'a') as outfile:  # Append mode
+        with open(filepath, 'a') as outfile:
             for node_id, pileup_data in results_batch_dict.items():
-                # Each line is a self-contained JSON object representing one node's results
                 record_to_write = {str(node_id): pileup_data}
                 json.dump(record_to_write, outfile)
                 outfile.write('\n')
                 count_written_this_batch += 1
-        # print(f"\n  Appended {count_written_this_batch} node results to {filepath}", flush=True) # Can be verbose
+        # print(f"\n  Appended {count_written_this_batch} node results to {filepath}", flush=True) # Verbose
     except Exception as e:
         print(f"\n❌ Error writing results batch to {filepath}: {e}", file=sys.stderr, flush=True)
     return count_written_this_batch
@@ -364,7 +343,6 @@ def main():
                         help="Write results to file and print progress every N completed tasks.")
     parser.add_argument("--max-active-futures", type=int, default=0,
                         help="Max futures in flight (0 for num_workers * 2, min 1)")
-
     args = parser.parse_args()
 
     # --- Basic File/Arg Validation ---
@@ -381,33 +359,27 @@ def main():
     print(f"Script started at {time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
     overall_start_time = time.time()
 
-    # Clear/Create the output file at the beginning of the run
-    try:
+    # Get current process for memory monitoring
+    main_process = psutil.Process(os.getpid())
+
+    try:  # Clear the output file at the beginning
         with open(args.output, 'w') as f:
-            f.write("")  # Ensures file is empty if it existed, or creates it
+            f.write("")
         print(f"🔹 Output file {args.output} initialized/cleared.", flush=True)
     except Exception as e:
-        print(f"❌ Error initializing output file {args.output}: {e}", file=sys.stderr, flush=True)
-        sys.exit(1)
+        print(f"❌ Error initializing output file {args.output}: {e}", file=sys.stderr, flush=True); sys.exit(1)
 
     # 1. Load full node_index
     node_index_dict = parse_idx_file(args.idx)
     if not node_index_dict: print("❌ No nodes in index. Exiting.", file=sys.stderr, flush=True); sys.exit(1)
-
-    all_indexed_nodes_info = []  # List of (node_id_int, offset, n_records)
-    for nid_int, data_tuple in node_index_dict.items():
-        all_indexed_nodes_info.append((nid_int, data_tuple[0], data_tuple[1]))
-
-    if not all_indexed_nodes_info:
-        print("❌ No processable nodes found in index. Exiting.", file=sys.stderr, flush=True);
-        sys.exit(1)
-
+    all_indexed_nodes_info = [(nid, data[0], data[1]) for nid, data in node_index_dict.items()]
+    if not all_indexed_nodes_info: print("❌ No processable nodes in index. Exiting.", file=sys.stderr,
+                                         flush=True); sys.exit(1)
     target_ids_for_sequences = {info[0] for info in all_indexed_nodes_info}
 
     # 2. Load ALL necessary node_sequences ONCE
-    all_node_sequences = {}  # Integer node_id -> sequence string
+    all_node_sequences = {}
     loaded_from_cache = False
-    # ... (Cache loading logic from previous script, ensuring all_node_sequences is populated) ...
     if args.load_cache and os.path.isfile(args.load_cache):
         print(f"🔹 Loading node sequences from cache: {args.load_cache}...", flush=True)
         cache_load_start = time.time()
@@ -428,7 +400,6 @@ def main():
             print(f"❌ Error loading/parsing cache {args.load_cache}: {e}. Will try GFA if provided.", file=sys.stderr,
                   flush=True)
             all_node_sequences = {}
-
     if not loaded_from_cache or len(all_node_sequences) < len(target_ids_for_sequences):
         if args.gfa:
             print(
@@ -441,7 +412,6 @@ def main():
                 all_node_sequences.update(gfa_sequences)
             elif not still_needed_ids and loaded_from_cache:
                 print("ℹ️ All required sequences were already found in cache.", flush=True)
-
             if args.save_cache and (not loaded_from_cache or (still_needed_ids and gfa_sequences)):
                 print(f"🔹 Saving {len(all_node_sequences)} sequences to cache: {args.save_cache}...", flush=True)
                 try:
@@ -451,94 +421,73 @@ def main():
                 except Exception as e:
                     print(f"❌ Error saving cache: {e}", file=sys.stderr, flush=True)
         elif not all_node_sequences:
-            print("❌ No sequence source (valid cache or GFA) available for required nodes. Exiting.", file=sys.stderr,
-                  flush=True);
-            sys.exit(1)
-
+            print("❌ No sequence source for required nodes. Exiting.", file=sys.stderr, flush=True); sys.exit(1)
     if not all_node_sequences: print("❌ Failed to load any required sequences. Exiting.", file=sys.stderr,
                                      flush=True); sys.exit(1)
 
-    # Filter node_info_list to only those for which we actually have sequences
     process_node_info_list = [info for info in all_indexed_nodes_info if info[0] in all_node_sequences]
     total_tasks_to_process = len(process_node_info_list)
+    if not process_node_info_list: print("❌ No nodes to process after matching index with sequences. Exiting.",
+                                         flush=True); sys.exit(1)
+    if total_tasks_to_process < len(all_indexed_nodes_info): print(
+        f"ℹ️ Will process {total_tasks_to_process} nodes with sequences (out of {len(all_indexed_nodes_info)} indexed).",
+        flush=True)
 
-    if not process_node_info_list:
-        print("❌ No nodes to process after matching index with available sequences. Exiting.", flush=True);
-        sys.exit(1)
-
-    if total_tasks_to_process < len(all_indexed_nodes_info):
-        print(
-            f"ℹ️ Will process {total_tasks_to_process} nodes for which sequences were loaded (out of {len(all_indexed_nodes_info)} indexed).",
-            flush=True)
-
-    # 3. Create the task generator
     task_arg_generator = generate_task_args(process_node_info_list, all_node_sequences, args.window)
 
-    # --- Execute in Parallel using bounded as_completed with task generator ---
+    # --- Execute in Parallel ---
     total_nodes_with_pileups_written = 0
-    results_this_interval = {}  # Batch of results to write periodically
+    results_this_interval = {}
     nodes_processed_since_last_write = 0
-
-    future_to_node_id = {}  # Map Future objects to their original node_id
-
-    num_workers = min(args.workers, os.cpu_count() or 1, total_tasks_to_process)
-    num_workers = max(1, num_workers)  # Ensure at least one worker
-    max_active_futures = args.max_active_futures if args.max_active_futures > 0 else num_workers * 2
+    future_to_node_id = {}
+    num_workers = min(args.workers, os.cpu_count() or 1, total_tasks_to_process);
+    num_workers = max(1, num_workers)
+    max_active_futures = args.max_active_futures if args.max_active_futures > 0 else num_workers * 2;
     max_active_futures = max(1, max_active_futures)
-
-    progress_write_interval = args.progress_interval  # How often to write to file
+    progress_write_interval = args.progress_interval
 
     print(f"🔹 Concurrently submitting and processing {total_tasks_to_process} tasks using {num_workers} workers.",
           flush=True)
     print(f"   Max active futures to manage: {max_active_futures}", flush=True)
-    print(f"   Will write to output file approx every {progress_write_interval} completed tasks.", flush=True)
+    print(f"   Will write to output file and print memory approx every {progress_write_interval} completed tasks.",
+          flush=True)
 
-    nodes_completed_count = 0  # Overall count of completed tasks (success or fail)
+    nodes_completed_count = 0
     tasks_submitted_count = 0
 
     with ProcessPoolExecutor(max_workers=num_workers, initializer=init_worker, initargs=(args.dat,)) as executor:
-        # Submit initial batch of tasks from the generator
-        for _ in range(max_active_futures):
+        for _ in range(max_active_futures):  # Submit initial batch
             try:
                 task_args = next(task_arg_generator)
                 future = executor.submit(process_node_parallel, task_args)
-                future_to_node_id[future] = task_args[0]  # Map future to node_id
+                future_to_node_id[future] = task_args[0]
                 tasks_submitted_count += 1
-            except StopIteration:  # No more tasks from generator
+            except StopIteration:
                 break
+        if tasks_submitted_count > 0: print(f"  Initial submission: {tasks_submitted_count} tasks in flight.",
+                                            flush=True)
 
-        if tasks_submitted_count > 0:
-            print(f"  Initial submission: {tasks_submitted_count} tasks in flight.", flush=True)
-
-        while future_to_node_id:  # Loop as long as there are futures being processed
-            active_futures_list = list(future_to_node_id.keys())  # Get current snapshot
-            if not active_futures_list: break  # Should be caught by `while future_to_node_id`
-
+        while future_to_node_id:
+            active_futures_list = list(future_to_node_id.keys())
+            if not active_futures_list: break
             for future in as_completed(active_futures_list):
                 nodes_completed_count += 1
                 nodes_processed_since_last_write += 1
-                original_node_id = future_to_node_id.pop(future)  # Process one and remove
-
+                original_node_id = future_to_node_id.pop(future)
                 try:
-                    _ret_node_id, pileup_dict = future.result()  # This will raise exception if worker failed
-
-                    if _ret_node_id != original_node_id:
-                        print(f"⚠️ Main: Node ID mismatch! Original: {original_node_id}, Returned: {_ret_node_id}",
-                              file=sys.stderr, flush=True)
-
-                    # Add to current batch if result is valid
-                    if pileup_dict and not (isinstance(pileup_dict, dict) and "error" in pileup_dict):
-                        if pileup_dict:  # Ensure it's not an empty dict from worker success but no pileups
-                            results_this_interval[original_node_id] = pileup_dict
+                    _ret_node_id, pileup_dict = future.result()
+                    if _ret_node_id != original_node_id: print(
+                        f"⚠️ Main: Node ID mismatch! Original: {original_node_id}, Returned: {_ret_node_id}",
+                        file=sys.stderr, flush=True)
+                    if pileup_dict and not (isinstance(pileup_dict, dict) and "error" in pileup_dict) and pileup_dict:
+                        results_this_interval[original_node_id] = pileup_dict
                     elif isinstance(pileup_dict, dict) and "error" in pileup_dict:
                         print(f"  ℹ️ Worker for node {original_node_id} reported error: {pileup_dict['error']}",
                               file=sys.stderr, flush=True)
-
                 except Exception as exc:
-                    print(f"\n❌ Task for node {original_node_id} generated an exception during result retrieval: {exc}",
+                    print(f"\n❌ Task for node {original_node_id} generated exception during result retrieval: {exc}",
                           file=sys.stderr, flush=True)
 
-                # Try to submit a new task from the generator if we have capacity
                 if len(future_to_node_id) < max_active_futures:
                     try:
                         if tasks_submitted_count < total_tasks_to_process:
@@ -547,11 +496,8 @@ def main():
                             future_to_node_id[new_future] = new_task_args[0]
                             tasks_submitted_count += 1
                     except StopIteration:
-                        # Generator is exhausted, no more tasks to submit
                         pass
 
-                # Check if it's time to write this batch of results
-                # Write if interval reached OR all tasks submitted and all active futures completed OR all tasks completed
                 should_write_now = (nodes_processed_since_last_write >= progress_write_interval) or \
                                    (tasks_submitted_count == total_tasks_to_process and not future_to_node_id) or \
                                    (nodes_completed_count == total_tasks_to_process)
@@ -559,35 +505,38 @@ def main():
                 if results_this_interval and should_write_now:
                     num_written_this_batch = write_results_to_jsonl(args.output, results_this_interval)
                     total_nodes_with_pileups_written += num_written_this_batch
-                    results_this_interval.clear()  # Free memory for this batch
+                    results_this_interval.clear()
                     nodes_processed_since_last_write = 0
 
-                # Progress Reporting
-                if nodes_completed_count % 100 == 0 or \
+                # Condition for printing progress
+                # Print if interval reached, or all tasks completed, or no more active futures
+                if nodes_completed_count % progress_write_interval == 0 or \
                         nodes_completed_count == total_tasks_to_process or \
-                        not future_to_node_id:  # Update on the very last one too
+                        not future_to_node_id:
                     elapsed = time.time() - overall_start_time
                     rate = nodes_completed_count / elapsed if elapsed > 0 else 0
-                    print(f"  Progress: {nodes_completed_count}/{total_tasks_to_process} done. {len(future_to_node_id)} active. Rate: {rate:.1f}/s. Written: {total_nodes_with_pileups_written}")
-                    # print(
-                    #     f"  Progress: {nodes_completed_count}/{total_tasks_to_process} done. {len(future_to_node_id)} active. Rate: {rate:.1f}/s. Written: {total_nodes_with_pileups_written}",
-                    #     end='\r', flush=True)
+                    mem_rss_mb = main_process.memory_info().rss / (1024 * 1024)
+                    print(
+                        f"  Progress: {nodes_completed_count}/{total_tasks_to_process} done. {len(future_to_node_id)} active. Rate: {rate:.1f}/s. Mem: {mem_rss_mb:.1f}MB. Written: {total_nodes_with_pileups_written}",
+                        end='\r', flush=True)
+                break
+            else:
+                if not future_to_node_id: break
 
-                break  # Break from inner as_completed loop to re-evaluate while & get fresh active_futures_list
-            else:  # Inner loop completed without break (all futures in current snapshot processed)
-                if not future_to_node_id: break  # If no new futures added and list is empty, exit while
-
-    # Final write for any remaining results in the current interval batch
-    if results_this_interval:
-        print(f"\n  Writing final batch of {len(results_this_interval)} results...", flush=True)
+    if results_this_interval:  # Final write for any remaining results
+        # print(f"\n  Writing final batch of {len(results_this_interval)} results...", flush=True) # Optional
         num_written_this_batch = write_results_to_jsonl(args.output, results_this_interval)
         total_nodes_with_pileups_written += num_written_this_batch
         results_this_interval.clear()
 
     print()  # Newline after progress bar
     total_script_elapsed = time.time() - overall_start_time
-    print(f"\n🏁 Finished processing in {total_script_elapsed:.2f} seconds.")
-    print(f"🔹 Found and wrote pileups for {total_nodes_with_pileups_written} nodes overall to {args.output}")
+    mem_rss_mb = main_process.memory_info().rss / (1024 * 1024)  # Final memory
+    print(
+        f"\n🏁 Finished processing in {total_script_elapsed:.2f} seconds. Final main process memory: {mem_rss_mb:.1f}MB.",
+        flush=True)
+    print(f"🔹 Found and wrote pileups for {total_nodes_with_pileups_written} nodes overall to {args.output}",
+          flush=True)
     print(f"✅ Done. Total time: {time.time() - overall_start_time:.2f} seconds.", flush=True)
 
 
