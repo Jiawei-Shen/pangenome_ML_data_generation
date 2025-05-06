@@ -533,11 +533,9 @@ def main():
     total_script_elapsed = time.time() - overall_start_time
     mem_rss_mb = main_process.memory_info().rss / (1024 * 1024)  # Final memory
     print(
-        f"\n🏁 Finished processing in {total_script_elapsed:.2f} seconds. Final main process memory: {mem_rss_mb:.1f}MB.",
-        flush=True)
-    print(f"🔹 Found and wrote pileups for {total_nodes_with_pileups_written} nodes overall to {args.output}",
-          flush=True)
-    print(f"✅ Done. Total time: {time.time() - overall_start_time:.2f} seconds.", flush=True)
+        f"\n🏁 Finished processing in {total_script_elapsed:.2f} seconds. Final main process memory: {mem_rss_mb:.1f}MB.")
+    print(f"🔹 Found and wrote pileups for {total_nodes_with_pileups_written} nodes overall to {args.output}")
+    print(f"✅ Done. Total time: {time.time() - overall_start_time:.2f} seconds.")
 
 
 if __name__ == '__main__':
