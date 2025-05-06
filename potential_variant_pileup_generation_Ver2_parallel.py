@@ -197,8 +197,8 @@ def load_node_sequences_from_gfa(gfa_path, target_node_ids_set):
                 line_counter += 1
                 if not current_target_ids_set: break
                 if line_counter % 1_000_000 == 0: print(
-                    f"  GFA Checked {line_counter:,} lines... found {nodes_found_count}/{len(target_node_ids_set)} target sequences.",
-                    end='\r', flush=True)
+                    f"  GFA Checked {line_counter:,} lines... found {nodes_found_count}/{len(target_node_ids_set)} target sequences.")
+                    # end='\r', flush=True)
                 if not line.startswith('S\t'): continue
                 parts = line.strip().split('\t')
                 if len(parts) < 3: continue
