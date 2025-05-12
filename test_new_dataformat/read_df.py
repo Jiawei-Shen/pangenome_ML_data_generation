@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 import struct
 import argparse
+import sys
 
 # ─────────────────────────────────────────────────────────────────────────────
-RECORD_STRUCT = struct.Struct("<h150s150s20shc")  # <-- 注意！已经改成新版结构
+RECORD_STRUCT = struct.Struct("<h150s150s20shc")  # updated structure
 RECORD_SIZE = RECORD_STRUCT.size  # 325 bytes
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -56,17 +57,39 @@ def read_segments(dat_path, node_index, node_id):
     return records
 
 # ─────────────────────────────────────────────────────────────────────────────
+def print_node_ids(node_index, n):
+    node_ids = list(node_index.keys())
+    print(f"Total nodes: {len(node_ids)}")
+    print("Listing first {} node IDs:".format(n if n != -1 else len(node_ids)))
+    for nid in node_ids[:n if n != -1 else None]:
+        print(nid)
+
+# ─────────────────────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="Read segments for a given node_id from binary .dat/.idx files (new format with cigar).")
+    parser = argparse.ArgumentParser(description="Read segments or print node IDs from binary .dat/.idx files (new format with cigar).")
     parser.add_argument("dat_path", help="Path to .dat file")
     parser.add_argument("idx_path", help="Path to .idx file")
-    parser.add_argument("node_id", type=int, help="Node ID to fetch")
-    parser.add_argument("--topn", type=int, default=20, help="Show top N records (default 10, use -1 to show all)")
+    parser.add_argument("--node_id", type=int, help="Node ID to fetch")
+    parser.add_argument("--topn", type=int, default=20, help="Show top N records (default 20, use -1 to show all)")
+    parser.add_argument("--print-nodes", type=int, help="Print N node IDs from the index and exit")
     args = parser.parse_args()
 
+    # Load index regardless of operation
     node_index = load_index(args.idx_path)
-    records = read_segments(args.dat_path, node_index, args.node_id)
 
+    # If printing node IDs only
+    if args.print_nodes is not None:
+        print_node_ids(node_index, args.print_nodes)
+        return
+
+    # node_id is required if not using --print-nodes
+    if args.node_id is None:
+        print("Error: --node_id is required unless --print-nodes is specified.", file=sys.stderr)
+        parser.print_help()
+        sys.exit(1)
+
+    # Proceed to read segments
+    records = read_segments(args.dat_path, node_index, args.node_id)
     print(f"Node {args.node_id} has {len(records)} records.")
 
     if args.topn == -1:
