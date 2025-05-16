@@ -3,20 +3,14 @@ import subprocess
 import shlex  # For safely formatting command arguments for display
 import concurrent.futures
 import os  # To get CPU count
-import time  # For basic timing if needed, though executor handles it
+import argparse  # For command-line argument parsing
+import time
 
-# --- Configuration ---
-# !!! IMPORTANT: Update this path if your GBZ file is located elsewhere !!!
+# --- Global Configuration (will be updated by CLI args) ---
 GBZ_FILE_PATH = "hprc-v1.1-mc-grch38.d9.gbz"
-# !!! IMPORTANT: Set the desired path for the output JSON file !!!
 OUTPUT_JSON_PATH = "grch38_node_positions_output.json"
-# Adjust the number of parallel workers if needed. Defaults to number of CPU cores.
-# Set to 1 for sequential execution (useful for debugging).
 MAX_WORKERS = os.cpu_count() if os.cpu_count() else 1
-# Timeout in seconds for each individual 'vg find' command.
-# Set to None for no timeout, but be cautious with potentially very slow commands.
-TASK_TIMEOUT_SECONDS = 300  # 5 minutes per task, adjust as needed
-# Enable detailed logging during the task counting phase
+TASK_TIMEOUT_SECONDS = 300  # 5 minutes per task
 ENABLE_COUNTING_DIAGNOSTICS = True
 
 
@@ -52,7 +46,8 @@ def get_target_node_id_from_haplotype(haplotype_entry):
     return None
 
 
-def find_grch38_starting_position(node_id_to_find, chromosome_name_on_grch38, gbz_file_path_for_worker):
+def find_grch38_starting_position(node_id_to_find, chromosome_name_on_grch38, gbz_file_path_for_worker,
+                                  worker_task_timeout):
     """
     Uses 'vg find' to get the starting position of a node on a specific GRCh38 path.
     This function is designed to be run in a separate process.
@@ -65,10 +60,14 @@ def find_grch38_starting_position(node_id_to_find, chromosome_name_on_grch38, gb
         "-P", path_name
     ]
 
-    print(f"    [Worker PID:{os.getpid()}] Executing: {' '.join(shlex.quote(arg) for arg in command)}")
+    # Using global TASK_TIMEOUT_SECONDS for the subprocess call
+    effective_timeout = worker_task_timeout if worker_task_timeout is not None else 300  # Default if None
+
+    print(
+        f"    [Worker PID:{os.getpid()}] Executing: {' '.join(shlex.quote(arg) for arg in command)} (Timeout: {effective_timeout}s)")
 
     try:
-        result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=TASK_TIMEOUT_SECONDS)
+        result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=effective_timeout)
         output = result.stdout.strip()
         if output:
             parts = output.split()
@@ -81,7 +80,7 @@ def find_grch38_starting_position(node_id_to_find, chromosome_name_on_grch38, gb
             print(f"    [Worker PID:{os.getpid()}] Warning: No output for node {node_id_to_find} on {path_name}.")
     except subprocess.TimeoutExpired:
         print(
-            f"    [Worker PID:{os.getpid()}] Timeout: Command for node {node_id_to_find} on {path_name} exceeded {TASK_TIMEOUT_SECONDS}s.")
+            f"    [Worker PID:{os.getpid()}] Timeout: Command for node {node_id_to_find} on {path_name} exceeded {effective_timeout}s.")
         return "TIMEOUT"
     except subprocess.CalledProcessError as e:
         print(
@@ -96,10 +95,61 @@ def find_grch38_starting_position(node_id_to_find, chromosome_name_on_grch38, gb
     return None
 
 
-# --- Main processing logic ---
-if __name__ == "__main__":
-    json_file_path = "/scratch/jshen/Github/pangenome_ML_data_generation/test_new_dataformat/node_batch_info.json"
-    main_json_data = load_json_to_dict(json_file_path)
+def main():
+    """
+    Main function to parse arguments and run the processing.
+    """
+    # Declare global variables that will be modified
+    global GBZ_FILE_PATH, OUTPUT_JSON_PATH, MAX_WORKERS, TASK_TIMEOUT_SECONDS, ENABLE_COUNTING_DIAGNOSTICS
+
+    parser = argparse.ArgumentParser(
+        description="Process node batch JSON data to find GRCh38 starting positions using 'vg find'.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument(
+        "json_file",
+        help="Path to the input JSON file (e.g., node_batch_info.json)."
+    )
+    parser.add_argument(
+        "gbz_file",
+        help="Path to the GBZ graph file (e.g., hprc-v1.1-mc-grch38.d9.gbz)."
+    )
+    parser.add_argument(
+        "-t", "--threads",
+        type=int,
+        default=os.cpu_count() if os.cpu_count() else 1,
+        help="Number of parallel worker threads/processes to use."
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=300,  # Default timeout of 5 minutes
+        help="Timeout in seconds for each individual 'vg find' command."
+    )
+    parser.add_argument(
+        "-o", "--output",
+        default="grch38_node_positions_output.json",
+        help="Path to save the output JSON file."
+    )
+    parser.add_argument(
+        "--diag",
+        action="store_true",  # Becomes True if flag is present
+        default=False,  # Default is False if flag is not present
+        help="Enable detailed diagnostics during the task counting phase."
+    )
+
+    args = parser.parse_args()
+
+    # Update global configurations from parsed arguments
+    json_file_path_cli = args.json_file
+    GBZ_FILE_PATH = args.gbz_file
+    MAX_WORKERS = args.threads
+    TASK_TIMEOUT_SECONDS = args.timeout
+    OUTPUT_JSON_PATH = args.output
+    ENABLE_COUNTING_DIAGNOSTICS = args.diag
+
+    # --- Start of original main processing logic, now using CLI args ---
+    main_json_data = load_json_to_dict(json_file_path_cli)
 
     results_summary = []
     tasks_to_submit_count = 0
@@ -123,7 +173,7 @@ if __name__ == "__main__":
 
             haplotype_index = 0
             for haplotype_entry in node_specific_data['haplotypes']:
-                haplotype_index += 1  # For easier identification in logs
+                haplotype_index += 1
                 if not isinstance(haplotype_entry, dict):
                     if ENABLE_COUNTING_DIAGNOSTICS:
                         print(
@@ -131,7 +181,6 @@ if __name__ == "__main__":
                     continue
 
                 hap_id_for_log = haplotype_entry.get('haplotype_id', f'UnknownHapID_Index{haplotype_index}')
-
                 is_grch38 = haplotype_entry.get('chromosome') == 'GRCh38'
                 has_region = haplotype_entry.get('region') is not None and haplotype_entry.get('region') != ""
                 target_node_id = get_target_node_id_from_haplotype(haplotype_entry)
@@ -141,47 +190,39 @@ if __name__ == "__main__":
                     tasks_to_submit_count += 1
                 elif ENABLE_COUNTING_DIAGNOSTICS:
                     skip_reasons = []
-                    if not is_grch38:
-                        skip_reasons.append(f"Not GRCh38 (chromosome: {haplotype_entry.get('chromosome')})")
-                    if not has_region:
-                        skip_reasons.append("Missing 'region'")
-                    if not has_target_node:
-                        skip_reasons.append("No target node in thread_context")
+                    if not is_grch38: skip_reasons.append(
+                        f"Not GRCh38 (chromosome: {haplotype_entry.get('chromosome')})")
+                    if not has_region: skip_reasons.append("Missing 'region'")
+                    if not has_target_node: skip_reasons.append("No target node in thread_context")
                     print(
                         f"  [COUNT_SKIP] Node '{top_level_node_id_str}', Haplotype ID '{hap_id_for_log}': Skipped because ({'; '.join(skip_reasons)})")
         print(f"--- End Task Identification Phase ---")
         print(f"Identified {tasks_to_submit_count} potential 'vg find' tasks to execute.")
 
     if main_json_data and tasks_to_submit_count > 0:
-        print(f"\nProcessing nodes from '{json_file_path}' using GBZ file '{GBZ_FILE_PATH}'.")
+        print(f"\nProcessing nodes from '{json_file_path_cli}' using GBZ file '{GBZ_FILE_PATH}'.")
         print(f"Using up to {MAX_WORKERS} parallel worker processes.")
         print(f"Individual task timeout set to: {TASK_TIMEOUT_SECONDS} seconds.")
         print(f"Output will be saved to: '{OUTPUT_JSON_PATH}'\n")
 
         with concurrent.futures.ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures_to_metadata = {}
-
             for top_level_node_id_str, node_specific_data in main_json_data.items():
-                if not isinstance(node_specific_data, dict):
-                    continue
-
+                if not isinstance(node_specific_data, dict): continue
                 if 'haplotypes' in node_specific_data and isinstance(node_specific_data['haplotypes'], list):
                     for haplotype_entry in node_specific_data['haplotypes']:
-                        if not isinstance(haplotype_entry, dict):
-                            continue
-
+                        if not isinstance(haplotype_entry, dict): continue
                         if haplotype_entry.get('chromosome') == 'GRCh38':
                             grch38_region_name = haplotype_entry.get('region')
-                            if not grch38_region_name:  # Ensure region is not None or empty
-                                continue
-
+                            if not grch38_region_name: continue
                             target_node_id_in_haplotype = get_target_node_id_from_haplotype(haplotype_entry)
                             if target_node_id_in_haplotype is not None:
                                 future = executor.submit(
                                     find_grch38_starting_position,
                                     target_node_id_in_haplotype,
                                     grch38_region_name,
-                                    GBZ_FILE_PATH
+                                    GBZ_FILE_PATH,
+                                    TASK_TIMEOUT_SECONDS  # Pass timeout to worker
                                 )
                                 metadata = {
                                     "top_level_node_id": top_level_node_id_str,
@@ -199,41 +240,37 @@ if __name__ == "__main__":
             for future in concurrent.futures.as_completed(futures_to_metadata):
                 completed_tasks_count += 1
                 metadata = futures_to_metadata[future]
-                status_message_prefix = f"  Processed {completed_tasks_count}/{submitted_tasks_count} | " \
-                                        f"Top-Node {metadata['top_level_node_id']}, " \
-                                        f"Hap-ID {metadata['haplotype_id']}, " \
-                                        f"Target {metadata['target_node_id_queried']}: "
+                status_prefix = f"  Processed {completed_tasks_count}/{submitted_tasks_count} | TN {metadata['top_level_node_id']}, Hap {metadata['haplotype_id']}, Target {metadata['target_node_id_queried']}: "
                 try:
-                    start_position = future.result(timeout=TASK_TIMEOUT_SECONDS + 10)  # Increased buffer slightly
+                    # Add a small buffer to the future.result() timeout, as the worker has its own timeout
+                    start_position = future.result(timeout=TASK_TIMEOUT_SECONDS + 15)
 
                     if start_position == "TIMEOUT":
-                        print(f"{status_message_prefix}TIMED OUT (in worker)")
+                        print(f"{status_prefix}TIMED OUT (in worker)")
                         timed_out_tasks_count += 1
                         results_summary.append(
                             {**metadata, "grch38_start_position": None, "status": "timeout_in_worker"})
                     elif start_position is not None:
-                        print(f"{status_message_prefix}SUCCESS -> Position: {start_position}")
+                        print(f"{status_prefix}SUCCESS -> Position: {start_position}")
                         successful_finds_count += 1
                         results_summary.append(
                             {**metadata, "grch38_start_position": start_position, "status": "success"})
                     else:
-                        print(f"{status_message_prefix}FAILED (no position found or worker error, see logs)")
+                        print(f"{status_prefix}FAILED (no position/worker error, see logs)")
                         results_summary.append({**metadata, "grch38_start_position": None,
                                                 "status": "failed_to_find_position_or_worker_error"})
-
                 except concurrent.futures.TimeoutError:
-                    print(f"{status_message_prefix}TIMED OUT (waiting for future result)")
+                    print(f"{status_prefix}TIMED OUT (waiting for future result)")
                     timed_out_tasks_count += 1
                     results_summary.append(
                         {**metadata, "grch38_start_position": None, "status": "timeout_waiting_for_future"})
                 except Exception as exc:
-                    print(f"{status_message_prefix}ERROR (task execution generated an exception: {exc})")
+                    print(f"{status_prefix}ERROR (task execution exception: {exc})")
                     results_summary.append({**metadata, "grch38_start_position": None, "status": "task_execution_error",
                                             "error_message": str(exc)})
 
         print(f"\n--- Processing Complete ---")
-        print(
-            f"Total tasks identified by initial scan: {tasks_to_submit_count}")  # Should match submitted if all goes well
+        print(f"Total tasks identified by initial scan: {tasks_to_submit_count}")
         print(f"Total tasks submitted to executor: {submitted_tasks_count}")
         print(f"Total tasks completed (results processed): {completed_tasks_count}")
         print(f"Successfully found positions: {successful_finds_count}")
@@ -252,5 +289,9 @@ if __name__ == "__main__":
         print(
             "No suitable GRCh38 haplotypes with target nodes found in the input JSON to process after diagnostic scan.")
     elif not main_json_data:
-        print(f"Failed to load or parse JSON data from '{json_file_path}'. Cannot proceed.")
+        print(f"Failed to load or parse JSON data from '{json_file_path_cli}'. Cannot proceed.")
 
+
+# --- Entry point ---
+if __name__ == "__main__":
+    main()
