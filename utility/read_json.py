@@ -98,7 +98,7 @@ def find_grch38_starting_position(node_id_to_find, chromosome_name_on_grch38, gb
 
 # --- Main processing logic ---
 if __name__ == "__main__":
-    json_file_path = "node_batch_info.json"
+    json_file_path = "/scratch/jshen/Github/pangenome_ML_data_generation/test_new_dataformat/node_batch_info.json"
     main_json_data = load_json_to_dict(json_file_path)
 
     results_summary = []
