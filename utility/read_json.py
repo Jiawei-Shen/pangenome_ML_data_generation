@@ -60,8 +60,7 @@ def find_grch38_starting_position(node_id_to_find, chromosome_name_on_grch38, gb
         "-P", path_name
     ]
 
-    # Using global TASK_TIMEOUT_SECONDS for the subprocess call
-    effective_timeout = worker_task_timeout if worker_task_timeout is not None else 300  # Default if None
+    effective_timeout = worker_task_timeout if worker_task_timeout is not None else 300
 
     print(
         f"    [Worker PID:{os.getpid()}] Executing: {' '.join(shlex.quote(arg) for arg in command)} (Timeout: {effective_timeout}s)")
@@ -70,14 +69,34 @@ def find_grch38_starting_position(node_id_to_find, chromosome_name_on_grch38, gb
         result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=effective_timeout)
         output = result.stdout.strip()
         if output:
-            parts = output.split()
+            parts = output.split()  # Splits by any whitespace
+
+            # Expected: node_id path_name position [orientation] (len(parts) >= 3)
+            # Observed case: node_id position (len(parts) == 2)
+
             if len(parts) >= 3:
-                return parts[2]
+                # Standard case, expect at least 3 parts
+                if str(parts[0]) == str(node_id_to_find):
+                    return parts[2]  # Position is the third element
+                else:
+                    print(
+                        f"    [Worker PID:{os.getpid()}] Warning: Output node ID {parts[0]} does not match queried node ID {node_id_to_find} for path {path_name}: '{output}'")
+            elif len(parts) == 2:
+                # Handle the observed abbreviated case: node_id position
+                if str(parts[0]) == str(node_id_to_find):
+                    print(
+                        f"    [Worker PID:{os.getpid()}] Info: Handling abbreviated output for node {node_id_to_find} on {path_name}. Assuming format: node_id position. Output: '{output}'")
+                    return parts[1]  # Position is the second element
+                else:
+                    print(
+                        f"    [Worker PID:{os.getpid()}] Warning: Abbreviated output node ID {parts[0]} does not match queried node ID {node_id_to_find} for path {path_name}: '{output}'")
             else:
+                # Not enough parts for either expected format
                 print(
-                    f"    [Worker PID:{os.getpid()}] Warning: Unexpected output for node {node_id_to_find} on {path_name}: '{output}'")
+                    f"    [Worker PID:{os.getpid()}] Warning: Unexpected output format (not enough parts) for node {node_id_to_find} on {path_name}: '{output}'")
         else:
-            print(f"    [Worker PID:{os.getpid()}] Warning: No output for node {node_id_to_find} on {path_name}.")
+            print(
+                f"    [Worker PID:{os.getpid()}] Warning: No output from vg find for node {node_id_to_find} on {path_name}.")
     except subprocess.TimeoutExpired:
         print(
             f"    [Worker PID:{os.getpid()}] Timeout: Command for node {node_id_to_find} on {path_name} exceeded {effective_timeout}s.")
@@ -99,7 +118,6 @@ def main():
     """
     Main function to parse arguments and run the processing.
     """
-    # Declare global variables that will be modified
     global GBZ_FILE_PATH, OUTPUT_JSON_PATH, MAX_WORKERS, TASK_TIMEOUT_SECONDS, ENABLE_COUNTING_DIAGNOSTICS
 
     parser = argparse.ArgumentParser(
@@ -123,7 +141,7 @@ def main():
     parser.add_argument(
         "--timeout",
         type=int,
-        default=300,  # Default timeout of 5 minutes
+        default=300,
         help="Timeout in seconds for each individual 'vg find' command."
     )
     parser.add_argument(
@@ -133,14 +151,13 @@ def main():
     )
     parser.add_argument(
         "--diag",
-        action="store_true",  # Becomes True if flag is present
-        default=False,  # Default is False if flag is not present
+        action="store_true",
+        default=False,
         help="Enable detailed diagnostics during the task counting phase."
     )
 
     args = parser.parse_args()
 
-    # Update global configurations from parsed arguments
     json_file_path_cli = args.json_file
     GBZ_FILE_PATH = args.gbz_file
     MAX_WORKERS = args.threads
@@ -148,7 +165,6 @@ def main():
     OUTPUT_JSON_PATH = args.output
     ENABLE_COUNTING_DIAGNOSTICS = args.diag
 
-    # --- Start of original main processing logic, now using CLI args ---
     main_json_data = load_json_to_dict(json_file_path_cli)
 
     results_summary = []
@@ -222,7 +238,7 @@ def main():
                                     target_node_id_in_haplotype,
                                     grch38_region_name,
                                     GBZ_FILE_PATH,
-                                    TASK_TIMEOUT_SECONDS  # Pass timeout to worker
+                                    TASK_TIMEOUT_SECONDS
                                 )
                                 metadata = {
                                     "top_level_node_id": top_level_node_id_str,
@@ -242,7 +258,6 @@ def main():
                 metadata = futures_to_metadata[future]
                 status_prefix = f"  Processed {completed_tasks_count}/{submitted_tasks_count} | TN {metadata['top_level_node_id']}, Hap {metadata['haplotype_id']}, Target {metadata['target_node_id_queried']}: "
                 try:
-                    # Add a small buffer to the future.result() timeout, as the worker has its own timeout
                     start_position = future.result(timeout=TASK_TIMEOUT_SECONDS + 15)
 
                     if start_position == "TIMEOUT":
@@ -292,6 +307,5 @@ def main():
         print(f"Failed to load or parse JSON data from '{json_file_path_cli}'. Cannot proceed.")
 
 
-# --- Entry point ---
 if __name__ == "__main__":
     main()
