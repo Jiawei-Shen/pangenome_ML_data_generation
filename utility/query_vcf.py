@@ -59,39 +59,34 @@ def process_item_for_bcftools(item, vcf_file_path):
     and prepares it for bcftools query.
 
     Args:
-        item (dict): A dictionary from the input JSON (expected to have fields like
-                     'top_level_node_id', 'haplotype_id', 'node_sequence_length',
-                     'grch38_chromosome_region', 'grch38_start_position').
+        item (dict): A dictionary from the input JSON.
         vcf_file_path (str): Path to the VCF file.
 
     Returns:
         dict: A dictionary containing original item info, the query region string,
               a list of found variants, and any error messages from bcftools.
-              Returns None if the item is fundamentally invalid for querying.
     """
-    # Initialize the result entry with all expected fields from the input item
     base_result_entry = {
         "top_level_node_id": item.get("top_level_node_id"),
         "haplotype_id": item.get("haplotype_id"),
         "node_sequence_length": item.get("node_sequence_length"),
         "grch38_chromosome_region": item.get("grch38_chromosome_region"),
         "grch38_start_position": item.get("grch38_start_position"),
-        "query_region": None,  # Will be populated if query proceeds
-        "variants": [],  # Initialize as empty list for variants
-        "bcftools_error": None  # Will store any errors
+        "query_region": None,
+        "variants": [],
+        "bcftools_error": None
     }
 
-    # Extract necessary fields from the input item
     start_pos_str = item.get("grch38_start_position")
     seq_len_val = item.get("node_sequence_length")
     chromosome = item.get("grch38_chromosome_region")
     item_hap_id_for_log = base_result_entry.get('haplotype_id', 'N/A')
 
-    # Validate required fields for constructing the query region
     if not chromosome:
         base_result_entry["bcftools_error"] = "Skipped: Missing 'grch38_chromosome_region'."
+        # This print is helpful for console feedback during execution
         print(f"  Skipping item (HapID: {item_hap_id_for_log}): Missing 'grch38_chromosome_region'.")
-        return base_result_entry  # Return the entry with error, it won't have variants.
+        return base_result_entry
 
     if start_pos_str is None:
         base_result_entry["bcftools_error"] = "Skipped: 'grch38_start_position' is null."
@@ -104,7 +99,6 @@ def process_item_for_bcftools(item, vcf_file_path):
         return base_result_entry
 
     try:
-        # Convert start position and sequence length to integers
         start_pos = int(start_pos_str)
         seq_len = int(seq_len_val)
         if seq_len < 0:
@@ -119,39 +113,29 @@ def process_item_for_bcftools(item, vcf_file_path):
             f"  Skipping item (HapID: {item_hap_id_for_log}): 'grch38_start_position' or 'node_sequence_length' not a valid int.")
         return base_result_entry
 
-    # Calculate end position based on the user's formula: grch38_start_position + node_sequence_length.
-    # VCF coordinates are 1-based.
-    # If node_sequence_length is the number of bases in a feature starting at start_pos,
-    # the standard inclusive region is chr:start_pos-(start_pos + node_sequence_length - 1).
-    # However, the user's formula implies the end coordinate is literally start_pos + node_sequence_length.
-    # Example: start=100, length=1 -> user formula end=101 (region 100-101). Standard for 1bp feature: 100-100.
-    # Example: start=100, length=0 -> user formula end=100 (region 100-100). This is fine for a point.
     end_pos = start_pos + seq_len
 
-    # Sanity check for calculated end position
-    if end_pos < start_pos:  # Should only happen if seq_len was negative (already checked)
+    if end_pos < start_pos:
         base_result_entry[
             "bcftools_error"] = f"Skipped: Calculated end position ({end_pos}) is less than start position ({start_pos}) with length ({seq_len})."
         print(
             f"  Skipping item (HapID: {item_hap_id_for_log}): Calculated end_pos {end_pos} < start_pos {start_pos} with length {seq_len}.")
         return base_result_entry
 
-    # Construct the region string for bcftools
     query_region_str = f"{chromosome}:{start_pos}-{end_pos}"
     base_result_entry["query_region"] = query_region_str
 
-    # Execute the bcftools query
     variants_list, bcftools_stderr_output = execute_bcftools_query(vcf_file_path, query_region_str)
 
-    if variants_list is not None:  # Indicates bcftools command was attempted (not a FileNotFoundError for bcftools itself)
-        base_result_entry["variants"] = variants_list  # Will be an empty list if no variants found
+    if variants_list is not None:
+        base_result_entry["variants"] = variants_list
 
-    if bcftools_stderr_output:  # Store any stderr output from bcftools (warnings or errors)
+    if bcftools_stderr_output:
         if "bcftools command not found" in bcftools_stderr_output:
-            # This error is critical and indicates a setup problem.
-            # The FileNotFoundError will be raised by the main loop when future.result() is called.
             raise FileNotFoundError(bcftools_stderr_output)
-        # Append to existing error or set if new, to preserve initial skip reasons.
+        # Store stderr ONLY if there was an actual error message from bcftools.
+        # An empty stderr string means bcftools ran cleanly.
+        # If there was a pre-existing skip error, append to it.
         if base_result_entry["bcftools_error"]:
             base_result_entry["bcftools_error"] += f"; bcftools stderr: {bcftools_stderr_output}"
         else:
@@ -165,10 +149,8 @@ def main():
     Main function to parse arguments and run the VCF querying process.
     """
     parser = argparse.ArgumentParser(
-        description="Query a VCF file using bcftools view based on regions derived from an input JSON file. "
-                    "The input JSON should be an array of objects, each with fields like "
-                    "'grch38_chromosome_region', 'grch38_start_position', and 'node_sequence_length'. "
-                    "Records with no variants found will not be saved to the output.",
+        description="Query a VCF file using bcftools view based on regions from an input JSON file. "
+                    "Only records with found variants and no bcftools errors are saved.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument(
@@ -181,13 +163,13 @@ def main():
     )
     parser.add_argument(
         "-o", "--output_json",
-        default="bcftools_query_results_with_variants.json",
-        help="Path to save the output JSON file with bcftools query results (only includes records with variants)."
+        default="bcftools_query_clean_variant_results.json",  # Updated default name
+        help="Path to save the output JSON file (only includes records with variants and no bcftools errors)."
     )
     parser.add_argument(
         "-t", "--threads",
         type=int,
-        default=None,  # Will be set to CPU count or 1 if not provided
+        default=None,
         help=(f"Number of parallel worker threads to use for bcftools queries. "
               f"(default: number of CPU cores, or 1 if CPU count cannot be determined. "
               f"Currently detected cores: {os.cpu_count() if os.cpu_count() else 'N/A'})")
@@ -195,13 +177,11 @@ def main():
 
     args = parser.parse_args()
 
-    # Set MAX_WORKERS based on args.threads or default to CPU count / 1
     max_workers = args.threads if args.threads is not None else (os.cpu_count() if os.cpu_count() else 1)
-    if max_workers <= 0:  # Ensure at least one worker
+    if max_workers <= 0:
         print("Warning: Number of threads must be positive. Defaulting to 1.")
         max_workers = 1
 
-    # --- Print effective configuration ---
     print("--- Effective Configuration ---")
     print(f"Input JSON: {args.input_json}")
     print(f"VCF File: {args.vcf_file}")
@@ -209,20 +189,16 @@ def main():
     print(f"Max Workers (Threads): {max_workers}")
     print("-----------------------------")
 
-    # --- Validate input files ---
     if not os.path.exists(args.input_json):
         print(f"Error: Input JSON file not found at '{args.input_json}'")
         return
-
     if not os.path.exists(args.vcf_file):
         print(f"Error: VCF file not found at '{args.vcf_file}'")
         return
     if not (os.path.exists(args.vcf_file + ".tbi") or os.path.exists(args.vcf_file + ".csi")):
-        print(f"Error: Index file (.tbi or .csi) not found for '{args.vcf_file}'. "
-              "Please index the VCF file using tabix or bcftools index.")
+        print(f"Error: Index file (.tbi or .csi) not found for '{args.vcf_file}'. Please index the VCF file.")
         return
 
-    # --- Load input JSON data ---
     try:
         with open(args.input_json, 'r') as f:
             input_data = json.load(f)
@@ -234,16 +210,14 @@ def main():
         print(f"Error: Input JSON is not a list as expected. Found type: {type(input_data)}")
         return
 
-    all_results_with_variants = []
+    final_results_to_save = []
 
     print(f"\nProcessing {len(input_data)} items from '{args.input_json}'...")
     print(f"Querying VCF: '{args.vcf_file}' with bcftools view (no header).")
-    # Max workers already printed in effective configuration
 
     items_to_process = []
     skipped_due_to_input_validation = 0
 
-    # Pre-filter items that can be processed
     for i, item in enumerate(input_data):
         item_hap_id_for_log = item.get('haplotype_id', f'index_{i}')
         start_pos_str = item.get("grch38_start_position")
@@ -279,29 +253,38 @@ def main():
         future_to_item_info = {
             executor.submit(process_item_for_bcftools, item, args.vcf_file):
                 item.get('haplotype_id', f'original_index_{input_data.index(item) if item in input_data else "N/A"}')
-            for item in items_to_process  # Only submit valid items
+            for item in items_to_process
         }
 
         processed_count = 0
-        skipped_due_to_no_variants = 0
+        skipped_from_output_count = 0
         for future in concurrent.futures.as_completed(future_to_item_info):
             item_id_for_log = future_to_item_info[future]
             processed_count += 1
             try:
                 result_entry = future.result()
 
-                if result_entry.get("variants"):
-                    all_results_with_variants.append(result_entry)
+                # Stricter condition for saving: variants must exist AND bcftools_error must be null
+                if result_entry.get("variants") and result_entry.get("bcftools_error") is None:
+                    final_results_to_save.append(result_entry)
                 else:
-                    skipped_due_to_no_variants += 1
-                    # Log if there was an error during processing, or just no variants
+                    skipped_from_output_count += 1
                     error_msg = result_entry.get("bcftools_error")
-                    if error_msg and "Skipped:" not in error_msg:  # Don't re-log simple skips already printed
+                    query_region_log = result_entry.get('query_region', 'N/A')
+                    if not result_entry.get("variants") and error_msg is None:
                         print(
-                            f"  Item (HapID: {item_id_for_log}): No variants found or query failed. Error: {error_msg}")
-                    elif not error_msg:  # No error, just no variants
+                            f"  Item (HapID: {item_id_for_log}): No variants found in region '{query_region_log}'. Not saved.")
+                    elif error_msg:
+                        # Don't re-log simple "Skipped:" messages from pre-validation if they somehow got here
+                        if not error_msg.startswith("Skipped:"):
+                            print(
+                                f"  Item (HapID: {item_id_for_log}): Query for region '{query_region_log}' had issues or no variants. Error: '{error_msg}'. Not saved.")
+                        else:  # It was a pre-skip, already logged.
+                            print(
+                                f"  Item (HapID: {item_id_for_log}): Pre-skipped query for region '{query_region_log}'. Not saved.")
+                    else:  # Should not happen if variants is empty and error is None, but as a fallback
                         print(
-                            f"  Item (HapID: {item_id_for_log}): No variants found in region '{result_entry.get('query_region', 'N/A')}'.")
+                            f"  Item (HapID: {item_id_for_log}): No variants for region '{query_region_log}'. Not saved.")
 
                 if processed_count % 50 == 0 or processed_count == len(items_to_process):
                     print(f"  Processed {processed_count}/{len(items_to_process)} submitted tasks...")
@@ -314,20 +297,20 @@ def main():
                 break
             except Exception as exc:
                 print(f"An error occurred processing future for item associated with ID '{item_id_for_log}': {exc}")
+                skipped_from_output_count += 1  # Count this as skipped from output
 
-    # --- Save all results to the output JSON file ---
     print(f"\n--- Summary ---")
     print(f"Total items in input JSON: {len(input_data)}")
     print(f"Items skipped due to initial validation: {skipped_due_to_input_validation}")
     print(f"Items submitted for bcftools query: {len(items_to_process)}")
-    print(f"Items processed: {processed_count}")
-    print(f"Records saved to output (with variants): {len(all_results_with_variants)}")
-    print(f"Records skipped (no variants found or query skipped): {skipped_due_to_no_variants}")
+    print(f"Items processed by workers: {processed_count}")
+    print(f"Records saved to output (variants found and no bcftools error): {len(final_results_to_save)}")
+    print(f"Records not saved (no variants or bcftools error/skip): {skipped_from_output_count}")
 
     try:
         with open(args.output_json, 'w') as outfile:
-            json.dump(all_results_with_variants, outfile, indent=4)
-        print(f"\nSuccessfully saved {len(all_results_with_variants)} records to '{args.output_json}'")
+            json.dump(final_results_to_save, outfile, indent=4)
+        print(f"\nSuccessfully saved {len(final_results_to_save)} records to '{args.output_json}'")
     except IOError:
         print(f"Error: Could not write results to '{args.output_json}'.")
     except Exception as e:
