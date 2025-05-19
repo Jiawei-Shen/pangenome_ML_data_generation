@@ -3,7 +3,7 @@ import struct
 import argparse
 
 # ─────────────────────────────────────────────────────────────────────────────
-RECORD_STRUCT = struct.Struct("<h150s150s20shc")  # <-- 注意！已经改成新版结构
+RECORD_STRUCT = struct.Struct("<h150s150s20shc")
 RECORD_SIZE = RECORD_STRUCT.size  # 325 bytes
 
 # ─────────────────────────────────────────────────────────────────────────────
