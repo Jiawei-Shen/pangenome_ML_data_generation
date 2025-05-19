@@ -64,7 +64,7 @@ def process_item_for_bcftools(item, vcf_file_path):
 
     Returns:
         dict: A dictionary containing original item info, the query region string,
-              a list of found variants, and any error messages from bcftools.
+              a list of found variants, and an internal 'bcftools_error' field.
     """
     base_result_entry = {
         "top_level_node_id": item.get("top_level_node_id"),
@@ -74,7 +74,7 @@ def process_item_for_bcftools(item, vcf_file_path):
         "grch38_start_position": item.get("grch38_start_position"),
         "query_region": None,
         "variants": [],
-        "bcftools_error": None
+        "bcftools_error": None  # Internal field for error tracking
     }
 
     start_pos_str = item.get("grch38_start_position")
@@ -84,7 +84,6 @@ def process_item_for_bcftools(item, vcf_file_path):
 
     if not chromosome:
         base_result_entry["bcftools_error"] = "Skipped: Missing 'grch38_chromosome_region'."
-        # This print is helpful for console feedback during execution
         print(f"  Skipping item (HapID: {item_hap_id_for_log}): Missing 'grch38_chromosome_region'.")
         return base_result_entry
 
@@ -133,10 +132,8 @@ def process_item_for_bcftools(item, vcf_file_path):
     if bcftools_stderr_output:
         if "bcftools command not found" in bcftools_stderr_output:
             raise FileNotFoundError(bcftools_stderr_output)
-        # Store stderr ONLY if there was an actual error message from bcftools.
-        # An empty stderr string means bcftools ran cleanly.
-        # If there was a pre-existing skip error, append to it.
-        if base_result_entry["bcftools_error"]:
+        # Store bcftools stderr output. If there was a pre-skip error, append.
+        if base_result_entry["bcftools_error"]:  # e.g., from pre-skip
             base_result_entry["bcftools_error"] += f"; bcftools stderr: {bcftools_stderr_output}"
         else:
             base_result_entry["bcftools_error"] = f"bcftools stderr: {bcftools_stderr_output}"
@@ -150,7 +147,8 @@ def main():
     """
     parser = argparse.ArgumentParser(
         description="Query a VCF file using bcftools view based on regions from an input JSON file. "
-                    "Only records with found variants and no bcftools errors are saved.",
+                    "The 'bcftools_error' field will not be included in the final output JSON. "
+                    "Use --save-empty-records to include records with no variants (but no errors).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument(
@@ -163,8 +161,8 @@ def main():
     )
     parser.add_argument(
         "-o", "--output_json",
-        default="bcftools_query_clean_variant_results.json",  # Updated default name
-        help="Path to save the output JSON file (only includes records with variants and no bcftools errors)."
+        default="bcftools_query_results.json",
+        help="Path to save the output JSON file."
     )
     parser.add_argument(
         "-t", "--threads",
@@ -173,6 +171,12 @@ def main():
         help=(f"Number of parallel worker threads to use for bcftools queries. "
               f"(default: number of CPU cores, or 1 if CPU count cannot be determined. "
               f"Currently detected cores: {os.cpu_count() if os.cpu_count() else 'N/A'})")
+    )
+    parser.add_argument(
+        "--save-empty-records",
+        action="store_true",
+        default=False,
+        help="If specified, save records to output even if no variants were found (as long as there was no bcftools error during query)."
     )
 
     args = parser.parse_args()
@@ -187,6 +191,7 @@ def main():
     print(f"VCF File: {args.vcf_file}")
     print(f"Output JSON: {args.output_json}")
     print(f"Max Workers (Threads): {max_workers}")
+    print(f"Save Empty Records: {args.save_empty_records}")
     print("-----------------------------")
 
     if not os.path.exists(args.input_json):
@@ -264,27 +269,37 @@ def main():
             try:
                 result_entry = future.result()
 
-                # Stricter condition for saving: variants must exist AND bcftools_error must be null
-                if result_entry.get("variants") and result_entry.get("bcftools_error") is None:
-                    final_results_to_save.append(result_entry)
+                # Condition for saving to output file
+                save_this_record = False
+                # Check if there was a bcftools error reported by the worker or a pre-skip error
+                # The process_item_for_bcftools function populates result_entry["bcftools_error"]
+                # if any issue occurs, including pre-skips or actual bcftools stderr.
+                actual_bcftools_error = result_entry.get("bcftools_error")
+
+                if actual_bcftools_error is None:  # Only proceed if the query and pre-check were clean
+                    if result_entry.get("variants"):  # Variants were found
+                        save_this_record = True
+                    elif args.save_empty_records:  # No variants, but user wants to save empty records
+                        save_this_record = True
+
+                if save_this_record:
+                    # Create a new dict for output, excluding the internal "bcftools_error" field
+                    output_record = {k: v for k, v in result_entry.items() if k != "bcftools_error"}
+                    final_results_to_save.append(output_record)
                 else:
                     skipped_from_output_count += 1
-                    error_msg = result_entry.get("bcftools_error")
+                    # Log why it was skipped from output
                     query_region_log = result_entry.get('query_region', 'N/A')
-                    if not result_entry.get("variants") and error_msg is None:
-                        print(
-                            f"  Item (HapID: {item_id_for_log}): No variants found in region '{query_region_log}'. Not saved.")
-                    elif error_msg:
+                    if actual_bcftools_error:
                         # Don't re-log simple "Skipped:" messages from pre-validation if they somehow got here
-                        if not error_msg.startswith("Skipped:"):
+                        if not actual_bcftools_error.startswith("Skipped:"):
                             print(
-                                f"  Item (HapID: {item_id_for_log}): Query for region '{query_region_log}' had issues or no variants. Error: '{error_msg}'. Not saved.")
-                        else:  # It was a pre-skip, already logged.
-                            print(
-                                f"  Item (HapID: {item_id_for_log}): Pre-skipped query for region '{query_region_log}'. Not saved.")
-                    else:  # Should not happen if variants is empty and error is None, but as a fallback
+                                f"  Item (HapID: {item_id_for_log}): Query for region '{query_region_log}' had issues. Error: '{actual_bcftools_error}'. Not saved.")
+                        # else: pre-skip error was already logged by process_item_for_bcftools
+                    elif not result_entry.get("variants") and not args.save_empty_records:
                         print(
-                            f"  Item (HapID: {item_id_for_log}): No variants for region '{query_region_log}'. Not saved.")
+                            f"  Item (HapID: {item_id_for_log}): No variants found in region '{query_region_log}'. Not saved (as per --save-empty-records=False).")
+                    # else: Other reasons for not saving (e.g. variants empty and save_empty_records is False)
 
                 if processed_count % 50 == 0 or processed_count == len(items_to_process):
                     print(f"  Processed {processed_count}/{len(items_to_process)} submitted tasks...")
@@ -297,15 +312,15 @@ def main():
                 break
             except Exception as exc:
                 print(f"An error occurred processing future for item associated with ID '{item_id_for_log}': {exc}")
-                skipped_from_output_count += 1  # Count this as skipped from output
+                skipped_from_output_count += 1
 
     print(f"\n--- Summary ---")
     print(f"Total items in input JSON: {len(input_data)}")
     print(f"Items skipped due to initial validation: {skipped_due_to_input_validation}")
     print(f"Items submitted for bcftools query: {len(items_to_process)}")
     print(f"Items processed by workers: {processed_count}")
-    print(f"Records saved to output (variants found and no bcftools error): {len(final_results_to_save)}")
-    print(f"Records not saved (no variants or bcftools error/skip): {skipped_from_output_count}")
+    print(f"Records saved to output: {len(final_results_to_save)}")
+    print(f"Records not saved to output (no variants/error/skipped by flag): {skipped_from_output_count}")
 
     try:
         with open(args.output_json, 'w') as outfile:
