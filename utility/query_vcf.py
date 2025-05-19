@@ -144,8 +144,10 @@ def process_item_for_bcftools(item, vcf_file_path):
 
     if bcftools_stderr_output:
         if "bcftools command not found" in bcftools_stderr_output:
+            # This error is critical and indicates a setup problem.
+            # The FileNotFoundError will be raised by the main loop when future.result() is called.
             raise FileNotFoundError(bcftools_stderr_output)
-        base_result_entry["bcftools_error"] = bcftools_stderr_output
+        base_result_entry["bcftools_error"] = bcftools_stderr_output  # Store other stderr messages
 
     return base_result_entry
 
@@ -157,7 +159,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="Query a VCF file using bcftools view based on regions derived from an input JSON file. "
                     "The input JSON should be an array of objects, each with fields like "
-                    "'grch38_chromosome_region', 'grch38_start_position', and 'node_sequence_length'.",
+                    "'grch38_chromosome_region', 'grch38_start_position', and 'node_sequence_length'. "
+                    "Records with no variants found will not be saved to the output.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument(
@@ -170,8 +173,8 @@ def main():
     )
     parser.add_argument(
         "-o", "--output_json",
-        default="bcftools_query_results.json",
-        help="Path to save the output JSON file with bcftools query results."
+        default="bcftools_query_results_with_variants.json",  # Updated default name
+        help="Path to save the output JSON file with bcftools query results (only includes records with variants)."
     )
     parser.add_argument(
         "-t", "--threads",
@@ -207,12 +210,12 @@ def main():
         print(f"Error: Input JSON is not a list as expected. Found type: {type(input_data)}")
         return
 
-    all_results = []
+    all_results_with_variants = []  # List to store results that have variants
 
     print(f"Processing {len(input_data)} items from '{args.input_json}'...")
     print(f"Querying VCF: '{args.vcf_file}' with bcftools view (no header).")
     print(f"Using up to {args.threads} parallel threads.")
-    print(f"Output will be saved to: '{args.output_json}'")
+    print(f"Output (only records with variants) will be saved to: '{args.output_json}'")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as executor:
         future_to_item_info = {
@@ -222,34 +225,45 @@ def main():
         }
 
         processed_count = 0
+        skipped_due_to_no_variants = 0
         for future in concurrent.futures.as_completed(future_to_item_info):
             item_id_for_log = future_to_item_info[future]
             processed_count += 1
             try:
                 result_entry = future.result()
-                all_results.append(result_entry)
+                # Only append to results if the 'variants' list is not empty
+                if result_entry.get("variants"):  # An empty list evaluates to False
+                    all_results_with_variants.append(result_entry)
+                else:
+                    skipped_due_to_no_variants += 1
+                    # Optionally, log that this specific item was skipped for having no variants
+                    # print(f"  Skipping save for item (HapID: {item_id_for_log}): No variants found or query was skipped.")
+
                 if processed_count % 50 == 0 or processed_count == len(input_data):
                     print(f"  Processed {processed_count}/{len(input_data)} items...")
+
             except FileNotFoundError as e:
                 print(f"CRITICAL ERROR: {e}. Aborting further processing.")
-                for f_cancel in future_to_item_info:
+                for f_cancel in future_to_item_info:  # Attempt to cancel remaining tasks
                     if not f_cancel.done() and not f_cancel.cancelled():
                         f_cancel.cancel()
-                break
+                break  # Exit the loop if bcftools is not found
             except Exception as exc:
+                # This catches other errors from future.result() or within process_item_for_bcftools
+                # that were not handled as FileNotFoundError specifically.
                 print(f"An error occurred processing item associated with ID '{item_id_for_log}': {exc}")
-                all_results.append({
-                    "haplotype_id": item_id_for_log,
-                    "query_region": "N/A - processing error",
-                    "variants": [],
-                    "bcftools_error": str(exc)
-                })
+                # We don't add it to all_results_with_variants as it likely has no variants or is an error state
+                # but it has been logged.
+                # If you wanted to save error states too (even without variants), you would append here.
 
     # --- Save all results to the output JSON file ---
     try:
         with open(args.output_json, 'w') as outfile:
-            json.dump(all_results, outfile, indent=4)
-        print(f"\nSuccessfully saved {len(all_results)} results to '{args.output_json}'")
+            json.dump(all_results_with_variants, outfile, indent=4)
+        print(f"\nSuccessfully saved {len(all_results_with_variants)} records (with variants) to '{args.output_json}'")
+        if skipped_due_to_no_variants > 0:
+            print(
+                f"Skipped saving {skipped_due_to_no_variants} records because no variants were found or query was skipped.")
     except IOError:
         print(f"Error: Could not write results to '{args.output_json}'.")
     except Exception as e:
