@@ -123,21 +123,24 @@ def load_node_sequence_from_gfa(gfa_path, target_node_id):
 
 
 def decode_cigar(cigar_string):
-    """Decodes a CIGAR string into a list of (length, operation) tuples."""
+    """Decodes a CIGAR string into a list of (length_str, operation_str) tuples."""
     if not cigar_string or cigar_string == '*':
         return []
     try:
-        return re.findall(r'(\d+)([MIDNSHPX=])', cigar_string)  # Common CIGAR ops
+        # Returns list of tuples, e.g., [('10', 'M'), ('3', 'I'), ('5', 'D')]
+        # Lengths are still strings here.
+        return re.findall(r'(\d+)([MIDNSHPX=])', cigar_string)
     except Exception as e:
         print(f"⚠️ Warning: Could not parse CIGAR string '{cigar_string}': {e}", file=sys.stderr)
         return []
 
 
-def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_cigar_ops,
+def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_cigar_ops_decoded,
                                      target_node_pos, node_sequence,
                                      expected_var_type=None, expected_ref_len_for_del=0):
     """
     Determines the allele presented by a read at a specific target_node_pos.
+    read_cigar_ops_decoded should be a list of (int_length, str_op) tuples.
     Returns:
         - The base character if it's a match/mismatch at target_node_pos.
         - The inserted sequence string if an insertion occurs *after* target_node_pos.
@@ -147,72 +150,59 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_ci
     current_node_pos = read_offset_on_node
     current_read_pos = 0
 
-    for length, op in read_cigar_ops:
+    for length, op in read_cigar_ops_decoded:  # length is already int here
         if op == 'M' or op == '=' or op == 'X':
             if current_node_pos <= target_node_pos < current_node_pos + length:
-                # Target position is within this aligned block
-                if expected_var_type == 'I':  # If we expect an INS, a match here means REF state for INS
+                if expected_var_type == 'I':
                     return "REF_STATE_FOR_INDEL"
-                if expected_var_type == 'D':  # If we expect a DEL, a match here means REF state for DEL
+                if expected_var_type == 'D':
                     return "REF_STATE_FOR_INDEL"
-                # For SNP or general query
                 offset_in_block = target_node_pos - current_node_pos
-                return read_sequence[current_read_pos + offset_in_block]
+                if current_read_pos + offset_in_block < len(read_sequence):
+                    return read_sequence[current_read_pos + offset_in_block]
+                else:  # Should not happen with valid CIGAR/read
+                    return None
             current_node_pos += length
             current_read_pos += length
         elif op == 'I':
-            # Insertion in read occurs after current_node_pos-1 on reference
-            # If target_node_pos is the anchor base *before* the insertion
             if expected_var_type == 'I' and (current_node_pos - 1) == target_node_pos:
                 return read_sequence[current_read_pos: current_read_pos + length]
             current_read_pos += length
         elif op == 'D':
-            # Deletion from reference starts at current_node_pos and spans 'length' bases
             if current_node_pos <= target_node_pos < current_node_pos + length:
-                # The target_node_pos is part of this deletion in the read
-                if expected_var_type == 'I':  # If we expect an INS, a DEL here means OTHER state for INS
-                    return "OTHER_FOR_INDEL"  # Or handle as non-informative for specific INS
+                if expected_var_type == 'I':
+                    return "OTHER_FOR_INDEL"
                 if expected_var_type == 'D':
-                    # Check if this deletion matches the one we are assessing
-                    # This requires comparing the length of deletion
-                    if length == expected_ref_len_for_del:  # Simple check, could be more specific
-                        return "*"  # Represents the deletion allele
+                    if length == expected_ref_len_for_del:
+                        return "*"
                     else:
-                        return "OTHER_FOR_INDEL"  # Different deletion
-                return "*"  # General case: read shows a deletion at target_node_pos
+                        return "OTHER_FOR_INDEL"
+                return "*"
             current_node_pos += length
         elif op == 'S':
             current_read_pos += length
         elif op == 'N':
             current_node_pos += length
 
-        # If we've passed the target position without an informative operation
-        if current_node_pos > target_node_pos + 1 and (op in ['M', '=', 'X', 'D', 'N']):  # Add some buffer for indels
-            # For indels, target_node_pos can be an anchor, so check current_node_pos > target_node_pos
+        if current_node_pos > target_node_pos + 1 and (op in ['M', '=', 'X', 'D', 'N']):
             if not (expected_var_type == 'I' and (current_node_pos - 1) <= target_node_pos):
-                break  # Optimization: stop if we've passed the relevant part of the read
+                break
 
-    return None  # Read does not informatively cover the position for the given type or is complex
+    return None
 
 
-def detect_variants_from_cigar(offset_on_node, cigar_string, read_sequence, node_sequence):
+def detect_variants_from_cigar(offset_on_node, cigar_ops_decoded, read_sequence, node_sequence):
     """
     Detects variants (mismatches, insertions, deletions) based on CIGAR and sequence alignment.
+    cigar_ops_decoded should be a list of (int_length, str_op) tuples.
     Returns a list of tuples: (position_on_node, variant_type, alt_allele, ref_allele)
     """
     variants = []
     node_pos = offset_on_node
     read_pos = 0
-    cigar_ops = decode_cigar(cigar_string)
+    # cigar_ops_decoded already contains (int_length, str_op)
 
-    for length_str, op in cigar_ops:
-        try:
-            length = int(length_str)
-        except ValueError:
-            print(f"⚠️ Warning: Invalid length in CIGAR operation '{length_str}{op}' in string '{cigar_string}'",
-                  file=sys.stderr)
-            continue
-
+    for length, op in cigar_ops_decoded:  # length is already int
         if op == 'M' or op == '=' or op == 'X':
             for i in range(length):
                 current_node_pos = node_pos + i
@@ -226,17 +216,15 @@ def detect_variants_from_cigar(offset_on_node, cigar_string, read_sequence, node
             read_pos += length
         elif op == 'I':
             inserted_sequence = read_sequence[read_pos: read_pos + length]
-            # Anchor position for insertion is the base *before* it on the reference
-            ref_anchor_pos = node_pos - 1 if node_pos > 0 else 0  # Handle insertion at start of node alignment
-            # Ref allele for an insertion is often represented by the base at anchor_pos or empty/placeholder
-            # For simplicity, using '*' as ref for indel events.
+            ref_anchor_pos = node_pos - 1 if node_pos > 0 else 0
             ref_base_at_anchor = node_sequence[ref_anchor_pos] if ref_anchor_pos < len(
                 node_sequence) and ref_anchor_pos >= 0 else ""
             variants.append((ref_anchor_pos, 'I', inserted_sequence, ref_base_at_anchor if ref_base_at_anchor else "*"))
             read_pos += length
         elif op == 'D':
-            deleted_sequence_from_ref = node_sequence[node_pos: node_pos + length]
-            variants.append((node_pos, 'D', '*', deleted_sequence_from_ref))  # Alt is '*', Ref is deleted part
+            deleted_sequence_from_ref = node_sequence[node_pos: node_pos + length] if node_pos + length <= len(
+                node_sequence) else ""
+            variants.append((node_pos, 'D', '*', deleted_sequence_from_ref))
             node_pos += length
         elif op == 'S':
             read_pos += length
@@ -268,10 +256,10 @@ def process_single_node_for_pileup(task_args):
     if not node_sequence: return node_id, {}
 
     node_len = len(node_sequence)
-    final_variant_data = {}  # Store final data including AF
+    final_variant_data = {}
     aligned_read_segments = []
 
-    try:  # Read all segments for the node
+    try:
         worker_dat_file.seek(dat_file_offset + 10)
         for record_idx in range(n_records):
             data = worker_dat_file.read(RECORD_SIZE)
@@ -280,26 +268,38 @@ def process_single_node_for_pileup(task_args):
             if mapq < 10: continue
             try:
                 seq = raw_seq.rstrip(b'\x00').decode('ascii', errors='replace')
-                cigar = raw_cigar.rstrip(b'\x00').decode('ascii', errors='replace')
+                cigar_str = raw_cigar.rstrip(b'\x00').decode('ascii', errors='replace')
                 strand_char = strand_byte.decode('ascii')
             except UnicodeDecodeError:
                 continue
+
             current_read_sequence = reverse_complement(seq) if strand_char == '-' else seq
+
+            # Decode CIGAR string into (int_length, str_op) tuples
+            decoded_cigar_ops = []
+            for len_str_op, char_op in decode_cigar(cigar_str):  # decode_cigar returns (str_len, str_op)
+                try:
+                    decoded_cigar_ops.append((int(len_str_op), char_op))
+                except ValueError:
+                    print(
+                        f"⚠️ Warning [Worker {os.getpid()}]: Invalid length in CIGAR op for node {node_id}, record {record_idx + 1}. Skipping op.",
+                        file=sys.stderr)
+                    continue  # Skip this malformed CIGAR operation
+
             aligned_read_segments.append({
                 "offset_on_node": off, "read_sequence": current_read_sequence,
-                "cigar_string": cigar, "cigar_ops": decode_cigar(cigar),  # Pre-decode CIGAR
+                "cigar_string": cigar_str,  # Keep original string for reference if needed
+                "cigar_ops": decoded_cigar_ops,  # Store pre-decoded CIGAR
                 "original_strand": strand_char
             })
     except Exception as e:
         print(f"❌ Error [Worker {os.getpid()}] reading records for node {node_id}: {e}", file=sys.stderr)
         return node_id, {}
 
-    # 1. Detect all unique variants defined by reads
-    # Key: (pos, type, ref, alt), Value: list of read_info for pileup matrix
     raw_variant_occurrences = defaultdict(list)
     for segment in aligned_read_segments:
         variants_in_read = detect_variants_from_cigar(
-            segment["offset_on_node"], segment["cigar_string"],
+            segment["offset_on_node"], segment["cigar_ops"],  # Pass decoded CIGAR ops
             segment["read_sequence"], node_sequence
         )
         for v_pos, v_type, v_alt, v_ref in variants_in_read:
@@ -308,7 +308,6 @@ def process_single_node_for_pileup(task_args):
                 "read_sequence": segment["read_sequence"]
             })
 
-    # 2. For each unique variant, calculate AF and build pileup
     window_size = 60
     half_window = window_size // 2
 
@@ -316,113 +315,84 @@ def process_single_node_for_pileup(task_args):
         alt_allele_count = len(reads_defining_alt)
         ref_allele_count = 0
         other_allele_count = 0
-        coverage_at_locus = 0
 
         expected_ref_len_for_del = len(v_ref_defined) if v_type == 'D' else 0
 
-        for segment in aligned_read_segments:  # Iterate all reads covering the locus
-            # Check if this read informs the locus v_pos for v_type
-            # This requires checking if the read spans v_pos and what allele it presents
-
-            # Simplified check: does read span v_pos?
-            # A more precise check would use CIGAR to see if v_pos is matched/mismatched or part of an indel
+        # Determine coverage and allele counts at the specific variant locus
+        # This loop iterates over ALL reads aligned to the node, not just those defining this variant.
+        locus_specific_coverage = 0
+        for segment in aligned_read_segments:
+            # Check if this read actually covers the variant position v_pos
+            # This needs to consider the read's alignment span on the node sequence
             read_start_on_node = segment["offset_on_node"]
-            read_end_on_node = read_start_on_node  # Needs CIGAR to determine actual end
-
-            # Quick CIGAR parse to find read span on reference
-            temp_node_pos_for_span = segment["offset_on_node"]
-            for l_span, op_span in segment["cigar_ops"]:
+            current_node_pos_for_span = segment["offset_on_node"]
+            for l_span, op_span in segment["cigar_ops"]:  # l_span is already int
                 if op_span in ('M', '=', 'X', 'D', 'N'):
-                    temp_node_pos_for_span += l_span
-            read_end_on_node = temp_node_pos_for_span
+                    current_node_pos_for_span += l_span
+            read_end_on_node_exclusive = current_node_pos_for_span  # End is exclusive for 0-based span
 
-            # Check if v_pos (or anchor for insertion) is covered
-            locus_covered = False
-            if v_type == 'I':  # v_pos is anchor, insertion is after v_pos
-                # Read needs to span the base before v_pos and the base after v_pos (or end of read)
-                # to inform about presence/absence of insertion
-                if read_start_on_node <= v_pos < read_end_on_node:  # Simplified: covers anchor
-                    locus_covered = True
-            else:  # SNP or Deletion, v_pos is the start of the event
-                if read_start_on_node <= v_pos < read_end_on_node:
-                    locus_covered = True
+            # Determine if the variant position v_pos is within this read's span on the node
+            # For insertions, v_pos is the base *before* the insertion.
+            # The read must cover this anchor base and potentially the next one to inform.
+            is_locus_covered_by_read = False
+            if v_type == 'I':
+                # Read covers anchor v_pos and the position after (or read ends at anchor)
+                if read_start_on_node <= v_pos < read_end_on_node_exclusive:
+                    is_locus_covered_by_read = True
+            else:  # For 'X' or 'D', v_pos is the first affected base
+                if read_start_on_node <= v_pos < read_end_on_node_exclusive:
+                    is_locus_covered_by_read = True
 
-            if not locus_covered:
+            if not is_locus_covered_by_read:
                 continue
 
-            # If covered, determine what this read supports at v_pos for v_type
-            coverage_at_locus += 1
-
-            # Does this read define the exact (v_pos, v_type, v_ref_defined, v_alt_defined)?
-            # We know it does if it's in reads_defining_alt, but those are already counted in alt_allele_count.
-            # We need to check reads NOT in reads_defining_alt for their support of REF or OTHER.
-
-            # Check if this read *also* generated the current unique_variant
-            # This is a bit tricky because a read can generate multiple variants.
-            # We are interested if *this specific variant being iterated* is present in the read.
-
-            is_this_read_defining_current_alt = False
-            # This check is not perfect because reads_defining_alt contains dicts, not segments.
-            # For simplicity, assume if a read is NOT among those that defined the ALT, it's either REF or OTHER.
-            # A more robust way is to re-evaluate the read against this specific variant.
-
-            # Re-evaluate what this read presents for the *specific variant* (v_pos, v_type, v_ref_defined, v_alt_defined)
-            read_allele_type = "OTHER"  # Default
-
-            # Simplified logic for now: if it's not one of the reads that *defined* this alt,
-            # assume it's ref or other. This is an approximation.
-            # A full re-evaluation of each read against each variant type is needed for perfect AF.
-
-            # For now, let's use a proxy:
-            # If this read is not in `reads_defining_alt` (hard to check directly with current structure)
-            # we assume it's either REF or OTHER.
-            # This part needs significant refinement for accurate ref/other counts for indels.
-
-            # Let's count ref based on reads that *don't* have this specific variant
-            # but *do* cover the site and match the reference state.
-            # This is the most complex part.
-
-            # Simplified AF: alt_count is known. Coverage is reads spanning the site.
-            # Ref_count = coverage - alt_count - other_count (where other is not easy yet)
-
-            # Let's use the get_allele_from_read_at_node_pos for a more direct check
-            allele_in_read = get_allele_from_read_at_node_pos(
+            # If covered, what allele does this read present for *this specific variant*?
+            allele_presented_by_read = get_allele_from_read_at_node_pos(
                 segment["offset_on_node"], segment["read_sequence"], segment["cigar_ops"],
                 v_pos, node_sequence, v_type, expected_ref_len_for_del
             )
 
-            if allele_in_read is None:  # Read doesn't inform this specific locus/type well
-                coverage_at_locus -= 1  # Don't count it in coverage for AF
+            if allele_presented_by_read is None:  # Not informative for this variant type/locus
                 continue
 
-            # Check if this read supports the v_alt_defined
-            supported_alt_in_this_read = False
-            if v_type == 'X' and allele_in_read == v_alt_defined:
-                supported_alt_in_this_read = True
-            elif v_type == 'I' and allele_in_read == v_alt_defined:  # allele_in_read is inserted seq
-                supported_alt_in_this_read = True
-            elif v_type == 'D' and allele_in_read == "*":  # and v_ref_defined matches deletion from read
-                # This check needs to be more robust for specific deleted sequence if needed
-                supported_alt_in_this_read = True  # Assuming '*' means it supports *a* deletion here
+            locus_specific_coverage += 1  # This read contributes to coverage at the locus
 
-            if supported_alt_in_this_read:
-                # This read contributes to alt_allele_count, which is already len(reads_defining_alt)
-                # If this read was NOT in reads_defining_alt but still supports it, this logic is flawed.
-                # Assuming reads_defining_alt correctly captures all reads for this exact alt.
-                pass
-            elif allele_in_read == "REF_STATE_FOR_INDEL" or \
-                    (v_type == 'X' and allele_in_read == v_ref_defined):
-                ref_allele_count += 1
-            else:  # Supports neither the defined alt nor the defined ref
-                other_allele_count += 1
+            # Now, classify the allele presented by this read
+            if v_type == 'X':
+                if allele_presented_by_read == v_alt_defined:
+                    # This read supports the alt, already counted by len(reads_defining_alt)
+                    # We only need to count ref/other from reads *not* in reads_defining_alt
+                    # This logic needs to ensure we don't double count.
+                    # The `alt_allele_count` is the primary count from `reads_defining_alt`.
+                    # We now need to find `ref_allele_count` and `other_allele_count` from all covering reads.
+                    pass  # Will be handled by `alt_allele_count`
+                elif allele_presented_by_read == v_ref_defined:
+                    ref_allele_count += 1
+                else:
+                    other_allele_count += 1
+            elif v_type == 'I':
+                if allele_presented_by_read == v_alt_defined:  # Inserted sequence matches
+                    pass  # Handled by alt_allele_count
+                elif allele_presented_by_read == "REF_STATE_FOR_INDEL":  # Read shows no such insertion
+                    ref_allele_count += 1
+                else:  # Different insertion or other event
+                    other_allele_count += 1
+            elif v_type == 'D':
+                if allele_presented_by_read == "*":  # Read shows a deletion matching expected length
+                    # This assumes '*' from get_allele means it matches the v_alt_defined='*'
+                    # and length was checked inside get_allele_from_read_at_node_pos
+                    pass  # Handled by alt_allele_count
+                elif allele_presented_by_read == "REF_STATE_FOR_INDEL":  # Read shows no such deletion
+                    ref_allele_count += 1
+                else:  # Different deletion or other event
+                    other_allele_count += 1
 
-        # Adjust coverage: it's sum of alt (already counted), ref, and other
-        # The initial coverage_at_locus was just reads spanning.
-        # More accurate coverage for AF is alt_allele_count + ref_allele_count + other_allele_count
+        # Correct alt_allele_count should not be double-counted with ref/other if a read defining alt also defines ref for another variant
+        # The current `alt_allele_count = len(reads_defining_alt)` is correct for *this specific alt*.
+        # `ref_allele_count` and `other_allele_count` are reads that cover the locus but *do not* show this specific alt.
         effective_coverage = alt_allele_count + ref_allele_count + other_allele_count
         alt_freq = alt_allele_count / effective_coverage if effective_coverage > 0 else 0.0
 
-        # Build pileup matrix from reads that defined this alternate variant
         pileup_matrix = np.full((len(reads_defining_alt), window_size), BASE_TO_INDEX['N'], dtype=np.uint8)
         for i, read_info in enumerate(reads_defining_alt):
             read_offset_on_node = read_info["read_offset_on_node"]
@@ -442,7 +412,7 @@ def process_single_node_for_pileup(task_args):
             "ref_allele_count_at_locus": ref_allele_count,
             "other_allele_count_at_locus": other_allele_count,
             "coverage_at_locus": effective_coverage,
-            "alt_allele_frequency": round(alt_freq, 4)  # Round for display
+            "alt_allele_frequency": round(alt_freq, 4)
         }
 
     return node_id, final_variant_data
@@ -467,7 +437,6 @@ def display_pileup_data(pileup_data_dict, max_reads_to_display_per_variant, max_
 
         print(f"\n=== Displaying Pileups for Node ID: {node_id_str} ===")
         variants_displayed_count = 0
-        # Sort variants by position (first part of the key)
         sorted_variant_keys = sorted(variants_dict.keys(), key=lambda x: int(x.split('_')[0]))
 
         for variant_key in sorted_variant_keys:
@@ -484,7 +453,11 @@ def display_pileup_data(pileup_data_dict, max_reads_to_display_per_variant, max_
             print(f"  Ref Count: {variant_data.get('ref_allele_count_at_locus', 'N/A')}")
             print(f"  Other Count: {variant_data.get('other_allele_count_at_locus', 'N/A')}")
             print(f"  Coverage: {variant_data.get('coverage_at_locus', 'N/A')}")
-            print(f"  Alt Freq: {variant_data.get('alt_allele_frequency', 'N/A'):.4f}")
+            alt_freq_val = variant_data.get('alt_allele_frequency', 'N/A')
+            if isinstance(alt_freq_val, float):
+                print(f"  Alt Freq: {alt_freq_val:.4f}")
+            else:
+                print(f"  Alt Freq: {alt_freq_val}")
 
             if not pileup_matrix_indices:
                 print("  (No reads in pileup matrix for this variant)")
