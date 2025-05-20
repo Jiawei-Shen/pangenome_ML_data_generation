@@ -16,8 +16,7 @@ from concurrent.futures import ProcessPoolExecutor
 # Constants
 RECORD_STRUCT = struct.Struct("<h150s150s20shc")  # Read offset, sequence, base qualities, CIGAR, MAPQ, strand
 RECORD_SIZE = RECORD_STRUCT.size
-BASE_TO_INDEX = {'A': 0, 'C': 1, 'G': 2, 'T': 3, 'N': 4, '*': 4}  # '*' for deletions in pileup vis
-INDEX_TO_BASE_FOR_VIEW = {0: 'A', 1: 'C', 2: 'G', 3: 'T', 4: 'N'}  # For viewing, '*' will show as 'N'
+BASE_TO_INDEX = {'A': 0, 'C': 1, 'G': 2, 'T': 3, 'N': 4, '*': 4}  # Added '*' for deletions in pileup vis
 
 # Global for worker process state (file handle)
 worker_dat_file = None
@@ -167,16 +166,26 @@ def detect_variants_from_cigar(offset_on_node, cigar_string, read_sequence, node
             node_pos += length
             read_pos += length
         elif op == 'I':  # Insertion to the reference (node)
+            # Insertion occurs *after* node_pos-1 on the node.
+            # The inserted sequence is from read_pos to read_pos + length - 1 in the read.
             inserted_sequence = read_sequence[read_pos: read_pos + length]
-            ref_anchor_pos = node_pos - 1
+            # Position of insertion is typically the base *before* the insertion on the reference.
+            # If node_pos is 0, it's an insertion at the beginning.
+            ref_anchor_pos = node_pos - 1  # Base before insertion
             variants.append((ref_anchor_pos, 'I', inserted_sequence, '*'))
-            read_pos += length
+            read_pos += length  # Consumes read bases
+            # Does not consume node bases
         elif op == 'D':  # Deletion from the reference (node)
+            # Deletion starts *at* node_pos on the node.
+            # The deleted sequence is from node_pos to node_pos + length - 1 on the node.
             deleted_sequence = node_sequence[node_pos: node_pos + length]
             variants.append((node_pos, 'D', '*', deleted_sequence))
-            node_pos += length
+            node_pos += length  # Consumes node bases
+            # Does not consume read bases
         elif op == 'S':  # Soft clipping
-            read_pos += length
+            read_pos += length  # Consumes read bases
+        # Other CIGAR ops like H (hard clipping), P (padding), N (skipped region) are ignored for basic pileup
+        # H and P do not consume read or reference for alignment purposes here. N consumes reference.
         elif op == 'N':  # Skipped region from reference
             node_pos += length
 
@@ -189,6 +198,7 @@ def detect_variants_from_cigar(offset_on_node, cigar_string, read_sequence, node
 def init_worker(dat_file_path_for_worker):
     """Initializer for each worker process: opens the .dat file."""
     global worker_dat_file
+    # print(f"[Worker {os.getpid()}] Initializing and opening {dat_file_path_for_worker}")
     try:
         worker_dat_file = open(dat_file_path_for_worker, 'rb')
     except FileNotFoundError:
@@ -218,10 +228,22 @@ def process_single_node_for_pileup(task_args):
         return node_id, {}
 
     node_len = len(node_sequence)
-    variant_pileups = {}
+    # segments = [] # Store (offset_on_node, read_sequence, cigar_string)
+
+    # Pileup matrix: rows = positions on node, columns = A, C, G, T, N, Ins, Del
+    # For simplicity, let's create a dictionary of pileups for each variant position.
+    # pileups_at_variant_sites = defaultdict(lambda: np.zeros(5, dtype=np.uint32)) # A,C,G,T,N counts
+
+    # More detailed pileup: for each variant, store a window of aligned read bases
+    variant_pileups = {}  # Key: "pos_type", Value: list of lists (pileup matrix)
+
+    # Store all read segments that align to this node
     aligned_read_segments = []
 
     try:
+        # The first 10 bytes of a block in .dat are metadata (node_id_block, offset_block, block_size_block)
+        # The actual alignment records start after this.
+        # The offset from .idx file is the start of the block for this node.
         worker_dat_file.seek(dat_file_offset + 10)  # Skip block header
 
         for record_idx in range(n_records):
@@ -235,11 +257,11 @@ def process_single_node_for_pileup(task_args):
 
                 off, raw_seq, _, raw_cigar, mapq, strand_byte = RECORD_STRUCT.unpack(data)
 
-                if mapq < 10:
+                if mapq < 10:  # Basic MAPQ filter
                     continue
 
                 try:
-                    seq = raw_seq.rstrip(b'\x00').decode('ascii', errors='replace')
+                    seq = raw_seq.rstrip(b'\x00').decode('ascii', errors='replace')  # Replace invalid bytes
                     cigar = raw_cigar.rstrip(b'\x00').decode('ascii', errors='replace')
                     strand_char = strand_byte.decode('ascii')
                 except UnicodeDecodeError as ude:
@@ -248,18 +270,35 @@ def process_single_node_for_pileup(task_args):
                         file=sys.stderr)
                     continue
 
+                read_len_from_seq = len(seq)  # Actual length of decoded sequence
+
+                # Adjust offset and reverse complement sequence for reverse strand reads
                 current_offset_on_node = off
                 current_read_sequence = seq
 
                 if strand_char == '-':
+                    # The offset 'off' from the .dat file for a reverse strand read
+                    # is typically the start position of the alignment on the FORWARD strand
+                    # representation of the node.
+                    # To map this to the reverse complemented node sequence (if we were to use one),
+                    # or to correctly place the reverse complemented read on the forward node sequence,
+                    # we need to adjust.
+                    # If the node_sequence is always forward, and we reverse_complement the read,
+                    # the 'off' still refers to the start on the forward node.
+                    # The original script had: adj_off = node_len - off - read_len_from_seq
+                    # This adj_off would be the start of the revcomp read on a revcomp node.
+                    # Let's keep node_sequence as forward. If read is '-', revcomp it.
+                    # The 'off' from .dat should be the 0-based start on the forward node.
                     current_read_sequence = reverse_complement(seq)
+                    # 'off' remains the start position on the forward reference node.
 
+                # Store the processed read segment for later pileup generation
                 aligned_read_segments.append({
                     "offset_on_node": current_offset_on_node,
-                    "read_sequence": current_read_sequence,
+                    "read_sequence": current_read_sequence,  # Already reverse_complemented if needed
                     "cigar_string": cigar,
                     "mapq": mapq,
-                    "strand": strand_char
+                    "strand": strand_char  # Original strand
                 })
 
             except struct.error as se:
@@ -283,30 +322,41 @@ def process_single_node_for_pileup(task_args):
               file=sys.stderr)
         return node_id, {}
 
-    all_variant_sites = defaultdict(lambda: {"count": 0, "reads_info": []})
+    # --- Variant Detection and Pileup Generation from collected segments ---
+    # First, identify all unique variant sites from all reads aligned to this node
+    all_variant_sites = defaultdict(lambda: {"count": 0, "reads_info": []})  # Store reads supporting each variant
 
     for segment in aligned_read_segments:
+        # Variants are (pos_on_node, type, alt, ref)
         variants_in_read = detect_variants_from_cigar(
             segment["offset_on_node"],
             segment["cigar_string"],
-            segment["read_sequence"],
-            node_sequence
+            segment["read_sequence"],  # Use the (potentially revcomped) read sequence
+            node_sequence  # Use the forward node sequence
         )
         for v_pos, v_type, v_alt, v_ref in variants_in_read:
-            variant_key = f"{v_pos}_{v_type}_{v_ref}_{v_alt}"
+            variant_key = f"{v_pos}_{v_type}_{v_ref}_{v_alt}"  # More specific key
             all_variant_sites[variant_key]["count"] += 1
+            # Store read info for pileup generation around this variant
             all_variant_sites[variant_key]["reads_info"].append({
                 "read_offset_on_node": segment["offset_on_node"],
                 "read_sequence": segment["read_sequence"]
+                # "original_strand": segment["strand"] # If needed for strand bias, etc.
             })
 
-    window_size = 60
+    # Now, generate pileup windows around each identified variant site
+    window_size = 60  # Characters in the pileup window (e.g., 30 left, variant, 30 right)
     half_window = window_size // 2
 
     for variant_key, data in all_variant_sites.items():
         parts = variant_key.split('_')
-        v_pos = int(parts[0])
+        v_pos = int(parts[0])  # 0-based position of the variant on the node
+        # v_type = parts[1]
+        # v_ref = parts[2]
+        # v_alt = parts[3]
 
+        # Pileup matrix for this variant: (num_supporting_reads, window_size)
+        # Filled with index of 'N' initially
         pileup_matrix = np.full((len(data["reads_info"]), window_size), BASE_TO_INDEX['N'], dtype=np.uint8)
 
         for i, read_info in enumerate(data["reads_info"]):
@@ -314,62 +364,38 @@ def process_single_node_for_pileup(task_args):
             read_seq = read_info["read_sequence"]
             read_len = len(read_seq)
 
+            # Determine the portion of the read that aligns to the pileup window
+            # The pileup window is centered around v_pos on the node sequence
+            # Window start on node: v_pos - half_window + 1 (if v_pos is the variant itself)
+            # Or, if v_pos is the first base of a multi-base variant:
+            # Let's center the window around v_pos.
+
+            # For each position in the window (0 to window_size - 1)
             for j in range(window_size):
+                # Position in the window relative to the center (v_pos)
+                # window_pos_on_node is the 0-based coordinate on the node sequence
+                # for the j-th base of the pileup window.
                 window_pos_on_node = (v_pos - half_window) + j
+
+                # Corresponding position in the current read
+                # read_char_idx = (position on node) - (read's start offset on node)
                 read_char_idx = window_pos_on_node - read_offset_on_node
 
                 if 0 <= read_char_idx < read_len:
                     base = read_seq[read_char_idx].upper()
                     pileup_matrix[i, j] = BASE_TO_INDEX.get(base, BASE_TO_INDEX['N'])
+                # else: it's outside the read, remains 'N'
 
-        variant_pileups[variant_key] = pileup_matrix.tolist()
+        variant_pileups[variant_key] = pileup_matrix.tolist()  # Convert numpy array to list for JSON
+
+    # print(f"[Worker {os.getpid()}] Finished node {node_id}. Found {len(variant_pileups)} variant sites with pileups.")
     return node_id, variant_pileups
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Pileup Viewing Function (Integrated from view_pileup_json)
-# ─────────────────────────────────────────────────────────────────────────────
-def display_pileup_data(pileup_data_dict, max_reads_to_display_per_variant):
-    """
-    Prints pileup data from the results dictionary in a human-readable format.
-    """
-    if not pileup_data_dict:
-        print("ℹ️ No pileup data to display.", file=sys.stderr)
-        return
-
-    for node_id_str, variants_dict in pileup_data_dict.items():
-        if not isinstance(variants_dict, dict):
-            print(f"⚠️ Warning: Data for node '{node_id_str}' is not in the expected format. Skipping display.",
-                  file=sys.stderr)
-            continue
-
-        if not variants_dict:
-            print(f"ℹ️ No variants found or pileups generated for node ID: {node_id_str}")
-            continue
-
-        print(f"\n=== Displaying Pileups for Node ID: {node_id_str} ===")
-        for variant_key, pileup_matrix_indices in variants_dict.items():
-            print(f"\n--- Variant: {variant_key} ---")
-            if not pileup_matrix_indices:
-                print("  (No reads in pileup for this variant)")
-                continue
-
-            displayed_reads_count = 0
-            for i, row_indices in enumerate(pileup_matrix_indices):
-                if displayed_reads_count >= max_reads_to_display_per_variant:
-                    print(f"  ... (and {len(pileup_matrix_indices) - max_reads_to_display_per_variant} more reads)")
-                    break
-
-                pileup_row_str = "".join([INDEX_TO_BASE_FOR_VIEW.get(idx, '?') for idx in row_indices])
-                print(f"  Read {i + 1:3d}: {pileup_row_str}")
-                displayed_reads_count += 1
-    print("\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate variant-centered pileups for a single specified node and optionally view them.",
+        description="Generate variant-centered pileups for a single specified node.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("dat", help=".dat file path (read alignment data)")
@@ -379,10 +405,8 @@ def main():
     parser.add_argument("--gfa", help="GFA graph file path (required if node sequence cache is not used/built).")
     parser.add_argument("--load-cache", help="Load node sequence from this JSON cache file.")
     parser.add_argument("--save-cache", help="Save node sequence to this JSON cache file (used if --gfa is provided).")
-    parser.add_argument("--view", action="store_true", default=False,
-                        help="Print the generated pileups to the console in a human-readable format after saving the JSON.")
-    parser.add_argument("--max_view_reads", type=int, default=20,
-                        help="Maximum number of reads to display per pileup matrix in console view (if --view is used).")
+    # Workers argument is kept for consistency but will effectively be 1 for a single node.
+    # parser.add_argument("-w", "--workers", type=int, default=1, help="Number of worker processes (should be 1 for single node).")
 
     args = parser.parse_args()
 
@@ -429,27 +453,30 @@ def main():
         try:
             with open(args.load_cache, 'r') as cf:
                 cached_sequences = json.load(cf)
+                # Keys in JSON cache are strings
                 node_sequence = cached_sequences.get(str(target_node_id))
             if node_sequence:
                 print(
                     f"✔ Loaded sequence for node {target_node_id} from cache in {time.time() - start_time:.2f} seconds.")
             else:
                 print(f"⚠️ Warning: Node {target_node_id} not found in cache {args.load_cache}.")
-                if not args.gfa:
+                if not args.gfa:  # If GFA is not provided as fallback
                     print(f"❌ Error: Node {target_node_id} not in cache and no GFA provided. Exiting.", file=sys.stderr)
                     sys.exit(1)
         except Exception as e:
             print(f"❌ Error loading cache file {args.load_cache}: {e}", file=sys.stderr)
+            # Potentially fallback to GFA if provided
             if not args.gfa: sys.exit(1)
-            node_sequence = None
+            node_sequence = None  # Ensure it's reset if cache load failed
 
-    if node_sequence is None and args.gfa:
+    if node_sequence is None and args.gfa:  # Fallback to GFA or primary source
         print(f"🔹 Loading node sequence for {target_node_id} from GFA: {args.gfa}...")
         start_time = time.time()
         node_sequence = load_node_sequence_from_gfa(args.gfa, target_node_id)
         if node_sequence and args.save_cache:
             print(f"🔹 Saving node sequence for {target_node_id} to cache: {args.save_cache}...")
             try:
+                # Load existing cache if it exists to update it, otherwise create new
                 existing_cache_data = {}
                 if os.path.isfile(args.save_cache):
                     with open(args.save_cache, 'r') as scf_read:
@@ -458,7 +485,9 @@ def main():
                         except json.JSONDecodeError:
                             print(f"⚠️ Warning: Existing cache file {args.save_cache} is corrupted. Overwriting.",
                                   file=sys.stderr)
-                existing_cache_data[str(target_node_id)] = node_sequence
+
+                existing_cache_data[str(target_node_id)] = node_sequence  # Add/update current node
+
                 with open(args.save_cache, 'w') as scf_write:
                     json.dump(existing_cache_data, scf_write)
                 print(f"✔ Saved sequence for node {target_node_id} to cache.")
@@ -472,42 +501,48 @@ def main():
         print(f"❌ Error: Failed to obtain sequence for target node {target_node_id}. Exiting.", file=sys.stderr)
         sys.exit(1)
 
+    # --- Prepare Single Task ---
     task = (target_node_id, dat_offset, n_records, node_sequence)
     print(f"🔹 Prepared task for node {target_node_id}.")
 
+    # --- Execute Task (using ProcessPoolExecutor with 1 worker for consistency with init_worker) ---
     results = {}
     print(f"🔹 Processing node {target_node_id} using 1 worker...")
     start_proc_time = time.time()
 
     try:
-        with ProcessPoolExecutor(max_workers=1, initializer=init_worker, initargs=(args.dat,)) as executor:
+        # Using max_workers=1 as we are processing a single node.
+        # The initializer will open the .dat file for this single worker.
+        with ProcessPoolExecutor(max_workers=1,
+                                 initializer=init_worker,
+                                 initargs=(args.dat,)) as executor:
+            # Submit the single task
             future = executor.submit(process_single_node_for_pileup, task)
+            # Get the result (this will block until the task is done)
             processed_node_id, pileup_dict = future.result()
+
             if pileup_dict is not None:
-                results[str(processed_node_id)] = pileup_dict
+                results[str(processed_node_id)] = pileup_dict  # Store with string key for JSON
             else:
                 print(f"⚠️ Warning: Processing for node {processed_node_id} did not yield results.", file=sys.stderr)
+
     except Exception as pool_exc:
         print(f"\n❌ An error occurred during processing node {target_node_id}: {pool_exc}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(1)  # Exit if processing fails for the single node
 
     total_elapsed_time = time.time() - start_proc_time
     print(f"✔ Node {target_node_id} processing finished in {total_elapsed_time:.2f} seconds.")
 
+    # --- Write Output ---
     if results:
         print(f"🔹 Writing pileup results for node {target_node_id} to JSON output: {args.output}")
         start_write_time = time.time()
         try:
             with open(args.output, 'w') as out_f:
-                json.dump(results, out_f, indent=2)
+                json.dump(results, out_f, indent=2)  # results will contain one key: target_node_id (as string)
             write_elapsed_time = time.time() - start_write_time
             print(f"✔ Output written in {write_elapsed_time:.2f} seconds.")
-            print(f"✅ Pileup JSON saved to {args.output}")
-
-            if args.view:
-                print(f"\n🔹 Displaying pileups from generated data (max {args.max_view_reads} reads per variant)...")
-                display_pileup_data(results, args.max_view_reads)
-
+            print(f"✅ Done. Output saved to {args.output}")
         except IOError as ioe:
             print(f"❌ Error writing output JSON to {args.output}: {ioe}", file=sys.stderr)
             sys.exit(1)
@@ -515,9 +550,8 @@ def main():
             print(f"❌ Unexpected error writing output JSON: {e}", file=sys.stderr)
             sys.exit(1)
     else:
-        print(f"ℹ️ No pileup data generated for node {target_node_id}. Output file not written if empty.")
-
-    print("✅ Script finished.")
+        print(
+            f"ℹ️ No pileup data generated for node {target_node_id} (this might be expected if no variants or reads). Output file not written if empty.")
 
 
 if __name__ == '__main__':
