@@ -168,9 +168,8 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_ci
             if current_node_pos <= target_node_pos < current_node_pos + length:
                 if expected_var_type == 'I': return "OTHER_FOR_INDEL"
                 if expected_var_type == 'D':
-                    deleted_seq_in_read = node_sequence[
-                                          current_node_pos: current_node_pos + length]  # This is ref sequence
-                    if deleted_seq_in_read == expected_ref_allele_for_indel:  # expected_ref_allele_for_indel is v_ref_defined
+                    # Compare the length of deletion for matching
+                    if length == len(expected_ref_allele_for_indel if expected_ref_allele_for_indel else ""):
                         return "*"
                     else:
                         return "OTHER_FOR_INDEL"
@@ -229,45 +228,48 @@ def detect_variants_from_cigar(offset_on_node, cigar_ops_decoded, read_sequence,
 
 
 def get_read_representation_in_window(segment_cigar_ops, segment_offset_on_node, segment_read_sequence,
-                                      window_start_node, window_size, node_len):
+                                      window_start_node, window_size, node_total_len):
     """
     For a single read, generates its character representation across a defined window on the node.
     Returns a list of characters of length window_size.
     ' ' for no coverage, '*' for deletion, base for match/mismatch.
-    Insertions are not explicitly expanded in this node-coordinate based window.
     """
     window_char_representation = [' '] * window_size
 
-    current_node_pos_in_read = segment_offset_on_node
-    current_read_pos_in_read = 0
+    current_node_pos_from_read_start = segment_offset_on_node
+    current_read_seq_pos = 0
 
     for cigar_len, cigar_op in segment_cigar_ops:
+        if current_node_pos_from_read_start >= window_start_node + window_size:
+            break
         if cigar_op in ('M', '=', 'X'):
             for i in range(cigar_len):
-                node_aln_pos = current_node_pos_in_read + i
-                read_aln_pos = current_read_pos_in_read + i
+                node_aln_pos = current_node_pos_from_read_start + i
+                read_aln_pos = current_read_seq_pos + i
+
+                if read_aln_pos >= len(segment_read_sequence): break
 
                 if node_aln_pos >= window_start_node and node_aln_pos < window_start_node + window_size:
                     window_idx = node_aln_pos - window_start_node
-                    if read_aln_pos < len(segment_read_sequence):
-                        window_char_representation[window_idx] = segment_read_sequence[read_aln_pos].upper()
-            current_node_pos_in_read += cigar_len
-            current_read_pos_in_read += cigar_len
+                    window_char_representation[window_idx] = segment_read_sequence[read_aln_pos].upper()
+
+            current_node_pos_from_read_start += cigar_len
+            current_read_seq_pos += cigar_len
         elif cigar_op == 'D' or cigar_op == 'N':
             for i in range(cigar_len):
-                node_aln_pos = current_node_pos_in_read + i
+                node_aln_pos = current_node_pos_from_read_start + i
                 if node_aln_pos >= window_start_node and node_aln_pos < window_start_node + window_size:
                     window_idx = node_aln_pos - window_start_node
                     window_char_representation[window_idx] = '*'
-            current_node_pos_in_read += cigar_len
+            current_node_pos_from_read_start += cigar_len
         elif cigar_op == 'I':
-            current_read_pos_in_read += cigar_len
+            current_read_seq_pos += cigar_len
         elif cigar_op == 'S':
-            current_read_pos_in_read += cigar_len
+            current_read_seq_pos += cigar_len
 
-        if current_node_pos_in_read >= window_start_node + window_size:
+        if current_read_seq_pos >= len(
+                segment_read_sequence) and current_node_pos_from_read_start >= window_start_node + window_size:
             break
-
     return window_char_representation
 
 
@@ -312,28 +314,19 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
                 continue
 
             current_read_sequence = seq
-            original_decoded_cigar_ops = decode_cigar_to_int_ops(cigar_str)
-
+            decoded_cigar_ops = decode_cigar_to_int_ops(cigar_str)
             current_offset_on_node = off_from_file
-            current_decoded_cigar_ops = list(original_decoded_cigar_ops)
 
             if strand_char == '-':
                 current_read_sequence = reverse_complement(seq)
-                current_decoded_cigar_ops = original_decoded_cigar_ops[::-1]
+                decoded_cigar_ops = decoded_cigar_ops[::-1]
 
-                alignment_span_on_node = 0
-                for l_op, op_char_op in original_decoded_cigar_ops:
-                    if op_char_op in ('M', 'D', 'N', '=', 'X'):
-                        alignment_span_on_node += l_op
-
-                if alignment_span_on_node > 0:
-                    current_offset_on_node = node_len - alignment_span_on_node - off_from_file
-                    if current_offset_on_node < 0:
-                        continue
             aligned_read_segments.append({
                 "offset_on_node": current_offset_on_node,
                 "read_sequence": current_read_sequence,
-                "cigar_ops": current_decoded_cigar_ops,
+                "cigar_ops": decoded_cigar_ops,
+                "original_dat_offset": off_from_file,
+                "original_dat_strand": strand_char
             })
     except Exception as e:
         print(f"❌ Error [Worker {os.getpid()}] reading records for node {node_id}: {e}", file=sys.stderr)
@@ -395,27 +388,40 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
         if alt_freq < min_af_threshold:
             continue
 
-        pileup_matrix_for_json = []
+        pileup_details_for_json = []
 
+        # Calculate window_start_on_node for this variant, ensuring it's within node bounds
         if v_type == 'I':
-            window_center_on_node = v_pos + 1
+            ideal_center = v_pos + 1
         else:
-            window_center_on_node = v_pos
-        window_start_on_node = window_center_on_node - half_window
+            ideal_center = v_pos
+
+        current_window_start = ideal_center - half_window
+        # Adjust if window goes before node start
+        if current_window_start < 0:
+            current_window_start = 0
+        # Adjust if window goes past node end
+        if current_window_start + window_size > node_len:
+            current_window_start = node_len - window_size
+            if current_window_start < 0:  # Handle case where node_len < window_size
+                current_window_start = 0
 
         for segment in aligned_read_segments:
             row_chars = get_read_representation_in_window(
                 segment["cigar_ops"], segment["offset_on_node"], segment["read_sequence"],
-                window_start_on_node, window_size, node_len
+                current_window_start, window_size, node_len  # Use adjusted window_start
             )
             if any(c != ' ' for c in row_chars):
-                # Convert characters to indices for JSON storage
                 row_indices = [BASE_TO_INDEX.get(char.upper(), BASE_TO_INDEX['N']) for char in row_chars]
-                pileup_matrix_for_json.append(row_indices)
+                pileup_details_for_json.append({
+                    "display_indices": row_indices,
+                    "offset": segment["original_dat_offset"],
+                    "strand": segment["original_dat_strand"]
+                })
 
         variant_key_str = f"{v_pos}_{v_type}_{v_ref_defined}_{v_alt_defined}"
         final_variant_output[variant_key_str] = {
-            "pileup_matrix": pileup_matrix_for_json if pileup_matrix_for_json else [],
+            "pileup_details": pileup_details_for_json if pileup_details_for_json else [],
             "alt_allele_count": af_alt_count,
             "ref_allele_count_at_locus": af_ref_count,
             "other_allele_count_at_locus": af_other_count,
@@ -439,11 +445,11 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
         print(f"ℹ️ No valid pileup data to display for node {node_id_str_for_display}.", file=sys.stderr)
         return
 
-    node_length = node_data_for_display_view.get("node_length")
+    node_length_from_data = node_data_for_display_view.get("node_length")
     variants_dict = node_data_for_display_view.get("variants", {})
 
     print(
-        f"\n=== Displaying Pileups for Node ID: {node_id_str_for_display} (Length: {node_length if node_length is not None else 'N/A'}) ===")
+        f"\n=== Displaying Pileups for Node ID: {node_id_str_for_display} (Length: {node_length_from_data if node_length_from_data is not None else 'N/A'}) ===")
 
     if not variants_dict:
         print(f"ℹ️ No variants found or pileups generated for this node (or all filtered by AF).")
@@ -461,17 +467,25 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
             break
 
         variant_data = variants_dict[variant_key]
-        # pileup_matrix_indices now refers to the list of lists of *indices*
-        pileup_matrix_indices = variant_data.get("pileup_matrix", [])
+        pileup_details_list = variant_data.get("pileup_details", [])
 
         v_pos = int(variant_key.split('_')[0])
         v_type = variant_key.split('_')[1]
 
+        # Calculate window_start_on_node for display, ensuring it's within node bounds
         if v_type == 'I':
-            window_center_on_node = v_pos + 1
+            ideal_center = v_pos + 1
         else:
-            window_center_on_node = v_pos
-        current_window_start_on_node = window_center_on_node - half_window
+            ideal_center = v_pos
+
+        current_window_start_on_node = ideal_center - half_window
+        if current_window_start_on_node < 0:
+            current_window_start_on_node = 0
+        if current_window_start_on_node + window_size > len(
+                full_node_sequence):  # node_len is full_node_sequence length
+            current_window_start_on_node = len(full_node_sequence) - window_size
+            if current_window_start_on_node < 0:
+                current_window_start_on_node = 0
 
         print(
             f"\n--- Variant: {variant_key} (Node Pos: {v_pos}, Display Window on Node: {current_window_start_on_node}-{current_window_start_on_node + window_size - 1}) ---")
@@ -487,49 +501,48 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
 
         ref_display_parts = []
         marker_line_parts = [' '] * window_size
-        variant_display_idx_in_window = -1  # Initialize to an invalid index
 
-        # Determine the display index for the variant marker within the window
-        if v_type != 'I':
-            # For SNPs/Deletions, v_pos is the start of the variant
-            if current_window_start_on_node <= v_pos < current_window_start_on_node + window_size:
-                variant_display_idx_in_window = v_pos - current_window_start_on_node
-        elif v_type == 'I':
-            # For Insertions, v_pos is the base *before* the insertion.
-            # We mark this anchor base and the position after it.
-            if current_window_start_on_node <= v_pos < current_window_start_on_node + window_size:
-                variant_display_idx_in_window = v_pos - current_window_start_on_node
-
-        for i in range(window_size):  # i is the index in the window string (0 to window_size-1)
+        # Display reference for the calculated window
+        for i in range(window_size):
             actual_node_pos_in_window = current_window_start_on_node + i
             if 0 <= actual_node_pos_in_window < len(full_node_sequence):
                 ref_display_parts.append(full_node_sequence[actual_node_pos_in_window])
             else:
-                ref_display_parts.append(" ")  # Use space if outside node bounds
-
-            # Place marker based on calculated variant_display_idx_in_window
-            if i == variant_display_idx_in_window:
-                if v_type == 'I':
-                    marker_line_parts[i] = "I"  # Mark the anchor base
-                    if i + 1 < window_size: marker_line_parts[i + 1] = "^"  # Mark the insertion point after anchor
-                else:  # SNP or Deletion start
-                    marker_line_parts[i] = "^"
-
+                ref_display_parts.append(" ")
         print(f"  Node Ref: {''.join(ref_display_parts)}")
+
+        # Place marker based on v_pos relative to the *actual* window_start_on_node
+        variant_display_idx_in_window = -1
+        if current_window_start_on_node <= v_pos < current_window_start_on_node + window_size:
+            variant_display_idx_in_window = v_pos - current_window_start_on_node
+
+        if variant_display_idx_in_window != -1:  # If variant position is within the displayed window
+            if v_type == 'I':
+                # For insertion at v_pos (meaning after base v_pos), mark v_pos and the spot after
+                if variant_display_idx_in_window < window_size:  # Check if v_pos itself is in window
+                    marker_line_parts[variant_display_idx_in_window] = "I"
+                if variant_display_idx_in_window + 1 < window_size:  # Check if spot after v_pos is in window
+                    marker_line_parts[variant_display_idx_in_window + 1] = "^"
+            else:  # SNP or Deletion start
+                marker_line_parts[variant_display_idx_in_window] = "^"
         print(f"  Marker  : {''.join(marker_line_parts)}")
 
-        if not pileup_matrix_indices:
-            print("  (No reads in pileup matrix for this variant's window)")
+        if not pileup_details_list:
+            print("  (No reads in pileup details for this variant's window)")
         else:
             displayed_reads_count = 0
-            for i, row_of_indices in enumerate(pileup_matrix_indices):  # This is a list of numerical indices
+            for i, read_detail in enumerate(pileup_details_list):
                 if displayed_reads_count >= max_reads_to_display_per_variant:
                     print(
-                        f"  ... (and {len(pileup_matrix_indices) - max_reads_to_display_per_variant} more reads for this variant's pileup window)")
+                        f"  ... (and {len(pileup_details_list) - max_reads_to_display_per_variant} more reads for this variant's pileup window)")
                     break
-                # Convert indices back to characters for display
-                pileup_row_str = "".join([INDEX_TO_BASE_FOR_VIEW.get(idx, '?') for idx in row_of_indices])
-                print(f"  Read {i + 1:3d}: {pileup_row_str}")
+
+                row_indices = read_detail.get("display_indices", [])
+                original_offset = read_detail.get("offset", "N/A")
+                original_strand = read_detail.get("strand", "?")
+
+                pileup_row_str = "".join([INDEX_TO_BASE_FOR_VIEW.get(idx, '?') for idx in row_indices])
+                print(f"  Read {i + 1:3d}: {pileup_row_str} (Off: {str(original_offset):<6}, Str: {original_strand})")
                 displayed_reads_count += 1
         variants_displayed_count += 1
     print("\n")
@@ -555,11 +568,11 @@ def main():
         help="Print generated pileups to console. Optionally specify N to view the first N variants. If no N, all variants are shown."
     )
     parser.add_argument(
-        "--max_view_reads", type=int, default=20,
+        "--max_view_reads", type=int, default=50,  # Changed default to 50
         help="Maximum number of reads to display per pileup matrix in console view (if --view is used)."
     )
     parser.add_argument(
-        "--min_af", type=float, default=0.1,
+        "--min_af", type=float, default=0.0,
         help="Minimum allele frequency threshold for a variant to be included in the output and pileup generation."
     )
 
@@ -690,9 +703,9 @@ def main():
 
                         view_msg = f"all variants (max {args.max_view_reads} reads/variant)..."
                         if max_v_show != float(
-                            'inf'): view_msg = f"first {int(max_v_show)} variants (max {args.max_view_reads} reads/variant)..."
+                                'inf'): view_msg = f"first {int(max_v_show)} variants (max {args.max_view_reads} reads/variant)..."
 
-                        # Pass the node-specific data and the full node sequence for context
+                        print(f"\n🔹 Displaying pileups: {view_msg}")
                         display_pileup_data(node_result_data_for_output_and_view,
                                             str(target_node_id),
                                             node_sequence,
