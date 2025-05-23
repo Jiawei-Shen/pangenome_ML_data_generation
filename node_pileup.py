@@ -315,10 +315,11 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
                 current_read_sequence = reverse_complement(seq)
                 current_decoded_cigar_ops = original_decoded_cigar_ops[::-1]  # CIGAR ops reversed for processing
 
-                alignment_span_on_node = 0
-                for l_op, op_char_op in original_decoded_cigar_ops:  # Use original ops for span calculation
-                    if op_char_op in ('M', 'D', 'N', '=', 'X'):
-                        alignment_span_on_node += l_op
+                # alignment_span_on_node = 0
+                # for l_op, op_char_op in original_decoded_cigar_ops:  # Use original ops for span calculation
+                #     if op_char_op in ('M', 'D', 'N', '=', 'X'):
+                #         alignment_span_on_node += l_op
+                alignment_span_on_node = len(current_read_sequence)
 
                 if alignment_span_on_node > 0:
                     current_offset_on_node = node_len - alignment_span_on_node - off_from_file
