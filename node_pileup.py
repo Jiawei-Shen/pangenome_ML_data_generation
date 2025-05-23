@@ -310,8 +310,12 @@ def process_single_node_for_pileup(task_args):
             except UnicodeDecodeError:
                 continue
 
-            current_read_sequence = reverse_complement(seq) if strand_char == '-' else seq
+            current_read_sequence = seq
             decoded_cigar_ops = decode_cigar_to_int_ops(cigar_str)
+
+            if strand_char == '-':
+                current_read_sequence = reverse_complement(seq)
+                decoded_cigar_ops = decoded_cigar_ops[::-1]
 
             aligned_read_segments.append({
                 "offset_on_node": off, "read_sequence": current_read_sequence,
@@ -330,7 +334,7 @@ def process_single_node_for_pileup(task_args):
         for v_pos, v_type, v_alt, v_ref in variants_in_read:
             candidate_variants[(v_pos, v_type, v_ref, v_alt)] += 1
 
-    window_size = 50
+    window_size = 50  # User-defined window size
     half_window = window_size // 2
 
     for (v_pos, v_type, v_ref_defined, v_alt_defined), _ in candidate_variants.items():
@@ -375,7 +379,15 @@ def process_single_node_for_pileup(task_args):
         alt_freq = af_alt_count / af_locus_coverage if af_locus_coverage > 0 else 0.0
 
         pileup_matrix_for_json = []
-        window_start_on_node = v_pos - (half_window - 1) if v_type != 'I' else (v_pos + 1) - (half_window - 1)
+
+        # Adjust window start for centering v_pos (or v_pos+1 for insertions)
+        if v_type == 'I':
+            # For an insertion after v_pos, center the window around the position *after* v_pos.
+            window_center_on_node = v_pos + 1
+        else:
+            # For SNPs or Deletions, v_pos is the first base of the variant.
+            window_center_on_node = v_pos
+        window_start_on_node = window_center_on_node - half_window  # v_pos will be at index half_window (e.g. 25)
 
         for segment in aligned_read_segments:
             row_chars = get_read_representation_in_window(
@@ -550,7 +562,7 @@ def main():
     task = (target_node_id, dat_offset, n_records, node_sequence)
     print(f"🔹 Prepared task for node {target_node_id}.")
 
-    output_data_for_json = {}  # This will store {"node_id_str": {"node_length": L, "variants": V_DICT}}
+    output_data_for_json = {}
 
     print(f"🔹 Processing node {target_node_id} using 1 worker...")
     start_proc_time = time.time()
@@ -560,7 +572,6 @@ def main():
             future = executor.submit(process_single_node_for_pileup, task)
             processed_node_id, variants_dict_from_worker = future.result()
 
-            # Ensure variants_dict_from_worker is a dict, even if processing failed partially in worker
             variants_dict_to_store = variants_dict_from_worker if isinstance(variants_dict_from_worker, dict) else {}
 
             output_data_for_json[str(processed_node_id)] = {
@@ -579,20 +590,14 @@ def main():
     total_elapsed_time = time.time() - start_proc_time
     print(f"✔ Node {target_node_id} processing finished in {total_elapsed_time:.2f}s.")
 
-    # Get the result for the specific target node to check its contents
     node_result_data = output_data_for_json.get(str(target_node_id))
-
-    # Determine if there are actual variants to save/display
-    # `node_result_data` itself could be None if something went very wrong, though unlikely with current flow for single node
-    # `node_result_data.get("variants")` will return the variants dict, or None if "variants" key is missing
-    # An empty variants dict {} is falsey in boolean context.
     has_actual_variants = bool(node_result_data and node_result_data.get("variants"))
 
     should_save_main_output_file = False
     if has_actual_variants:
         should_save_main_output_file = True
     elif args.save_cache:
-        should_save_main_output_file = True  # Save even if no variants, if caching sequence
+        should_save_main_output_file = True
 
     if should_save_main_output_file:
         if node_result_data:
@@ -606,11 +611,10 @@ def main():
 
                 if args.view is not None:
                     # Debug print before calling display
-                    print(
-                        f"DEBUG: Calling display_pileup_data. node_result_data keys: {list(node_result_data.keys()) if node_result_data else 'None'}")
-                    if node_result_data and "variants" in node_result_data:
-                        print(
-                            f"DEBUG: node_result_data['variants'] type: {type(node_result_data['variants'])}, empty: {not bool(node_result_data['variants'])}")
+                    # print(f"DEBUG: Attempting to display. output_data_for_json for node {target_node_id} keys: {list(output_data_for_json.get(str(target_node_id), {}).keys())}")
+                    node_data_for_display = output_data_for_json.get(str(target_node_id))
+                    # if node_data_for_display and "variants" in node_data_for_display:
+                    #      print(f"DEBUG: Variants dict for display type: {type(node_data_for_display['variants'])}, is_empty: {not bool(node_data_for_display['variants'])}")
 
                     if has_actual_variants:
                         max_v_show = float('inf') if args.view == -1 else (
@@ -621,7 +625,7 @@ def main():
                         if max_v_show != float(
                             'inf'): view_msg = f"first {int(max_v_show)} variants (max {args.max_view_reads} reads/variant)..."
                         print(f"\n🔹 Displaying pileups: {view_msg}")
-                        display_pileup_data(node_result_data, str(target_node_id), args.max_view_reads, max_v_show)
+                        display_pileup_data(node_data_for_display, str(target_node_id), args.max_view_reads, max_v_show)
                     else:
                         print(f"ℹ️ --view specified, but no variants were found for node {target_node_id} to display.")
             except Exception as e:
@@ -629,8 +633,7 @@ def main():
     else:
         print(
             f"ℹ️ No variants found for node {target_node_id} and --save-cache not specified. Main output file '{args.output}' will not be created/overwritten if it exists, or an empty structure might be written if it's a new file and node_result_data was populated but had no variants.")
-        if node_result_data and not has_actual_variants and not os.path.exists(
-                args.output):  # If file doesn't exist and no variants and no save_cache
+        if node_result_data and not has_actual_variants and not os.path.exists(args.output):
             print(f"   (Skipping creation of empty output file '{args.output}')")
         elif node_result_data and not has_actual_variants and os.path.exists(args.output) and not args.save_cache:
             print(
