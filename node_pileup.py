@@ -321,7 +321,7 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
                         alignment_span_on_node += l_op
 
                 if alignment_span_on_node > 0:
-                    current_offset_on_node = node_len - alignment_span_on_node - off_from_file + 1
+                    current_offset_on_node = node_len - alignment_span_on_node - off_from_file
                     if current_offset_on_node < 0:
                         continue
 
