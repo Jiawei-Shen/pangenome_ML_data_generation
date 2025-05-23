@@ -328,12 +328,17 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
 
                 if alignment_span_on_node > 0:
                     current_offset_on_node = node_len - alignment_span_on_node - off_from_file
-                    if current_offset_on_node < 0:
-                        continue
+                    if current_offset_on_node < 0:  # Should not happen with correct GAF to DAT
+                        # print(f"⚠️ Negative offset calculated for node {node_id}, read on '-' strand. Skipping read.")
+                        # print(f"   L={node_len}, span={alignment_span_on_node}, off_from_file={off_from_file}")
+                        continue  # Skip this read if offset calculation is problematic
+
+            # Store strand with other segment information
             aligned_read_segments.append({
                 "offset_on_node": current_offset_on_node,
                 "read_sequence": current_read_sequence,
                 "cigar_ops": current_decoded_cigar_ops,
+                "strand": strand_char  # ADDED STRAND
             })
     except Exception as e:
         print(f"❌ Error [Worker {os.getpid()}] reading records for node {node_id}: {e}", file=sys.stderr)
@@ -395,7 +400,8 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
         if alt_freq < min_af_threshold:
             continue
 
-        pileup_matrix_for_json = []
+        # pileup_matrix_for_json = [] # OLD: Renaming for clarity
+        pileup_reads_data_for_json = []  # NEW NAME
 
         if v_type == 'I':
             window_center_on_node = v_pos + 1
@@ -403,19 +409,24 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
             window_center_on_node = v_pos
         window_start_on_node = window_center_on_node - half_window
 
-        for segment in aligned_read_segments:
+        for segment in aligned_read_segments:  # segment now contains "strand"
             row_chars = get_read_representation_in_window(
                 segment["cigar_ops"], segment["offset_on_node"], segment["read_sequence"],
                 window_start_on_node, window_size, node_len
             )
             if any(c != ' ' for c in row_chars):
-                # Convert characters to indices for JSON storage
                 row_indices = [BASE_TO_INDEX.get(char.upper(), BASE_TO_INDEX['N']) for char in row_chars]
-                pileup_matrix_for_json.append(row_indices)
+                # pileup_matrix_for_json.append(row_indices) # OLD
+                pileup_reads_data_for_json.append({  # NEW STRUCTURE
+                    "bases": row_indices,
+                    "offset": segment["offset_on_node"],  # Store offset of this segment
+                    "strand": segment["strand"]  # Store strand of this segment
+                })
 
         variant_key_str = f"{v_pos}_{v_type}_{v_ref_defined}_{v_alt_defined}"
         final_variant_output[variant_key_str] = {
-            "pileup_matrix": pileup_matrix_for_json if pileup_matrix_for_json else [],
+            # "pileup_matrix": pileup_matrix_for_json if pileup_matrix_for_json else [], # OLD KEY
+            "pileup_reads_data": pileup_reads_data_for_json if pileup_reads_data_for_json else [],  # NEW KEY
             "alt_allele_count": af_alt_count,
             "ref_allele_count_at_locus": af_ref_count,
             "other_allele_count_at_locus": af_other_count,
@@ -461,8 +472,9 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
             break
 
         variant_data = variants_dict[variant_key]
-        # pileup_matrix_indices now refers to the list of lists of *indices*
-        pileup_matrix_indices = variant_data.get("pileup_matrix", [])
+        # pileup_matrix_indices now refers to list of dicts: {"bases": [...], "offset": X, "strand": Y}
+        # pileup_matrix_indices = variant_data.get("pileup_matrix", []) # OLD KEY
+        pileup_reads_display_data = variant_data.get("pileup_reads_data", [])  # NEW KEY & new var name
 
         v_pos = int(variant_key.split('_')[0])
         v_type = variant_key.split('_')[1]
@@ -487,49 +499,53 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
 
         ref_display_parts = []
         marker_line_parts = [' '] * window_size
-        variant_display_idx_in_window = -1  # Initialize to an invalid index
+        variant_display_idx_in_window = -1
 
-        # Determine the display index for the variant marker within the window
         if v_type != 'I':
-            # For SNPs/Deletions, v_pos is the start of the variant
             if current_window_start_on_node <= v_pos < current_window_start_on_node + window_size:
                 variant_display_idx_in_window = v_pos - current_window_start_on_node
         elif v_type == 'I':
-            # For Insertions, v_pos is the base *before* the insertion.
-            # We mark this anchor base and the position after it.
             if current_window_start_on_node <= v_pos < current_window_start_on_node + window_size:
                 variant_display_idx_in_window = v_pos - current_window_start_on_node
 
-        for i in range(window_size):  # i is the index in the window string (0 to window_size-1)
+        for i in range(window_size):
             actual_node_pos_in_window = current_window_start_on_node + i
             if 0 <= actual_node_pos_in_window < len(full_node_sequence):
                 ref_display_parts.append(full_node_sequence[actual_node_pos_in_window])
             else:
-                ref_display_parts.append(" ")  # Use space if outside node bounds
+                ref_display_parts.append(" ")
 
-            # Place marker based on calculated variant_display_idx_in_window
             if i == variant_display_idx_in_window:
                 if v_type == 'I':
-                    marker_line_parts[i] = "I"  # Mark the anchor base
-                    if i + 1 < window_size: marker_line_parts[i + 1] = "^"  # Mark the insertion point after anchor
-                else:  # SNP or Deletion start
+                    marker_line_parts[i] = "I"
+                    if i + 1 < window_size: marker_line_parts[i + 1] = "^"
+                else:
                     marker_line_parts[i] = "^"
 
         print(f"  Node Ref: {''.join(ref_display_parts)}")
         print(f"  Marker  : {''.join(marker_line_parts)}")
 
-        if not pileup_matrix_indices:
-            print("  (No reads in pileup matrix for this variant's window)")
+        # if not pileup_matrix_indices: # OLD
+        if not pileup_reads_display_data:  # NEW
+            print("  (No reads data in pileup for this variant's window)")  # MODIFIED MSG
         else:
             displayed_reads_count = 0
-            for i, row_of_indices in enumerate(pileup_matrix_indices):  # This is a list of numerical indices
+            # for i, row_of_indices in enumerate(pileup_matrix_indices): # OLD: row_of_indices was list of ints
+            for i, read_display_info in enumerate(pileup_reads_display_data):  # NEW: read_display_info is a dict
                 if displayed_reads_count >= max_reads_to_display_per_variant:
                     print(
-                        f"  ... (and {len(pileup_matrix_indices) - max_reads_to_display_per_variant} more reads for this variant's pileup window)")
+                        # f"  ... (and {len(pileup_matrix_indices) - max_reads_to_display_per_variant} more reads for this variant's pileup window)") # OLD
+                        f"  ... (and {len(pileup_reads_display_data) - max_reads_to_display_per_variant} more reads for this variant's pileup window)")  # NEW
                     break
-                # Convert indices back to characters for display
-                pileup_row_str = "".join([INDEX_TO_BASE_FOR_VIEW.get(idx, '?') for idx in row_of_indices])
-                print(f"  Read {i + 1:3d}: {pileup_row_str}")
+
+                base_indices = read_display_info["bases"]
+                read_offset = read_display_info["offset"]
+                read_strand = read_display_info["strand"]
+
+                pileup_row_str = "".join([INDEX_TO_BASE_FOR_VIEW.get(idx, '?') for idx in base_indices])
+                # print(f"  Read {i + 1:3d}: {pileup_row_str}") # OLD
+                print(
+                    f"  Read {i + 1:3d}: {pileup_row_str}  (Offset: {read_offset}, Strand: {read_strand})")  # MODIFIED PRINT
                 displayed_reads_count += 1
         variants_displayed_count += 1
     print("\n")
@@ -669,15 +685,18 @@ def main():
     should_save_main_output_file = False
     if has_actual_variants:
         should_save_main_output_file = True
-    elif args.save_cache:
-        should_save_main_output_file = True
+    elif args.save_cache:  # if --save-cache is used, we might want to save the file even if no variants for this specific node
+        should_save_main_output_file = True  # This logic might need refinement based on desired behavior with empty nodes + cache
 
     if should_save_main_output_file:
-        if node_result_data_for_output_and_view:
+        if node_result_data_for_output_and_view:  # Ensure there's actually data for the node
             print(f"🔹 Writing pileup results for node {target_node_id} to JSON output: {args.output}")
             start_write_time = time.time()
             try:
-                with open(args.output, 'w') as out_f:
+                # If the output file might contain other nodes from previous runs, and we only want to update this one.
+                # For simplicity, this script currently overwrites or creates the file with just the current node's data.
+                # If merging with existing JSON is needed, that's a more complex operation.
+                with open(args.output, 'w') as out_f:  # 'w' will overwrite or create new
                     json.dump(output_data_for_json, out_f, indent=2)
                 print(
                     f"✔ Output written in {time.time() - start_write_time:.2f}s. ✅ Pileup JSON saved to {args.output}")
@@ -690,9 +709,10 @@ def main():
 
                         view_msg = f"all variants (max {args.max_view_reads} reads/variant)..."
                         if max_v_show != float(
-                            'inf'): view_msg = f"first {int(max_v_show)} variants (max {args.max_view_reads} reads/variant)..."
+                                'inf'): view_msg = f"first {int(max_v_show)} variants (max {args.max_view_reads} reads/variant)..."
 
-                        # Pass the node-specific data and the full node sequence for context
+                        print(f"🔹 Displaying pileups for node {target_node_id}: {view_msg}")  # Added info msg
+
                         display_pileup_data(node_result_data_for_output_and_view,
                                             str(target_node_id),
                                             node_sequence,
@@ -709,16 +729,20 @@ def main():
 
             except Exception as e:
                 sys.exit(f"❌ Error writing/viewing output: {e}")
-    else:
+    else:  # No variants and no --save-cache
         print(
             f"ℹ️ No variants met AF threshold for node {target_node_id} (or none found) and --save-cache not specified. Main output file '{args.output}' will not be created/overwritten.")
+        # Clarify behavior if file exists vs. not exists
         if node_result_data_for_output_and_view and not has_actual_variants and \
                 not os.path.exists(args.output) and not args.save_cache:
-            print(f"   (Skipping creation of output file '{args.output}' as it would be empty of variants.)")
+            print(
+                f"   (Skipping creation of output file '{args.output}' as it would be empty of variants for node {target_node_id}.)")
         elif node_result_data_for_output_and_view and not has_actual_variants and \
                 os.path.exists(args.output) and not args.save_cache:
             print(
-                f"   (Output file '{args.output}' already exists. Not overwriting with empty variant data as --save-cache was not used.)")
+                f"   (Output file '{args.output}' already exists. Not overwriting with empty variant data for node {target_node_id} as --save-cache was not used.)")
+        # If node_result_data_for_output_and_view is None (e.g., error during processing), this might not be hit.
+        # The current script structure implies output_data_for_json will have an entry for the node, even if empty of variants.
 
     print("✅ Script finished.")
 
