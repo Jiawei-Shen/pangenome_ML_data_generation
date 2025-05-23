@@ -227,53 +227,43 @@ def detect_variants_from_cigar(offset_on_node, cigar_ops_decoded, read_sequence,
 
 
 def get_read_representation_in_window(segment_cigar_ops, segment_offset_on_node, segment_read_sequence,
-                                      window_start_node, window_size, node_total_len):
+                                      window_start_node, window_size, node_len):
     """
     For a single read, generates its character representation across a defined window on the node.
     Returns a list of characters of length window_size.
     ' ' for no coverage, '*' for deletion, base for match/mismatch.
+    Insertions are not explicitly expanded in this node-coordinate based window.
     """
     window_char_representation = [' '] * window_size
 
-    current_node_pos_from_read_start = segment_offset_on_node  # This is the read's start on the node
-    current_read_seq_pos = 0  # Position within the segment_read_sequence
+    current_node_pos_in_read = segment_offset_on_node
+    current_read_pos_in_read = 0
 
     for cigar_len, cigar_op in segment_cigar_ops:
-        if current_node_pos_from_read_start >= window_start_node + window_size:  # Optimization: read starts after window
-            break
         if cigar_op in ('M', '=', 'X'):
             for i in range(cigar_len):
-                # Absolute position on the node for this base of the read
-                node_aln_pos = current_node_pos_from_read_start + i
-                # Corresponding position in the read's sequence string
-                read_aln_pos = current_read_seq_pos + i
+                node_aln_pos = current_node_pos_in_read + i
+                read_aln_pos = current_read_pos_in_read + i
 
-                if read_aln_pos >= len(segment_read_sequence): break  # Consumed read
-
-                # Check if this node position falls within our display window
                 if node_aln_pos >= window_start_node and node_aln_pos < window_start_node + window_size:
-                    window_idx = node_aln_pos - window_start_node  # Position within the window_char_representation
-                    window_char_representation[window_idx] = segment_read_sequence[read_aln_pos].upper()
-
-            current_node_pos_from_read_start += cigar_len
-            current_read_seq_pos += cigar_len
-        elif cigar_op == 'D' or cigar_op == 'N':  # Deletion from ref or Skip in ref
+                    window_idx = node_aln_pos - window_start_node
+                    if read_aln_pos < len(segment_read_sequence):
+                        window_char_representation[window_idx] = segment_read_sequence[read_aln_pos].upper()
+            current_node_pos_in_read += cigar_len
+            current_read_pos_in_read += cigar_len
+        elif cigar_op == 'D' or cigar_op == 'N':
             for i in range(cigar_len):
-                node_aln_pos = current_node_pos_from_read_start + i
+                node_aln_pos = current_node_pos_in_read + i
                 if node_aln_pos >= window_start_node and node_aln_pos < window_start_node + window_size:
                     window_idx = node_aln_pos - window_start_node
                     window_char_representation[window_idx] = '*'
-            current_node_pos_from_read_start += cigar_len
-            # current_read_seq_pos does not advance for D or N
-        elif cigar_op == 'I':  # Insertion to ref (consumes read, not ref)
-            # Insertions occur between node bases. They don't occupy a position *in* this node-based window.
-            current_read_seq_pos += cigar_len
-        elif cigar_op == 'S':  # Soft clip (consumes read, not ref)
-            current_read_seq_pos += cigar_len
-        # H, P ops are ignored as they don't consume read or ref for alignment path
+            current_node_pos_in_read += cigar_len
+        elif cigar_op == 'I':
+            current_read_pos_in_read += cigar_len
+        elif cigar_op == 'S':
+            current_read_pos_in_read += cigar_len
 
-        if current_read_seq_pos >= len(
-                segment_read_sequence) and current_node_pos_from_read_start >= window_start_node + window_size:  # Optimization
+        if current_node_pos_in_read >= window_start_node + window_size:
             break
 
     return window_char_representation
@@ -301,7 +291,7 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
     if worker_dat_file is None: return node_id, {}
     if not node_sequence: return node_id, {}
 
-    node_len = len(node_sequence)
+    # node_len = len(node_sequence) # Not explicitly needed here if off_from_file is standard
     final_variant_output = {}
     aligned_read_segments = []
 
@@ -320,20 +310,20 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
                 continue
 
             current_read_sequence = seq
-            decoded_cigar_ops = decode_cigar_to_int_ops(cigar_str)
-            # 'off_from_file' is assumed to be the 0-based leftmost start on the forward node sequence
-            current_offset_on_node = off_from_file
+            current_decoded_cigar_ops = decode_cigar_to_int_ops(cigar_str)
+            current_offset_on_node = off_from_file  # Assumed to be 0-based start on forward node
 
             if strand_char == '-':
                 current_read_sequence = reverse_complement(seq)
-                decoded_cigar_ops = decoded_cigar_ops[::-1]  # Reverse CIGAR ops list
+                current_decoded_cigar_ops = current_decoded_cigar_ops[::-1]
+                # current_offset_on_node remains the same (leftmost on forward node)
 
             aligned_read_segments.append({
                 "offset_on_node": current_offset_on_node,
                 "read_sequence": current_read_sequence,
-                "cigar_ops": decoded_cigar_ops,
-                "original_dat_offset": off_from_file,
-                "original_dat_strand": strand_char
+                "cigar_ops": current_decoded_cigar_ops,
+                "original_dat_offset": off_from_file,  # Store for display
+                "original_dat_strand": strand_char  # Store for display
             })
     except Exception as e:
         print(f"❌ Error [Worker {os.getpid()}] reading records for node {node_id}: {e}", file=sys.stderr)
@@ -358,7 +348,7 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
         af_locus_coverage = 0
 
         ref_allele_for_indel_af_check = v_ref_defined if v_type == 'D' else \
-            (node_sequence[v_pos] if v_type == 'I' and 0 <= v_pos < node_len else None)
+            (node_sequence[v_pos] if v_type == 'I' and 0 <= v_pos < len(node_sequence) else None)
 
         for segment in aligned_read_segments:
             allele_in_segment_at_v_pos = get_allele_from_read_at_node_pos(
@@ -406,15 +396,14 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
         for segment in aligned_read_segments:
             row_chars = get_read_representation_in_window(
                 segment["cigar_ops"], segment["offset_on_node"], segment["read_sequence"],
-                window_start_on_node, window_size, node_len
+                window_start_on_node, window_size, len(node_sequence)
             )
-            # Only add to pileup if the read representation is not all spaces (i.e., it overlaps the window)
             if any(c != ' ' for c in row_chars):
                 row_indices = [BASE_TO_INDEX.get(char.upper(), BASE_TO_INDEX['N']) for char in row_chars]
                 pileup_details_for_json.append({
                     "display_indices": row_indices,
-                    "offset": segment["original_dat_offset"],
-                    "strand": segment["original_dat_strand"]
+                    "offset": segment["original_dat_offset"],  # Use original offset for display
+                    "strand": segment["original_dat_strand"]  # Use original strand for display
                 })
 
         variant_key_str = f"{v_pos}_{v_type}_{v_ref_defined}_{v_alt_defined}"
@@ -456,7 +445,7 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
     variants_displayed_count = 0
     sorted_variant_keys = sorted(variants_dict.keys(), key=lambda x: (int(x.split('_')[0]), x.split('_')[1]))
 
-    window_size = 100  # Should match generation
+    window_size = 100
     half_window = window_size // 2
 
     for variant_key in sorted_variant_keys:
@@ -531,7 +520,8 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
                 original_strand = read_detail.get("strand", "?")
 
                 pileup_row_str = "".join([INDEX_TO_BASE_FOR_VIEW.get(idx, '?') for idx in row_indices])
-                print(f"  Read {i + 1:3d}: {pileup_row_str} (Off: {original_offset:<6}, Str: {original_strand})")
+                print(
+                    f"  Read {i + 1:3d}: {pileup_row_str} (Off: {original_offset:<6}, Str: {original_strand})")  # Added formatting for offset
                 displayed_reads_count += 1
         variants_displayed_count += 1
     print("\n")
