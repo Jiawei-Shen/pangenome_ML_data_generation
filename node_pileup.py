@@ -16,9 +16,8 @@ from concurrent.futures import ProcessPoolExecutor
 # Constants
 RECORD_STRUCT = struct.Struct("<h150s150s20shc")  # Read offset, sequence, base qualities, CIGAR, MAPQ, strand
 RECORD_SIZE = RECORD_STRUCT.size
-BASE_TO_INDEX = {'A': 0, 'C': 1, 'G': 2, 'T': 3, 'N': 4, '*': 5,
-                 ' ': 6}  # '*' for deletions, ' ' for no coverage in window
-INDEX_TO_BASE_FOR_VIEW = {0: 'A', 1: 'C', 2: 'G', 3: 'T', 4: 'N', 5: '*', 6: ' '}  # Display '*' as is, space as is
+BASE_TO_INDEX = {'A': 0, 'C': 1, 'G': 2, 'T': 3, 'N': 4, '*': 5, ' ': 6}
+INDEX_TO_BASE_FOR_VIEW = {0: 'A', 1: 'C', 2: 'G', 3: 'T', 4: 'N', 5: '*', 6: ' '}
 
 # Global for worker process state (file handle)
 worker_dat_file = None
@@ -312,18 +311,17 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
 
             current_read_sequence = seq
             current_decoded_cigar_ops = decode_cigar_to_int_ops(cigar_str)
-            current_offset_on_node = off_from_file  # Assume 'off' is always leftmost on fwd strand
+            current_offset_on_node = off_from_file
 
             if strand_char == '-':
                 current_read_sequence = reverse_complement(seq)
-                current_decoded_cigar_ops = current_decoded_cigar_ops[::-1]  # Reverse CIGAR ops list
-                # 'off_from_file' is still the leftmost coordinate on the forward reference node.
-                # No adjustment to current_offset_on_node value is needed here if this convention holds.
+                current_decoded_cigar_ops = current_decoded_cigar_ops[::-1]
 
             aligned_read_segments.append({
                 "offset_on_node": current_offset_on_node,
                 "read_sequence": current_read_sequence,
                 "cigar_ops": current_decoded_cigar_ops,
+                "original_strand": strand_char  # Store original strand
             })
     except Exception as e:
         print(f"❌ Error [Worker {os.getpid()}] reading records for node {node_id}: {e}", file=sys.stderr)
@@ -338,7 +336,7 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
         for v_pos, v_type, v_alt, v_ref in variants_in_read:
             candidate_variants[(v_pos, v_type, v_ref, v_alt)] += 1
 
-    window_size = 100
+    window_size = 100  # Changed to 100bp
     half_window = window_size // 2
 
     for (v_pos, v_type, v_ref_defined, v_alt_defined), _ in candidate_variants.items():
@@ -347,10 +345,8 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
         af_other_count = 0
         af_locus_coverage = 0
 
-        # For deletions, v_ref_defined is the deleted sequence from ref.
-        # For insertions, v_alt_defined is the inserted sequence.
         ref_allele_for_indel_af_check = v_ref_defined if v_type == 'D' else \
-            (node_sequence[v_pos] if v_type == 'I' and 0 <= v_pos < node_len else None)
+            (node_sequence[v_pos] if v_type == 'I' and 0 <= v_pos < len(node_sequence) else None)
 
         for segment in aligned_read_segments:
             allele_in_segment_at_v_pos = get_allele_from_read_at_node_pos(
@@ -387,7 +383,7 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
         if alt_freq < min_af_threshold:
             continue
 
-        pileup_matrix_for_json = []
+        pileup_details_for_json = []  # Changed name from pileup_matrix_for_json
 
         if v_type == 'I':
             window_center_on_node = v_pos + 1
@@ -398,15 +394,19 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
         for segment in aligned_read_segments:
             row_chars = get_read_representation_in_window(
                 segment["cigar_ops"], segment["offset_on_node"], segment["read_sequence"],
-                window_start_on_node, window_size, node_len
+                window_start_on_node, window_size, len(node_sequence)
             )
             if any(c != ' ' for c in row_chars):
                 row_indices = [BASE_TO_INDEX.get(char.upper(), BASE_TO_INDEX['N']) for char in row_chars]
-                pileup_matrix_for_json.append(row_indices)
+                pileup_details_for_json.append({
+                    "display_indices": row_indices,
+                    "offset": segment["offset_on_node"],
+                    "strand": segment["original_strand"]
+                })
 
         variant_key_str = f"{v_pos}_{v_type}_{v_ref_defined}_{v_alt_defined}"
         final_variant_output[variant_key_str] = {
-            "pileup_matrix": pileup_matrix_for_json if pileup_matrix_for_json else [],
+            "pileup_details": pileup_details_for_json if pileup_details_for_json else [],  # Changed key name
             "alt_allele_count": af_alt_count,
             "ref_allele_count_at_locus": af_ref_count,
             "other_allele_count_at_locus": af_other_count,
@@ -430,11 +430,11 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
         print(f"ℹ️ No valid pileup data to display for node {node_id_str_for_display}.", file=sys.stderr)
         return
 
-    node_length = node_data_for_display_view.get("node_length")
+    node_length_from_data = node_data_for_display_view.get("node_length")
     variants_dict = node_data_for_display_view.get("variants", {})
 
     print(
-        f"\n=== Displaying Pileups for Node ID: {node_id_str_for_display} (Length: {node_length if node_length is not None else 'N/A'}) ===")
+        f"\n=== Displaying Pileups for Node ID: {node_id_str_for_display} (Length: {node_length_from_data if node_length_from_data is not None else 'N/A'}) ===")
 
     if not variants_dict:
         print(f"ℹ️ No variants found or pileups generated for this node (or all filtered by AF).")
@@ -452,7 +452,7 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
             break
 
         variant_data = variants_dict[variant_key]
-        pileup_matrix_indices = variant_data.get("pileup_matrix", [])
+        pileup_details_list = variant_data.get("pileup_details", [])  # Changed from pileup_matrix
 
         v_pos = int(variant_key.split('_')[0])
         v_type = variant_key.split('_')[1]
@@ -503,17 +503,22 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
         print(f"  Node Ref: {''.join(ref_display_parts)}")
         print(f"  Marker  : {''.join(marker_line_parts)}")
 
-        if not pileup_matrix_indices:
-            print("  (No reads in pileup matrix for this variant's window)")
+        if not pileup_details_list:  # Check the new key name
+            print("  (No reads in pileup details for this variant's window)")
         else:
             displayed_reads_count = 0
-            for i, row_of_indices in enumerate(pileup_matrix_indices):
+            for i, read_detail in enumerate(pileup_details_list):
                 if displayed_reads_count >= max_reads_to_display_per_variant:
                     print(
-                        f"  ... (and {len(pileup_matrix_indices) - max_reads_to_display_per_variant} more reads for this variant's pileup window)")
+                        f"  ... (and {len(pileup_details_list) - max_reads_to_display_per_variant} more reads for this variant's pileup window)")
                     break
-                pileup_row_str = "".join([INDEX_TO_BASE_FOR_VIEW.get(idx, '?') for idx in row_of_indices])
-                print(f"  Read {i + 1:3d}: {pileup_row_str}")
+
+                row_indices = read_detail.get("display_indices", [])
+                original_offset = read_detail.get("offset", "N/A")
+                original_strand = read_detail.get("strand", "?")
+
+                pileup_row_str = "".join([INDEX_TO_BASE_FOR_VIEW.get(idx, '?') for idx in row_indices])
+                print(f"  Read {i + 1:3d}: {pileup_row_str} (Off: {original_offset}, Str: {original_strand})")
                 displayed_reads_count += 1
         variants_displayed_count += 1
     print("\n")
@@ -539,7 +544,7 @@ def main():
         help="Print generated pileups to console. Optionally specify N to view the first N variants. If no N, all variants are shown."
     )
     parser.add_argument(
-        "--max_view_reads", type=int, default=20,
+        "--max_view_reads", type=int, default=50,  # Changed default to 50
         help="Maximum number of reads to display per pileup matrix in console view (if --view is used)."
     )
     parser.add_argument(
@@ -676,7 +681,7 @@ def main():
                         if max_v_show != float(
                             'inf'): view_msg = f"first {int(max_v_show)} variants (max {args.max_view_reads} reads/variant)..."
 
-                        print(f"\n🔹 Displaying pileups: {view_msg}")  # Moved print here
+                        print(f"\n🔹 Displaying pileups: {view_msg}")
                         display_pileup_data(node_result_data_for_output_and_view,
                                             str(target_node_id),
                                             node_sequence,
