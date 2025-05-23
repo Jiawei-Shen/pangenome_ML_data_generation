@@ -285,8 +285,8 @@ def init_worker(dat_file_path_for_worker):
         sys.exit(1)
 
 
-def process_single_node_for_pileup(task_args):
-    node_id, dat_file_offset, n_records, node_sequence = task_args
+def process_single_node_for_pileup(task_args_with_af_thresh):
+    node_id, dat_file_offset, n_records, node_sequence, min_af_threshold = task_args_with_af_thresh  # Unpack min_af_threshold
     global worker_dat_file
 
     if worker_dat_file is None: return node_id, {}
@@ -311,40 +311,28 @@ def process_single_node_for_pileup(task_args):
                 continue
 
             current_read_sequence = seq
-            # Decode CIGAR to (int_length, op_char) tuples *before* any reversal or offset adjustment
             original_decoded_cigar_ops = decode_cigar_to_int_ops(cigar_str)
 
             current_offset_on_node = off_from_file
-            current_decoded_cigar_ops = list(original_decoded_cigar_ops)  # Make a copy
+            current_decoded_cigar_ops = list(original_decoded_cigar_ops)
 
             if strand_char == '-':
                 current_read_sequence = reverse_complement(seq)
-                current_decoded_cigar_ops = original_decoded_cigar_ops[::-1]  # Reverse CIGAR ops list
+                current_decoded_cigar_ops = original_decoded_cigar_ops[::-1]
 
-                # Adjust offset for reverse strand based on the interpretation that
-                # off_from_file for '-' strand is its start on the reverse-complemented node.
-                # The adjusted offset will be the start of the rev-comp read on the forward node.
                 alignment_span_on_node = 0
-                for l_op, op_char_op in original_decoded_cigar_ops:  # Use original CIGAR for span
+                for l_op, op_char_op in original_decoded_cigar_ops:
                     if op_char_op in ('M', 'D', 'N', '=', 'X'):
                         alignment_span_on_node += l_op
 
-                if alignment_span_on_node > 0:  # Avoid issues if span is 0 (e.g. only 'I' or 'S')
+                if alignment_span_on_node > 0:
                     current_offset_on_node = node_len - alignment_span_on_node - off_from_file
                     if current_offset_on_node < 0:
-                        # This can happen if off_from_file + alignment_span_on_node > node_len
-                        # which implies an issue with the offset definition or data.
-                        # print(f"⚠️ Warning [Worker {os.getpid()}]: Negative adjusted offset ({current_offset_on_node}) for node {node_id}, record {record_idx+1}. Original off={off_from_file}, node_len={node_len}, span={alignment_span_on_node}. Skipping read.", file=sys.stderr)
-                        continue  # Skip this problematic read
-                # else: If span is 0, offset adjustment might not be meaningful in this way.
-                #      The original 'off_from_file' might be used, or it might be an edge case.
-                #      For now, if span is 0, current_offset_on_node remains off_from_file, which might be incorrect.
-                #      A read with 0 span on reference is unusual (e.g. all insertions/softclips).
-
+                        continue
             aligned_read_segments.append({
                 "offset_on_node": current_offset_on_node,
                 "read_sequence": current_read_sequence,
-                "cigar_ops": current_decoded_cigar_ops,  # Use the (potentially reversed) CIGAR ops
+                "cigar_ops": current_decoded_cigar_ops,
             })
     except Exception as e:
         print(f"❌ Error [Worker {os.getpid()}] reading records for node {node_id}: {e}", file=sys.stderr)
@@ -359,7 +347,7 @@ def process_single_node_for_pileup(task_args):
         for v_pos, v_type, v_alt, v_ref in variants_in_read:
             candidate_variants[(v_pos, v_type, v_ref, v_alt)] += 1
 
-    window_size = 50
+    window_size = 100  # Changed to 100bp
     half_window = window_size // 2
 
     for (v_pos, v_type, v_ref_defined, v_alt_defined), _ in candidate_variants.items():
@@ -402,6 +390,11 @@ def process_single_node_for_pileup(task_args):
                         af_other_count += 1
 
         alt_freq = af_alt_count / af_locus_coverage if af_locus_coverage > 0 else 0.0
+
+        # Apply AF filter
+        if alt_freq < min_af_threshold:
+            # print(f"  Skipping variant {v_pos}_{v_type}_{v_ref_defined}_{v_alt_defined} for node {node_id} due to AF {alt_freq:.4f} < {min_af_threshold:.4f}")
+            continue  # Skip this variant if AF is below threshold
 
         pileup_matrix_for_json = []
 
@@ -453,13 +446,13 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
         f"\n=== Displaying Pileups for Node ID: {node_id_str_for_display} (Length: {node_length if node_length is not None else 'N/A'}) ===")
 
     if not variants_dict:
-        print(f"ℹ️ No variants found or pileups generated for this node.")
+        print(f"ℹ️ No variants found or pileups generated for this node (or all filtered by AF).")
         return
 
     variants_displayed_count = 0
     sorted_variant_keys = sorted(variants_dict.keys(), key=lambda x: (int(x.split('_')[0]), x.split('_')[1]))
 
-    window_size = 50
+    window_size = 100  # Should match generation
     half_window = window_size // 2
 
     for variant_key in sorted_variant_keys:
@@ -549,6 +542,10 @@ def main():
         "--max_view_reads", type=int, default=20,
         help="Maximum number of reads to display per pileup matrix in console view (if --view is used)."
     )
+    parser.add_argument(
+        "--min_af", type=float, default=0.1,
+        help="Minimum allele frequency threshold for a variant to be included in the output and pileup generation."
+    )
 
     args = parser.parse_args()
 
@@ -559,6 +556,7 @@ def main():
         f"❌ Error: Cache file not found: {args.load_cache}")
     if args.gfa and not os.path.isfile(args.gfa): sys.exit(f"❌ Error: GFA file not found: {args.gfa}")
     if args.gfa and args.load_cache: print("🔹 Info: Both --gfa and --load-cache provided. Cache preferred.")
+    if args.min_af < 0.0 or args.min_af > 1.0: sys.exit("❌ Error: --min_af must be between 0.0 and 1.0.")
 
     target_node_id = args.node_id
     print(f"🔹 Processing single target node ID: {target_node_id}")
@@ -569,7 +567,7 @@ def main():
     dat_offset, n_records = node_dat_info
     print(f"✔ Index parsing for node {target_node_id} took {time.time() - start_time:.2f}s.")
 
-    node_sequence = None  # Will hold the actual sequence string
+    node_sequence = None
     if args.load_cache and os.path.isfile(args.load_cache):
         start_time = time.time()
         try:
@@ -615,8 +613,8 @@ def main():
               file=sys.stderr)
         sys.exit(1)
 
-    task = (target_node_id, dat_offset, n_records, node_sequence)
-    print(f"🔹 Prepared task for node {target_node_id}.")
+    task = (target_node_id, dat_offset, n_records, node_sequence, args.min_af)  # Pass min_af to worker
+    print(f"🔹 Prepared task for node {target_node_id} with min AF threshold: {args.min_af}.")
 
     output_data_for_json = {}
 
@@ -653,9 +651,9 @@ def main():
                                node_result_data_for_output_and_view.get("variants"))
 
     should_save_main_output_file = False
-    if has_actual_variants:
+    if has_actual_variants:  # Always save if variants were found (and passed AF filter)
         should_save_main_output_file = True
-    elif args.save_cache:
+    elif args.save_cache:  # If --save-cache is used, save the main output even if no variants (to record node_length)
         should_save_main_output_file = True
 
     if should_save_main_output_file:
@@ -678,16 +676,15 @@ def main():
                         if max_v_show != float(
                             'inf'): view_msg = f"first {int(max_v_show)} variants (max {args.max_view_reads} reads/variant)..."
 
-                        # Pass the full node sequence for context in display
                         display_pileup_data(node_result_data_for_output_and_view,
-                                            str(target_node_id),  # Pass target_node_id for the header
-                                            node_sequence,  # Pass the actual node sequence
+                                            str(target_node_id),
+                                            node_sequence,
                                             args.max_view_reads,
                                             max_v_show)
                     else:
                         print(
-                            f"\nℹ️ --view specified for node {target_node_id}, but no variants were found to display.")
-                        if node_result_data_for_output_and_view:  # Check if node_result_data exists
+                            f"\nℹ️ --view specified for node {target_node_id}, but no variants met AF threshold or were found to display.")
+                        if node_result_data_for_output_and_view:
                             print(f"   (Node Length: {node_result_data_for_output_and_view.get('node_length', 'N/A')})")
                         else:
                             print(f"   (No data available for node {target_node_id} to display length.)")
@@ -697,7 +694,7 @@ def main():
                 sys.exit(f"❌ Error writing/viewing output: {e}")
     else:
         print(
-            f"ℹ️ No variants found for node {target_node_id} and --save-cache not specified. Main output file '{args.output}' will not be created/overwritten.")
+            f"ℹ️ No variants met AF threshold for node {target_node_id} (or none found) and --save-cache not specified. Main output file '{args.output}' will not be created/overwritten.")
         if node_result_data_for_output_and_view and not has_actual_variants and \
                 not os.path.exists(args.output) and not args.save_cache:
             print(f"   (Skipping creation of output file '{args.output}' as it would be empty of variants.)")
