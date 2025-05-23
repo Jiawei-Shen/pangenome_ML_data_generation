@@ -16,9 +16,9 @@ from concurrent.futures import ProcessPoolExecutor
 # Constants
 RECORD_STRUCT = struct.Struct("<h150s150s20shc")  # Read offset, sequence, base qualities, CIGAR, MAPQ, strand
 RECORD_SIZE = RECORD_STRUCT.size
-BASE_TO_INDEX = {'A': 0, 'C': 1, 'G': 2, 'T': 3, 'N': 4, '*': 4,
-                 ' ': 4}  # '*' for deletions, ' ' for no coverage in window
-INDEX_TO_BASE_FOR_VIEW = {0: 'A', 1: 'C', 2: 'G', 3: 'T', 4: 'N', '*': '*', ' ': ' '}  # Display '*' as is, space as is
+# Ensure distinct indices for all characters used in pileup matrix
+BASE_TO_INDEX = {'A': 0, 'C': 1, 'G': 2, 'T': 3, 'N': 4, '*': 5, ' ': 6}
+INDEX_TO_BASE_FOR_VIEW = {0: 'A', 1: 'C', 2: 'G', 3: 'T', 4: 'N', 5: '*', 6: ' '}
 
 # Global for worker process state (file handle)
 worker_dat_file = None
@@ -168,8 +168,9 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_ci
             if current_node_pos <= target_node_pos < current_node_pos + length:
                 if expected_var_type == 'I': return "OTHER_FOR_INDEL"
                 if expected_var_type == 'D':
-                    deleted_seq_in_read = node_sequence[current_node_pos: current_node_pos + length]
-                    if deleted_seq_in_read == expected_ref_allele_for_indel:
+                    deleted_seq_in_read = node_sequence[
+                                          current_node_pos: current_node_pos + length]  # This is ref sequence
+                    if deleted_seq_in_read == expected_ref_allele_for_indel:  # expected_ref_allele_for_indel is v_ref_defined
                         return "*"
                     else:
                         return "OTHER_FOR_INDEL"
@@ -286,7 +287,7 @@ def init_worker(dat_file_path_for_worker):
 
 
 def process_single_node_for_pileup(task_args_with_af_thresh):
-    node_id, dat_file_offset, n_records, node_sequence, min_af_threshold = task_args_with_af_thresh  # Unpack min_af_threshold
+    node_id, dat_file_offset, n_records, node_sequence, min_af_threshold = task_args_with_af_thresh
     global worker_dat_file
 
     if worker_dat_file is None: return node_id, {}
@@ -347,7 +348,7 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
         for v_pos, v_type, v_alt, v_ref in variants_in_read:
             candidate_variants[(v_pos, v_type, v_ref, v_alt)] += 1
 
-    window_size = 100  # Changed to 100bp
+    window_size = 100
     half_window = window_size // 2
 
     for (v_pos, v_type, v_ref_defined, v_alt_defined), _ in candidate_variants.items():
@@ -391,10 +392,8 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
 
         alt_freq = af_alt_count / af_locus_coverage if af_locus_coverage > 0 else 0.0
 
-        # Apply AF filter
         if alt_freq < min_af_threshold:
-            # print(f"  Skipping variant {v_pos}_{v_type}_{v_ref_defined}_{v_alt_defined} for node {node_id} due to AF {alt_freq:.4f} < {min_af_threshold:.4f}")
-            continue  # Skip this variant if AF is below threshold
+            continue
 
         pileup_matrix_for_json = []
 
@@ -410,6 +409,7 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
                 window_start_on_node, window_size, node_len
             )
             if any(c != ' ' for c in row_chars):
+                # Convert characters to indices for JSON storage
                 row_indices = [BASE_TO_INDEX.get(char.upper(), BASE_TO_INDEX['N']) for char in row_chars]
                 pileup_matrix_for_json.append(row_indices)
 
@@ -461,6 +461,7 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
             break
 
         variant_data = variants_dict[variant_key]
+        # pileup_matrix_indices now refers to the list of lists of *indices*
         pileup_matrix_indices = variant_data.get("pileup_matrix", [])
 
         v_pos = int(variant_key.split('_')[0])
@@ -486,18 +487,33 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
 
         ref_display_parts = []
         marker_line_parts = [' '] * window_size
+        variant_display_idx_in_window = -1  # Initialize to an invalid index
 
-        for i in range(window_size):
+        # Determine the display index for the variant marker within the window
+        if v_type != 'I':
+            # For SNPs/Deletions, v_pos is the start of the variant
+            if current_window_start_on_node <= v_pos < current_window_start_on_node + window_size:
+                variant_display_idx_in_window = v_pos - current_window_start_on_node
+        elif v_type == 'I':
+            # For Insertions, v_pos is the base *before* the insertion.
+            # We mark this anchor base and the position after it.
+            if current_window_start_on_node <= v_pos < current_window_start_on_node + window_size:
+                variant_display_idx_in_window = v_pos - current_window_start_on_node
+
+        for i in range(window_size):  # i is the index in the window string (0 to window_size-1)
             actual_node_pos_in_window = current_window_start_on_node + i
             if 0 <= actual_node_pos_in_window < len(full_node_sequence):
                 ref_display_parts.append(full_node_sequence[actual_node_pos_in_window])
-                if actual_node_pos_in_window == v_pos and v_type != 'I':
-                    marker_line_parts[i] = "^"
-                elif v_type == 'I' and actual_node_pos_in_window == v_pos:
-                    marker_line_parts[i] = "I"
-                    if i + 1 < window_size: marker_line_parts[i + 1] = "^"
             else:
-                ref_display_parts.append(" ")
+                ref_display_parts.append(" ")  # Use space if outside node bounds
+
+            # Place marker based on calculated variant_display_idx_in_window
+            if i == variant_display_idx_in_window:
+                if v_type == 'I':
+                    marker_line_parts[i] = "I"  # Mark the anchor base
+                    if i + 1 < window_size: marker_line_parts[i + 1] = "^"  # Mark the insertion point after anchor
+                else:  # SNP or Deletion start
+                    marker_line_parts[i] = "^"
 
         print(f"  Node Ref: {''.join(ref_display_parts)}")
         print(f"  Marker  : {''.join(marker_line_parts)}")
@@ -506,13 +522,13 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
             print("  (No reads in pileup matrix for this variant's window)")
         else:
             displayed_reads_count = 0
-            for i, row_indices in enumerate(pileup_matrix_indices):
+            for i, row_of_indices in enumerate(pileup_matrix_indices):  # This is a list of numerical indices
                 if displayed_reads_count >= max_reads_to_display_per_variant:
                     print(
                         f"  ... (and {len(pileup_matrix_indices) - max_reads_to_display_per_variant} more reads for this variant's pileup window)")
                     break
-                pileup_row_str = "".join(
-                    [INDEX_TO_BASE_FOR_VIEW.get(idx, '?') if idx != BASE_TO_INDEX[' '] else ' ' for idx in row_indices])
+                # Convert indices back to characters for display
+                pileup_row_str = "".join([INDEX_TO_BASE_FOR_VIEW.get(idx, '?') for idx in row_of_indices])
                 print(f"  Read {i + 1:3d}: {pileup_row_str}")
                 displayed_reads_count += 1
         variants_displayed_count += 1
@@ -613,7 +629,7 @@ def main():
               file=sys.stderr)
         sys.exit(1)
 
-    task = (target_node_id, dat_offset, n_records, node_sequence, args.min_af)  # Pass min_af to worker
+    task = (target_node_id, dat_offset, n_records, node_sequence, args.min_af)
     print(f"🔹 Prepared task for node {target_node_id} with min AF threshold: {args.min_af}.")
 
     output_data_for_json = {}
@@ -651,9 +667,9 @@ def main():
                                node_result_data_for_output_and_view.get("variants"))
 
     should_save_main_output_file = False
-    if has_actual_variants:  # Always save if variants were found (and passed AF filter)
+    if has_actual_variants:
         should_save_main_output_file = True
-    elif args.save_cache:  # If --save-cache is used, save the main output even if no variants (to record node_length)
+    elif args.save_cache:
         should_save_main_output_file = True
 
     if should_save_main_output_file:
@@ -676,6 +692,7 @@ def main():
                         if max_v_show != float(
                             'inf'): view_msg = f"first {int(max_v_show)} variants (max {args.max_view_reads} reads/variant)..."
 
+                        # Pass the node-specific data and the full node sequence for context
                         display_pileup_data(node_result_data_for_output_and_view,
                                             str(target_node_id),
                                             node_sequence,
