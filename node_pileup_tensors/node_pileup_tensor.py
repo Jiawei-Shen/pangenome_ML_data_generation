@@ -20,22 +20,22 @@ BASE_TO_INDEX = {'A': 0, 'C': 1, 'G': 2, 'T': 3, 'N': 4, '*': 5, ' ': 6, '-': 6}
 INDEX_TO_BASE_FOR_VIEW = {0: 'A', 1: 'C', 2: 'G', 3: 'T', 4: 'N', 5: '*', 6: ' '}
 
 TENSOR_WINDOW_SIZE = 100
-TENSOR_MAX_READ_ROWS = 200  # Max number of actual read rows, total rows in tensor = 1 (ref) + TENSOR_MAX_READ_ROWS
+TENSOR_MAX_READ_ROWS = 200
 PADDING_BASE_INDEX = BASE_TO_INDEX[' ']
 DEFAULT_QUALITY_PADDING = 0
-MISMATCH_CHANNEL_REF_ROW_VALUE = 0  # Value for the ref row in mismatch channel
-MISMATCH_COMPARISON_PADDING_VALUE = 0  # Value if comparing against padding
+MISMATCH_CHANNEL_REF_ROW_VALUE = 0
+MISMATCH_COMPARISON_PADDING_VALUE = 0
 
-# Global for worker process state (file handle)
+# Globals for worker process state
 worker_dat_file = None
-# Global for base output directory (passed from main)
 worker_base_output_dir = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helper Functions (reverse_complement, parse_idx_file_for_single_node, load_node_sequence_from_gfa,
-# decode_cigar_to_int_ops, get_allele_from_read_at_node_pos, detect_variants_from_cigar,
-# get_read_representation_in_window_for_view are assumed to be the same as your last provided script)
+# Helper Functions
+# (reverse_complement, parse_idx_file_for_single_node, load_node_sequence_from_gfa,
+#  decode_cigar_to_int_ops, get_allele_from_read_at_node_pos, detect_variants_from_cigar,
+#  get_read_representation_in_window_for_view, get_read_tensor_rows_in_window remain the same)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def reverse_complement(sequence):
@@ -282,9 +282,9 @@ def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
     return base_indices_row, quality_scores_row
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Worker Process Initialization and Target Function
-# ─────────────────────────────────────────────────────────────────────────────
+## ─────────────────────────────────────────────────────────────────────────────
+## Worker Process Initialization and Target Function
+## ─────────────────────────────────────────────────────────────────────────────
 
 def init_worker(dat_file_path_for_worker, base_output_dir_for_worker):
     global worker_dat_file, worker_base_output_dir
@@ -292,39 +292,39 @@ def init_worker(dat_file_path_for_worker, base_output_dir_for_worker):
         worker_dat_file = open(dat_file_path_for_worker, 'rb')
         worker_base_output_dir = base_output_dir_for_worker
     except FileNotFoundError:
-        print(f"❌ Error [Worker {os.getpid()}]: DAT file not found at {dat_file_path_for_worker}", file=sys.stderr)
-        sys.exit(1)  # Worker exits, ProcessPoolExecutor will raise an error
+        # Ensure this print goes to stderr or a log accessible from the main process
+        sys.stderr.write(f"❌ Error [Worker {os.getpid()}]: DAT file not found at {dat_file_path_for_worker}\n")
+        sys.exit(1)
     except Exception as e:
-        print(f"❌ Error [Worker {os.getpid()}] opening DAT file {dat_file_path_for_worker}: {e}", file=sys.stderr)
+        sys.stderr.write(f"❌ Error [Worker {os.getpid()}] opening DAT file {dat_file_path_for_worker}: {e}\n")
         sys.exit(1)
 
 
 def process_single_node_for_pileup(task_args_with_af_thresh):
-    # task_args_with_af_thresh = (node_id, dat_file_offset, n_records, node_sequence, min_af_threshold)
-    # worker_base_output_dir is a global in the worker process
     node_id, dat_file_offset, n_records, node_sequence, min_af_threshold = task_args_with_af_thresh
     global worker_dat_file, worker_base_output_dir
 
     if worker_dat_file is None or worker_base_output_dir is None:
-        print(f"❌ Error [Worker {os.getpid()}]: Worker not initialized properly.", file=sys.stderr)
-        return node_id, None  # Indicate failure
+        sys.stderr.write(
+            f"❌ Error [Worker {os.getpid()}]: Worker not initialized properly (dat_file or output_dir missing).\n")
+        return node_id, None
 
     if not node_sequence:
-        return node_id, []  # Return empty list of headers if no sequence
+        # It's possible to have a node with reads but no sequence if GFA loading failed but processing was forced
+        sys.stderr.write(
+            f"ℹ️ [Worker {os.getpid()}]: No sequence provided for node {node_id}. Skipping tensor/summary generation.\n")
+        return node_id, {}  # Return empty dict for view_data if no sequence
 
     node_specific_output_dir = os.path.join(worker_base_output_dir, str(node_id))
     try:
         os.makedirs(node_specific_output_dir, exist_ok=True)
     except OSError as e:
-        print(f"❌ Error [Worker {os.getpid()}]: Could not create directory {node_specific_output_dir}: {e}",
-              file=sys.stderr)
+        sys.stderr.write(
+            f"❌ Error [Worker {os.getpid()}]: Could not create directory {node_specific_output_dir}: {e}\n")
         return node_id, None
 
     node_len = len(node_sequence)
-    variant_headers_for_node = []  # To store header info for this node's variants
-    # This will be used by display_pileup_data if --view is active
-    # It's an intermediate structure for each variant before tensor conversion.
-    # We'll keep it separate to avoid bloating the header JSON.
+    variant_headers_for_node = []
     view_oriented_variant_data = {}
 
     aligned_read_segments = []
@@ -341,8 +341,11 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
                 cigar_str_original = raw_cigar.rstrip(b'\x00').decode('ascii', errors='replace')
                 strand_char = strand_byte.decode('ascii')
             except UnicodeDecodeError:
+                # sys.stderr.write(f"⚠️ Warning [Worker {os.getpid()}]: Unicode decode error for a read on node {node_id}. Skipping.\n")
                 continue
-            if len(seq) != len(qual_str): continue
+            if len(seq) == 0 or len(seq) != len(qual_str):  # Ensure non-empty and matching lengths
+                # sys.stderr.write(f"⚠️ Warning [Worker {os.getpid()}]: Mismatch length seq vs qual or empty seq for a read on node {node_id}. Skipping read.\n")
+                continue
 
             original_decoded_cigar_ops = decode_cigar_to_int_ops(cigar_str_original)
             current_read_sequence = seq
@@ -354,10 +357,14 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
                 current_read_sequence = reverse_complement(seq)
                 current_quality_str = qual_str[::-1]
                 current_decoded_cigar_ops.reverse()
-                alignment_span_on_node = len(current_read_sequence)
-                if alignment_span_on_node > 0:
+                alignment_span_on_node = len(current_read_sequence)  # User-confirmed fix
+                if alignment_span_on_node > 0:  # Should always be true if len(seq)>0
                     current_offset_on_node = node_len - alignment_span_on_node - off_from_file
-                    if current_offset_on_node < 0: continue
+                    if current_offset_on_node < 0:
+                        # sys.stderr.write(f"⚠️ Warning [Worker {os.getpid()}]: Negative offset for node {node_id}, strand '-', off {off_from_file}, span {alignment_span_on_node}. Skipping.\n")
+                        continue
+                        # The conditional -1 based on off_from_file !=0 was discussed previously.
+                # Sticking to the script version confirmed by the user in the last "Remember this new script" prompt.
 
             aligned_read_segments.append({
                 "offset_on_node": current_offset_on_node,
@@ -368,7 +375,7 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
                 "strand": strand_char
             })
     except Exception as e:
-        print(f"❌ Error [Worker {os.getpid()}] reading records for node {node_id}: {e}", file=sys.stderr)
+        sys.stderr.write(f"❌ Error [Worker {os.getpid()}] reading records for node {node_id}: {e}\n")
         return node_id, None
 
     candidate_variants = defaultdict(int)
@@ -420,7 +427,6 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
 
         variant_key_str = f"{v_pos}_{v_type}_{v_ref_defined}_{v_alt_defined}"
 
-        # Data for console view (if needed)
         pileup_reads_data_for_view = []
         if v_type == 'I':
             window_center_on_node_view = v_pos + 1
@@ -438,8 +444,6 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
                     "bases": row_indices, "offset": segment["offset_on_node"],
                     "strand": segment["strand"], "cigar": segment["original_cigar_str"]})
 
-        # Store for potential viewing by main thread
-        # This is a temporary structure within the worker for the current node
         view_oriented_variant_data[variant_key_str] = {
             "pileup_reads_data": pileup_reads_data_for_view,
             "alt_allele_count": af_alt_count, "ref_allele_count_at_locus": af_ref_count,
@@ -447,24 +451,21 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
             "alt_allele_frequency": round(alt_freq, 4)
         }
 
-        # --- Tensor Generation ---
         tensor_ch1_bases_list = []
         tensor_ch2_qualities_list = []
         tensor_ch3_mismatches_list = []
-
         window_start_on_node_tensor = window_start_on_node_view
 
-        # Ref Row for Channel 1 (Bases) and Channel 2 (Qualities)
         ref_base_indices_row = [PADDING_BASE_INDEX] * TENSOR_WINDOW_SIZE
-        ref_qual_scores_row = [DEFAULT_QUALITY_PADDING] * TENSOR_WINDOW_SIZE
+        ref_qual_scores_row = [DEFAULT_QUALITY_PADDING] * TENSOR_WINDOW_SIZE  # CH2 Ref Quals
+        ref_mismatch_row = [MISMATCH_CHANNEL_REF_ROW_VALUE] * TENSOR_WINDOW_SIZE  # CH3 Ref Mismatches
         for i in range(TENSOR_WINDOW_SIZE):
             actual_node_pos = window_start_on_node_tensor + i
             if 0 <= actual_node_pos < node_len:
                 ref_base_indices_row[i] = BASE_TO_INDEX.get(node_sequence[actual_node_pos].upper(), BASE_TO_INDEX['N'])
         tensor_ch1_bases_list.append(ref_base_indices_row)
         tensor_ch2_qualities_list.append(ref_qual_scores_row)
-        # Ref Row for Channel 3 (Mismatches) - all zeros
-        tensor_ch3_mismatches_list.append([MISMATCH_CHANNEL_REF_ROW_VALUE] * TENSOR_WINDOW_SIZE)
+        tensor_ch3_mismatches_list.append(ref_mismatch_row)
 
         reads_added_to_tensor = 0
         for segment in aligned_read_segments:
@@ -478,19 +479,18 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
             tensor_ch1_bases_list.append(base_indices_row)
             tensor_ch2_qualities_list.append(quality_scores_row)
 
-            # Generate Mismatch Row (Channel 3)
-            mismatch_row = [MISMATCH_COMPARISON_PADDING_VALUE] * TENSOR_WINDOW_SIZE
+            mismatch_row_for_read = [MISMATCH_COMPARISON_PADDING_VALUE] * TENSOR_WINDOW_SIZE
             for i in range(TENSOR_WINDOW_SIZE):
                 read_base_idx = base_indices_row[i]
-                ref_base_idx_for_comp = ref_base_indices_row[i]  # From the generated ref row of tensor_ch1
+                ref_base_idx_for_comp = ref_base_indices_row[i]
 
                 if read_base_idx == PADDING_BASE_INDEX or ref_base_idx_for_comp == PADDING_BASE_INDEX:
-                    mismatch_row[i] = MISMATCH_COMPARISON_PADDING_VALUE  # Treat padding as no mismatch
+                    mismatch_row_for_read[i] = MISMATCH_COMPARISON_PADDING_VALUE
                 elif read_base_idx == ref_base_idx_for_comp:
-                    mismatch_row[i] = 0  # Same
+                    mismatch_row_for_read[i] = 0
                 else:
-                    mismatch_row[i] = 1  # Different
-            tensor_ch3_mismatches_list.append(mismatch_row)
+                    mismatch_row_for_read[i] = 1
+            tensor_ch3_mismatches_list.append(mismatch_row_for_read)
             reads_added_to_tensor += 1
 
         for _ in range(TENSOR_MAX_READ_ROWS - reads_added_to_tensor):
@@ -498,14 +498,14 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
             tensor_ch2_qualities_list.append([DEFAULT_QUALITY_PADDING] * TENSOR_WINDOW_SIZE)
             tensor_ch3_mismatches_list.append([MISMATCH_COMPARISON_PADDING_VALUE] * TENSOR_WINDOW_SIZE)
 
-        # Combine channels into a single tensor
-        # Shape: (channels, depth, width) = (3, 1+TENSOR_MAX_READ_ROWS, TENSOR_WINDOW_SIZE)
         try:
+            # Ensure all sublists have the same length for tensor conversion
+            # This should be guaranteed by TENSOR_WINDOW_SIZE initialization
             final_tensor = torch.tensor([
                 tensor_ch1_bases_list,
                 tensor_ch2_qualities_list,
                 tensor_ch3_mismatches_list
-            ], dtype=torch.int8)  # Using int8 to save space, adjust if necessary
+            ], dtype=torch.int8)
 
             tensor_filename = f"{variant_key_str}.pth"
             tensor_filepath = os.path.join(node_specific_output_dir, tensor_filename)
@@ -513,7 +513,7 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
 
             variant_headers_for_node.append({
                 "variant_key": variant_key_str,
-                "tensor_file": tensor_filename,  # Relative path within node_id folder
+                "tensor_file": tensor_filename,
                 "alt_allele_count": af_alt_count,
                 "ref_allele_count_at_locus": af_ref_count,
                 "other_allele_count_at_locus": af_other_count,
@@ -521,52 +521,41 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
                 "alt_allele_frequency": round(alt_freq, 4)
             })
         except Exception as e:
-            print(
-                f"❌ Error [Worker {os.getpid()}]: Failed to create or save tensor for {variant_key_str} in node {node_id}: {e}",
-                file=sys.stderr)
-            # Continue to next variant, or decide if this is a fatal error for the node
+            sys.stderr.write(
+                f"❌ Error [Worker {os.getpid()}]: Failed to create or save tensor for {variant_key_str} in node {node_id}: {e}\n")
 
-    # After processing all variants for the node, save the summary JSON
     if variant_headers_for_node:
         summary_json_path = os.path.join(node_specific_output_dir, "variant_summary.json")
         try:
             with open(summary_json_path, 'w') as sjf:
                 json.dump({
                     "node_id": node_id,
-                    "node_length": node_len,  # Add node length to summary
+                    "node_length": node_len,
+                    "node_sequence": node_sequence,  # Added node sequence
                     "variants": variant_headers_for_node
                 }, sjf, indent=2)
         except Exception as e:
-            print(f"❌ Error [Worker {os.getpid()}]: Failed to write summary JSON for node {node_id}: {e}",
-                  file=sys.stderr)
-            return node_id, None  # Indicate failure for this node's summary
+            sys.stderr.write(f"❌ Error [Worker {os.getpid()}]: Failed to write summary JSON for node {node_id}: {e}\n")
+            # If summary fails, we might still have .pth files.
+            # Decide if view_oriented_variant_data should be cleared or returned partially.
+            # For now, if summary fails, we still return view_data if it was populated.
 
-    # Return the view-oriented data if needed by main for --view, and the list of headers (or just success)
-    # For simplicity, the worker handles its file I/O. Main needs to know if it should call display.
-    # Let's return the view_oriented_variant_data for display purposes.
     return node_id, view_oriented_variant_data
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Pileup Viewing Function (display_pileup_data) - Remains the same as your last version
-# It will use the "pileup_reads_data" key from the dict returned by process_single_node_for_pileup
-# ─────────────────────────────────────────────────────────────────────────────
+## ─────────────────────────────────────────────────────────────────────────────
+## Pileup Viewing Function (display_pileup_data)
+## ─────────────────────────────────────────────────────────────────────────────
 def display_pileup_data(node_data_for_display_view, node_id_str_for_display, full_node_sequence,
                         max_reads_to_display_per_variant, max_variants_to_display=float('inf')):
-    # This function expects node_data_for_display_view to be a dictionary where keys are variant_key_str
-    # and values are dictionaries containing "pileup_reads_data" and other counts/freq.
-    # This matches what `view_oriented_variant_data` (returned by worker) will look like.
-    if not node_data_for_display_view or not isinstance(node_data_for_display_view,
-                                                        dict):  # Check if it's the variant dict
+    if not node_data_for_display_view or not isinstance(node_data_for_display_view, dict):
         print(f"ℹ️ No valid pileup data to display for node {node_id_str_for_display}.", file=sys.stderr)
         return
 
-    # We don't have a single "node_length" at this level anymore, it's per variant.
-    # However, full_node_sequence is passed, so len(full_node_sequence) can be used.
     print(
         f"\n=== Displaying Pileups for Node ID: {node_id_str_for_display} (Length: {len(full_node_sequence)}) ===")
 
-    if not node_data_for_display_view:  # Checks if the variant dictionary is empty
+    if not node_data_for_display_view:
         print(f"ℹ️ No variants found or pileups generated for this node (or all filtered by AF).")
         return
 
@@ -583,7 +572,7 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
                 f"\n  ... (and {len(node_data_for_display_view) - variants_displayed_count} more variants not shown due to limit)")
             break
 
-        variant_data = node_data_for_display_view[variant_key]  # Get data for this specific variant
+        variant_data = node_data_for_display_view[variant_key]
         pileup_reads_display_data = variant_data.get("pileup_reads_data", [])
 
         v_pos = int(variant_key.split('_')[0])
@@ -649,9 +638,9 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
     print("\n")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main function
-# ─────────────────────────────────────────────────────────────────────────────
+## ─────────────────────────────────────────────────────────────────────────────
+## Main function
+## ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
         description="Generate variant-centered pileups for a single specified node and optionally view them.",
@@ -659,8 +648,7 @@ def main():
     )
     parser.add_argument("dat", help=".dat file path (read alignment data)")
     parser.add_argument("idx", help=".idx file path (index for .dat file)")
-    parser.add_argument("output",
-                        help="Base output directory for node-specific folders, tensors, and summaries.")  # Modified help
+    parser.add_argument("output", help="Base output directory for node-specific folders, tensors, and summaries.")
     parser.add_argument("--node_id", type=int, required=True, help="The specific node ID to process.")
     parser.add_argument("--gfa", help="GFA graph file path (required if node sequence cache is not used/built).")
     parser.add_argument("--load-cache", help="Load node sequence from this JSON cache file.")
@@ -673,7 +661,6 @@ def main():
                         help="Min allele frequency for a variant to be processed.")
     args = parser.parse_args()
 
-    # Validate paths and args
     if not os.path.isfile(args.dat): sys.exit(f"❌ Error: DAT file not found: {args.dat}")
     if not os.path.isfile(args.idx): sys.exit(f"❌ Error: Index file not found: {args.idx}")
     if not args.load_cache and not args.gfa: sys.exit("❌ Error: Must provide --gfa or --load-cache.")
@@ -682,7 +669,6 @@ def main():
     if args.gfa and not os.path.isfile(args.gfa): sys.exit(f"❌ Error: GFA file not found: {args.gfa}")
     if args.min_af < 0.0 or args.min_af > 1.0: sys.exit("❌ Error: --min_af must be between 0.0 and 1.0.")
 
-    # Create base output directory if it doesn't exist
     try:
         os.makedirs(args.output, exist_ok=True)
         print(f"🔹 Base output directory: {args.output}")
@@ -699,7 +685,6 @@ def main():
     print(f"✔ Index parsing for node {target_node_id} took {time.time() - start_time:.2f}s.")
 
     node_sequence = None
-    # ... (node sequence loading logic remains the same) ...
     if args.load_cache and os.path.isfile(args.load_cache):
         start_time_cache = time.time()
         try:
@@ -747,20 +732,18 @@ def main():
     start_proc_time = time.time()
 
     processed_node_id_result = None
-    view_data_for_node = None  # This will store the dict of variants for viewing
+    view_data_for_node = None
 
     try:
-        # Pass the base output directory to the worker initializer
         with ProcessPoolExecutor(max_workers=1, initializer=init_worker, initargs=(args.dat, args.output)) as executor:
             future = executor.submit(process_single_node_for_pileup, task)
-            # process_single_node_for_pileup now returns (node_id, view_oriented_variant_data_dict_or_None)
             processed_node_id_result, view_data_for_node = future.result()
 
-        if view_data_for_node is None and processed_node_id_result is not None:  # Worker indicated failure for this node
+        if view_data_for_node is None and processed_node_id_result is not None:
             print(
                 f"⚠️ Warning: Processing for node {processed_node_id_result} encountered an issue. Check worker logs. No output generated for this node.",
                 file=sys.stderr)
-        elif processed_node_id_result is None:  # Should not happen if worker exits cleanly
+        elif processed_node_id_result is None:
             print(f"⚠️ Critical Error: Worker did not return expected results for node {target_node_id}.",
                   file=sys.stderr)
 
@@ -770,34 +753,29 @@ def main():
     total_elapsed_time = time.time() - start_proc_time
     print(f"✔ Node {target_node_id} processing (including I/O) finished in {total_elapsed_time:.2f}s.")
 
-    # --view logic now uses view_data_for_node
     if args.view is not None:
-        if view_data_for_node and isinstance(view_data_for_node,
-                                             dict) and view_data_for_node:  # Check if it's a non-empty dict
+        if view_data_for_node and isinstance(view_data_for_node, dict) and view_data_for_node:
             max_v_show = float('inf') if args.view == -1 else (args.view if args.view >= 0 else float('inf'))
             if args.view < -1: print("⚠️ Warning: Invalid number for --view. Showing all.", file=sys.stderr)
-
             view_msg = f"all variants (max {args.max_view_reads} reads/variant)..."
             if max_v_show != float(
                 'inf'): view_msg = f"first {int(max_v_show)} variants (max {args.max_view_reads} reads/variant)..."
             print(f"🔹 Displaying pileups for node {target_node_id}: {view_msg}")
-
-            # display_pileup_data expects a dictionary of variants for the node
             display_pileup_data(view_data_for_node, str(target_node_id),
                                 node_sequence, args.max_view_reads, max_v_show)
-        elif processed_node_id_result is not None:  # Node was processed but no viewable variants or an issue
+        elif processed_node_id_result is not None:
             print(
                 f"\nℹ️ --view specified for node {target_node_id}, but no variants met AF threshold or were found to display (or an error occurred in worker).")
-            print(f"   (Node Length: {len(node_sequence)})")
+            if node_sequence: print(f"   (Node Length: {len(node_sequence)})")
 
     node_summary_file = os.path.join(args.output, str(target_node_id), "variant_summary.json")
     if os.path.exists(node_summary_file):
         print(f"✅ Output generated for node {target_node_id} in {os.path.join(args.output, str(target_node_id))}")
-    elif processed_node_id_result is not None and view_data_for_node is not None and not view_data_for_node:  # Processed, but no variants met AF
+    elif processed_node_id_result is not None and view_data_for_node is not None and not view_data_for_node:
         print(f"ℹ️ No variants met AF threshold for node {target_node_id}. No tensors or summary file generated.")
-    elif processed_node_id_result is not None and view_data_for_node is None:  # Error in worker
-        pass  # Error message already printed
-    else:  # Should not be reached if processed_node_id_result is None
+    elif processed_node_id_result is not None and view_data_for_node is None:
+        pass
+    else:
         print(f"ℹ️ No output summary found for node {target_node_id}. Check logs for errors.")
 
     print("✅ Script finished.")
