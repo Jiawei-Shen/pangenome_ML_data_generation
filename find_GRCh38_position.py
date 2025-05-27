@@ -284,10 +284,8 @@ if __name__ == '__main__':
 
     # Early check for grep availability
     try:
-        # Use a simple grep command that should succeed if grep is present and working
-        # Using --version is standard. Redirecting stderr to DEVNULL to avoid polluting script's stderr if grep prints info there.
-        subprocess.run(['grep', '--version'], capture_output=True, check=True, text=True, encoding='utf-8',
-                       stderr=subprocess.DEVNULL)
+        # Corrected line: removed stderr=subprocess.DEVNULL as it conflicts with capture_output=True
+        subprocess.run(['grep', '--version'], capture_output=True, check=True, text=True, encoding='utf-8')
         logging.debug("grep command is available and functional.")
     except (FileNotFoundError, subprocess.CalledProcessError) as e:
         logging.critical(
