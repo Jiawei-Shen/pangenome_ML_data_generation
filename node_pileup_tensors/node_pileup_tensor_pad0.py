@@ -364,8 +364,7 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
                 current_read_sequence = reverse_complement(seq)
                 current_quality_str = qual_str[::-1]
                 current_decoded_cigar_ops.reverse()
-                alignment_span_on_node = sum(
-                    l for l, op in current_decoded_cigar_ops if op in ('M', '=', 'X', 'D', 'N'))
+                alignment_span_on_node = len(current_read_sequence)  # User-confirmed fix
                 if alignment_span_on_node > 0:
                     # The CIGAR defines alignment span on the reference.
                     # For reverse strand, if original offset was X, and original CIGAR aligns for L bases on node,
