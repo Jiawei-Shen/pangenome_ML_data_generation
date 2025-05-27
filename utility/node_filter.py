@@ -9,7 +9,7 @@ import re  # For extracting chromosome name
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Functions for reading IDX file (remains the same)
+# Functions for reading IDX file
 # ─────────────────────────────────────────────────────────────────────────────
 def load_index(idx_path):
     node_index = {}
@@ -98,8 +98,6 @@ def load_json_structure_and_ids(json_filepath):
 def extract_chromosome_from_path_pattern(path_pattern):
     if not path_pattern or not isinstance(path_pattern, str):
         return None
-    # Regex to find "chr" followed by one or more alphanumeric characters or just X, Y, M, MT
-    # Example: chr1, chrX, chr22_random
     match = re.search(r'(chr([0-9A-Za-z_]+|X|Y|M|MT))', path_pattern)
     if match:
         return match.group(1)
@@ -107,35 +105,32 @@ def extract_chromosome_from_path_pattern(path_pattern):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Function to run bcftools query
+# Function to run bcftools view to get VCF records for a region
 # ─────────────────────────────────────────────────────────────────────────────
-def run_bcftools_query(bcftools_path, vcf_filepath, chromosome, start_1based, end_1based):
-    """
-    Runs bcftools query for a given region and returns results.
-    """
+def run_bcftools_region_extract(bcftools_path, vcf_filepath, chromosome, start_1based, end_1based):
     results = []
     region = f"{chromosome}:{start_1based}-{end_1based}"
-    command = [bcftools_path, 'query', '-r', region, vcf_filepath]
+    command = [bcftools_path, 'view', '-r', region, vcf_filepath]
 
     try:
         process = subprocess.run(command, capture_output=True, text=True, check=False)
-        if process.returncode == 0:
+        if process.stdout:  # Process stdout even if returncode is non-zero, as some info might be there
             for line in process.stdout.splitlines():
                 if not line.startswith('#'):
                     results.append(line)
-        else:
-            # bcftools query can return non-zero if region is not found but file is valid.
-            # Or if region is malformed or VCF is problematic.
-            # We consider empty results for non-zero return unless it's a clear execution error.
-            if "failed to open" in process.stderr or "Could not parse" in process.stderr:
-                print(f"Error running bcftools query for region {region}: {process.stderr.strip()}", file=sys.stderr)
-            # else: bcftools might have just not found anything, which is not an error for results list.
+
+        if process.returncode != 0:
+            stderr_output = process.stderr.strip()
+            if stderr_output:
+                if "failed" in stderr_output.lower() or "error" in stderr_output.lower() or "could not" in stderr_output.lower() or "non-existent" in stderr_output.lower():
+                    print(f"Error running 'bcftools view' for region {region}: {stderr_output}", file=sys.stderr)
+                # else: # Non-fatal stderr, e.g. region not found but command itself okay
+                #    print(f"Note: 'bcftools view' for region {region} exited with code {process.returncode} and stderr: {stderr_output}", file=sys.stderr)
     except FileNotFoundError:
-        print(f"Error: bcftools command not found at '{bcftools_path}'. Cannot perform VCF query.", file=sys.stderr)
-        # This error should ideally be caught once globally.
-        return []  # Return empty as bcftools itself is missing
+        print(f"Error: bcftools command not found at '{bcftools_path}'. Cannot perform VCF operation.", file=sys.stderr)
+        return []
     except Exception as e:
-        print(f"An unexpected error occurred during bcftools query for region {region}: {e}", file=sys.stderr)
+        print(f"An unexpected error occurred during 'bcftools view' for region {region}: {e}", file=sys.stderr)
     return results
 
 
@@ -160,23 +155,16 @@ def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepat
         return
 
     chromosome_for_vcf = None
-    if vcf_file and bcftools_path:  # Only try to extract chromosome if we plan to query
+    if vcf_file and bcftools_path:
         path_pattern = main_json_structure.get("path_name_input_pattern")
         chromosome_for_vcf = extract_chromosome_from_path_pattern(path_pattern)
         if not chromosome_for_vcf:
+            print(f"Warning: Could not extract chromosome from 'path_name_input_pattern': '{path_pattern}'.",
+                  file=sys.stderr)
             print(
-                f"Warning: Could not extract chromosome from 'path_name_input_pattern': '{path_pattern}'. VCF queries might be inaccurate or skipped if chromosome is essential and unknown.",
+                "Attempting to use 'chr1' as a fallback chromosome for VCF queries. This may not be correct for your data.",
                 file=sys.stderr)
-            # Defaulting to "chr1" as per user example, but this is a guess.
-            # Consider making this a fatal error for VCF querying or requiring a chromosome arg.
-            # For now, let's allow it to proceed but with a clear warning that queries might fail if chr isn't "chr1".
-            # If your VCF files are always e.g. "chr1", you might hardcode it or pass as param.
-            # Given user query "chr1:...", we assume they might expect "chr1" if not found.
-            # A better approach would be to skip VCF if chromosome_for_vcf is None here.
-            print(
-                "Attempting to use 'chr1' as a fallback chromosome for VCF queries due to user example. This may not be correct.",
-                file=sys.stderr)
-            chromosome_for_vcf = "chr1"  # Fallback based on user's query example
+            chromosome_for_vcf = "chr1"
         else:
             print(f"Extracted chromosome '{chromosome_for_vcf}' for VCF queries.")
 
@@ -198,57 +186,75 @@ def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepat
 
     output_json_structure = copy.deepcopy(main_json_structure)
     filtered_nodes_list_in_json = []
+    nodes_queried_with_bcftools_count = 0  # Counter for VCF queries
 
     original_nodes_list = main_json_structure.get("nodes")
     if isinstance(original_nodes_list, list):
         for node_item in original_nodes_list:
-            if isinstance(node_item, dict):
-                node_id_str = node_item.get("node_id")
+            # Make a deepcopy of the node_item to modify it before appending
+            current_node_copy = copy.deepcopy(node_item)
+            if isinstance(current_node_copy, dict):
+                node_id_str = current_node_copy.get("node_id")
                 if node_id_str is not None:
                     try:
                         node_id_int = int(node_id_str)
                         if node_id_int in common_node_ids_int:
-                            # This node is kept, add VCF query results if applicable
+                            # This node is kept, attempt VCF query if applicable
                             if vcf_file and bcftools_path and chromosome_for_vcf:
                                 try:
-                                    start_0based = int(node_item.get("grch38_position_start", 0))
-                                    length = int(node_item.get("length", 0))
+                                    # Ensure keys exist before int() conversion to avoid TypeError
+                                    start_0based_str = current_node_copy.get("grch38_position_start")
+                                    length_str = current_node_copy.get("length")
+
+                                    if start_0based_str is None or length_str is None:
+                                        raise KeyError("grch38_position_start or length missing")
+
+                                    start_0based = int(start_0based_str)
+                                    length = int(length_str)
 
                                     if length <= 0:
                                         print(
-                                            f"Warning: Node ID {node_id_str} has non-positive length ({length}). Skipping VCF query.",
+                                            f"Note: Node ID {node_id_str} has non-positive length ({length}). Skipping VCF query.",
                                             file=sys.stderr)
-                                        node_item["vcf_query_results"] = []
+                                        current_node_copy["vcf_query_results"] = []
                                     else:
                                         query_start_1based = start_0based + 1
                                         query_end_1based = start_0based + length
-                                        # print(f"Querying VCF for Node {node_id_str} ({chromosome_for_vcf}:{query_start_1based}-{query_end_1based})...")
-                                        vcf_results = run_bcftools_query(bcftools_path, vcf_file, chromosome_for_vcf,
-                                                                         query_start_1based, query_end_1based)
-                                        node_item["vcf_query_results"] = vcf_results
+                                        vcf_results = run_bcftools_region_extract(bcftools_path, vcf_file,
+                                                                                  chromosome_for_vcf,
+                                                                                  query_start_1based, query_end_1based)
+                                        current_node_copy["vcf_query_results"] = vcf_results
+                                        nodes_queried_with_bcftools_count += 1  # Increment if query was attempted
                                 except KeyError as e:
                                     print(
-                                        f"Warning: Node ID {node_id_str} missing {e} field for VCF query. Skipping VCF query for this node.",
+                                        f"Warning: Node ID {node_id_str} missing required field ('{e}') for VCF query. Skipping VCF query for this node.",
                                         file=sys.stderr)
-                                    node_item["vcf_query_results"] = []
+                                    current_node_copy["vcf_query_results"] = []
                                 except ValueError as e:
                                     print(
-                                        f"Warning: Node ID {node_id_str} has invalid numeric value for position/length ({e}). Skipping VCF query.",
+                                        f"Warning: Node ID {node_id_str} has invalid numeric value for position/length ({e}). Skipping VCF query for this node.",
                                         file=sys.stderr)
-                                    node_item["vcf_query_results"] = []
+                                    current_node_copy["vcf_query_results"] = []
                             else:
-                                # VCF querying not enabled or not possible, ensure field doesn't exist or is empty
-                                if "vcf_query_results" in node_item:  # clean up if it was there from a previous run concept
-                                    del node_item["vcf_query_results"]
-                            filtered_nodes_list_in_json.append(node_item)
+                                if "vcf_query_results" in current_node_copy:
+                                    del current_node_copy["vcf_query_results"]
+                            filtered_nodes_list_in_json.append(current_node_copy)
                     except (ValueError, TypeError):
-                        pass  # Already warned in load_json_structure_and_ids
+                        # This specific node_id_str could not be converted to int.
+                        # Already warned in load_json_structure_and_ids if it was an issue for the set.
+                        # If it's not in common_node_ids_int, it's skipped anyway.
+                        pass
         output_json_structure["nodes"] = filtered_nodes_list_in_json
         print(
             f"\nStep 4: Writing modified JSON structure (with {len(filtered_nodes_list_in_json)} nodes in 'nodes' list) to {output_json_filepath}...")
     else:
         print(
             f"\nStep 4: Input JSON does not have a 'nodes' list or it's not a list. Writing structure to {output_json_filepath}...")
+
+    if vcf_file:
+        if bcftools_path:
+            print(f"Attempted VCF queries with bcftools for {nodes_queried_with_bcftools_count} filtered node(s).")
+        # else: warning already printed if bcftools not found
 
     try:
         with open(output_json_filepath, 'w') as f_out_json:
@@ -269,7 +275,8 @@ def main():
     parser.add_argument("json_path", help="Path to the input JSON file (object with a 'nodes' list).")
     parser.add_argument("idx_path", help="Path to the .idx file.")
     parser.add_argument("output_json_path", help="Path to the output JSON file for the modified JSON object.")
-    parser.add_argument("--vcf_file", help="Optional: Path to VCF file to query with bcftools for each filtered node.",
+    parser.add_argument("--vcf_file",
+                        help="Optional: Path to a bgzipped and tabix-indexed VCF file to query with bcftools for each filtered node.",
                         default=None)
 
     args = parser.parse_args()
