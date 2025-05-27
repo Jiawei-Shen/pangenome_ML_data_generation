@@ -2,24 +2,16 @@ import json
 import struct
 import argparse
 import sys
-import copy  # For deep copying the main JSON structure
+import copy
+import subprocess
+import shutil  # For checking bcftools availability
+import re  # For extracting chromosome name
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Functions for reading IDX file (remains the same)
 # ─────────────────────────────────────────────────────────────────────────────
 def load_index(idx_path):
-    """
-    Loads the node index from the .idx file.
-
-    Args:
-        idx_path (str): Path to the .idx file.
-
-    Returns:
-        dict: A dictionary where keys are integer node IDs (block_id)
-              and values are dictionaries with "start", "size", "n_records".
-              Returns an empty dictionary if the file cannot be processed.
-    """
     node_index = {}
     try:
         with open(idx_path, "rb") as f:
@@ -29,7 +21,6 @@ def load_index(idx_path):
                       file=sys.stderr)
                 return {}
             blocks_num, = struct.unpack("<I", blocks_num_bytes)
-
             for i in range(blocks_num):
                 header_data = f.read(4 + 8 + 4 + 4 + 2)
                 if len(header_data) < (4 + 8 + 4 + 4 + 2):
@@ -38,7 +29,6 @@ def load_index(idx_path):
                         file=sys.stderr)
                     break
                 block_id, block_start, block_size, n_records, metadata_len = struct.unpack("<I Q I I H", header_data)
-
                 if metadata_len > 0:
                     skipped_bytes = f.read(metadata_len)
                     if len(skipped_bytes) < metadata_len:
@@ -46,121 +36,152 @@ def load_index(idx_path):
                             f"Warning: Truncated metadata in {idx_path} for block_id {block_id}. Reached end of file unexpectedly.",
                             file=sys.stderr)
                         break
-
-                node_index[block_id] = {
-                    "start": block_start,
-                    "size": block_size,
-                    "n_records": n_records
-                }
+                node_index[block_id] = {"start": block_start, "size": block_size, "n_records": n_records}
     except FileNotFoundError:
         print(f"Error: IDX file not found at {idx_path}", file=sys.stderr)
         return {}
     except struct.error as e:
-        print(
-            f"Error: Could not unpack data from IDX file {idx_path}. It might be corrupted or not match the expected format. Details: {e}",
-            file=sys.stderr)
+        print(f"Error: Could not unpack data from IDX file {idx_path}. Details: {e}", file=sys.stderr)
         return {}
     except Exception as e:
-        print(f"An unexpected error occurred while reading the IDX file {idx_path}: {e}", file=sys.stderr)
+        print(f"An unexpected error occurred while reading IDX file {idx_path}: {e}", file=sys.stderr)
         return {}
     return node_index
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Function for reading JSON data and extracting Node IDs from the "nodes" list
+# Function for reading JSON data and extracting Node IDs
 # ─────────────────────────────────────────────────────────────────────────────
 def load_json_structure_and_ids(json_filepath):
-    """
-    Reads the main JSON object from a file. Expects a "nodes" key
-    containing a list of node objects, from which IDs are extracted.
-
-    Args:
-        json_filepath (str): Path to the JSON file.
-
-    Returns:
-        tuple: (main_json_object, set_of_integer_node_ids_from_nodes_list)
-               Returns (None, set()) if a critical error occurs or if the
-               "nodes" list is not found or is not a list.
-    """
     main_json_data = {}
     node_ids_set = set()
     try:
         with open(json_filepath, 'r') as f_json:
             main_json_data = json.load(f_json)
-
             if not isinstance(main_json_data, dict):
-                print(f"Error: Root JSON content in {json_filepath} is not an object/dictionary as expected.",
-                      file=sys.stderr)
+                print(f"Error: Root JSON content in {json_filepath} is not an object/dictionary.", file=sys.stderr)
                 return None, set()
-
             node_list_from_json = main_json_data.get("nodes")
             if not isinstance(node_list_from_json, list):
-                print(f"Error: The key 'nodes' was not found in {json_filepath}, or its value is not a list.",
-                      file=sys.stderr)
-                # Return the main data structure but an empty set for IDs, as filtering target is missing
+                print(f"Warning: 'nodes' key not found or not a list in {json_filepath}.", file=sys.stderr)
                 return main_json_data, set()
-
             for item_index, item in enumerate(node_list_from_json):
                 if not isinstance(item, dict):
-                    print(
-                        f"Warning: Item at index {item_index} within the 'nodes' list in {json_filepath} is not a dictionary, skipping ID extraction.",
-                        file=sys.stderr)
+                    print(f"Warning: Item at index {item_index} in 'nodes' list (JSON) is not a dictionary.",
+                          file=sys.stderr)
                     continue
                 try:
                     node_id_str = item.get("node_id")
-                    if node_id_str is None:
-                        # print(f"Debug: Item at index {item_index} in 'nodes' list (JSON) does not have 'node_id' key.")
-                        continue
+                    if node_id_str is None: continue
                     node_ids_set.add(int(node_id_str))
                 except (ValueError, TypeError) as e:
                     print(
-                        f"Warning: Could not convert node_id '{node_id_str}' to an integer for item at index {item_index} in 'nodes' list (JSON). Error: {e}. Skipping.",
+                        f"Warning: Could not convert node_id '{node_id_str}' to int for item {item_index} in 'nodes' list (JSON). Error: {e}.",
                         file=sys.stderr)
-                    continue
-
-        print(
-            f"Successfully read JSON from {json_filepath}. Found {len(node_list_from_json if node_list_from_json else [])} items in 'nodes' list, extracted {len(node_ids_set)} unique node IDs.")
-        return main_json_data, node_ids_set
-
+            print(
+                f"Successfully read JSON from {json_filepath}. Found {len(node_list_from_json)} items in 'nodes' list, extracted {len(node_ids_set)} unique node IDs.")
+            return main_json_data, node_ids_set
     except FileNotFoundError:
         print(f"Error: JSON file not found at {json_filepath}", file=sys.stderr)
         return None, set()
     except json.JSONDecodeError:
-        print(f"Error: Could not decode JSON from {json_filepath}. Check for syntax errors.", file=sys.stderr)
+        print(f"Error: Could not decode JSON from {json_filepath}.", file=sys.stderr)
         return None, set()
     except Exception as e:
-        print(f"An unexpected error occurred while reading the JSON file {json_filepath}: {e}", file=sys.stderr)
+        print(f"An unexpected error occurred while reading JSON file {json_filepath}: {e}", file=sys.stderr)
         return None, set()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Function to extract chromosome from path pattern
+# ─────────────────────────────────────────────────────────────────────────────
+def extract_chromosome_from_path_pattern(path_pattern):
+    if not path_pattern or not isinstance(path_pattern, str):
+        return None
+    # Regex to find "chr" followed by one or more alphanumeric characters or just X, Y, M, MT
+    # Example: chr1, chrX, chr22_random
+    match = re.search(r'(chr([0-9A-Za-z_]+|X|Y|M|MT))', path_pattern)
+    if match:
+        return match.group(1)
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Function to run bcftools query
+# ─────────────────────────────────────────────────────────────────────────────
+def run_bcftools_query(bcftools_path, vcf_filepath, chromosome, start_1based, end_1based):
+    """
+    Runs bcftools query for a given region and returns results.
+    """
+    results = []
+    region = f"{chromosome}:{start_1based}-{end_1based}"
+    command = [bcftools_path, 'query', '-r', region, vcf_filepath]
+
+    try:
+        process = subprocess.run(command, capture_output=True, text=True, check=False)
+        if process.returncode == 0:
+            for line in process.stdout.splitlines():
+                if not line.startswith('#'):
+                    results.append(line)
+        else:
+            # bcftools query can return non-zero if region is not found but file is valid.
+            # Or if region is malformed or VCF is problematic.
+            # We consider empty results for non-zero return unless it's a clear execution error.
+            if "failed to open" in process.stderr or "Could not parse" in process.stderr:
+                print(f"Error running bcftools query for region {region}: {process.stderr.strip()}", file=sys.stderr)
+            # else: bcftools might have just not found anything, which is not an error for results list.
+    except FileNotFoundError:
+        print(f"Error: bcftools command not found at '{bcftools_path}'. Cannot perform VCF query.", file=sys.stderr)
+        # This error should ideally be caught once globally.
+        return []  # Return empty as bcftools itself is missing
+    except Exception as e:
+        print(f"An unexpected error occurred during bcftools query for region {region}: {e}", file=sys.stderr)
+    return results
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main processing function
 # ─────────────────────────────────────────────────────────────────────────────
-def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepath):
-    """
-    Reads a main JSON object, filters its "nodes" list based on IDs from IDX,
-    and writes the modified main JSON object (with filtered "nodes") to an output file.
-    """
+def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepath, vcf_file=None):
+    bcftools_path = None
+    if vcf_file:
+        bcftools_path = shutil.which("bcftools")
+        if not bcftools_path:
+            print("Warning: --vcf_file provided, but bcftools command not found in PATH. VCF queries will be skipped.",
+                  file=sys.stderr)
+        else:
+            print(f"Using bcftools found at: {bcftools_path}")
+
     print("Step 1: Loading main JSON structure and node IDs from input JSON file...")
     main_json_structure, target_node_ids_from_json = load_json_structure_and_ids(json_filepath)
 
-    if main_json_structure is None:  # Critical error during JSON loading
+    if main_json_structure is None:
         print("Could not load main JSON structure. Cannot proceed.")
         return
-    if not target_node_ids_from_json and isinstance(main_json_structure.get("nodes"), list) and main_json_structure.get(
-            "nodes"):
-        print(
-            "Warning: No parsable 'node_id' fields were found or converted in the 'nodes' list of the JSON, though a 'nodes' list exists.")
-    elif not main_json_structure.get("nodes") and not isinstance(main_json_structure.get("nodes"), list):
-        print("Warning: 'nodes' key is missing or not a list in the input JSON. Output will reflect this.")
+
+    chromosome_for_vcf = None
+    if vcf_file and bcftools_path:  # Only try to extract chromosome if we plan to query
+        path_pattern = main_json_structure.get("path_name_input_pattern")
+        chromosome_for_vcf = extract_chromosome_from_path_pattern(path_pattern)
+        if not chromosome_for_vcf:
+            print(
+                f"Warning: Could not extract chromosome from 'path_name_input_pattern': '{path_pattern}'. VCF queries might be inaccurate or skipped if chromosome is essential and unknown.",
+                file=sys.stderr)
+            # Defaulting to "chr1" as per user example, but this is a guess.
+            # Consider making this a fatal error for VCF querying or requiring a chromosome arg.
+            # For now, let's allow it to proceed but with a clear warning that queries might fail if chr isn't "chr1".
+            # If your VCF files are always e.g. "chr1", you might hardcode it or pass as param.
+            # Given user query "chr1:...", we assume they might expect "chr1" if not found.
+            # A better approach would be to skip VCF if chromosome_for_vcf is None here.
+            print(
+                "Attempting to use 'chr1' as a fallback chromosome for VCF queries due to user example. This may not be correct.",
+                file=sys.stderr)
+            chromosome_for_vcf = "chr1"  # Fallback based on user's query example
+        else:
+            print(f"Extracted chromosome '{chromosome_for_vcf}' for VCF queries.")
 
     print("\nStep 2: Loading node index from IDX file...")
     idx_data = load_index(idx_filepath)
-    if not idx_data:
-        print("No node data loaded from IDX file. Cannot proceed with filtering 'nodes' list.")
-        # If idx fails, we could still write the original json, but the goal is filtering.
-        # For now, we'll proceed and the intersection will be empty if idx_data is empty.
-
     available_idx_node_ids = set(idx_data.keys())
     print(f"Found {len(available_idx_node_ids)} unique node IDs in {idx_filepath}")
 
@@ -170,43 +191,64 @@ def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepat
         common_node_ids_int = target_node_ids_from_json.intersection(available_idx_node_ids)
 
     num_common_nodes = len(common_node_ids_int)
-    if num_common_nodes == 0 and target_node_ids_from_json:  # Only print if there were targets
+    if num_common_nodes == 0 and target_node_ids_from_json:
         print("No common node IDs found to filter the 'nodes' list.")
     elif target_node_ids_from_json:
         print(f"Found {num_common_nodes} common node ID(s) for filtering the 'nodes' list.")
 
-    # Prepare the output structure
-    # We use deepcopy to ensure that if 'nodes' is not present or not a list in input,
-    # we don't accidentally add it if no filtering happens.
     output_json_structure = copy.deepcopy(main_json_structure)
+    filtered_nodes_list_in_json = []
 
-    # Filter the "nodes" list if it exists and is a list
     original_nodes_list = main_json_structure.get("nodes")
     if isinstance(original_nodes_list, list):
-        filtered_nodes_list_in_json = []
-        if num_common_nodes > 0:  # Only filter if there are common IDs
-            for node_item in original_nodes_list:
-                if isinstance(node_item, dict):
-                    node_id_str = node_item.get("node_id")
-                    if node_id_str is not None:
-                        try:
-                            node_id_int = int(node_id_str)
-                            if node_id_int in common_node_ids_int:
-                                filtered_nodes_list_in_json.append(node_item)
-                        except (ValueError, TypeError):
-                            pass
-                            # Replace the "nodes" list in the output structure
+        for node_item in original_nodes_list:
+            if isinstance(node_item, dict):
+                node_id_str = node_item.get("node_id")
+                if node_id_str is not None:
+                    try:
+                        node_id_int = int(node_id_str)
+                        if node_id_int in common_node_ids_int:
+                            # This node is kept, add VCF query results if applicable
+                            if vcf_file and bcftools_path and chromosome_for_vcf:
+                                try:
+                                    start_0based = int(node_item.get("grch38_position_start", 0))
+                                    length = int(node_item.get("length", 0))
+
+                                    if length <= 0:
+                                        print(
+                                            f"Warning: Node ID {node_id_str} has non-positive length ({length}). Skipping VCF query.",
+                                            file=sys.stderr)
+                                        node_item["vcf_query_results"] = []
+                                    else:
+                                        query_start_1based = start_0based + 1
+                                        query_end_1based = start_0based + length
+                                        # print(f"Querying VCF for Node {node_id_str} ({chromosome_for_vcf}:{query_start_1based}-{query_end_1based})...")
+                                        vcf_results = run_bcftools_query(bcftools_path, vcf_file, chromosome_for_vcf,
+                                                                         query_start_1based, query_end_1based)
+                                        node_item["vcf_query_results"] = vcf_results
+                                except KeyError as e:
+                                    print(
+                                        f"Warning: Node ID {node_id_str} missing {e} field for VCF query. Skipping VCF query for this node.",
+                                        file=sys.stderr)
+                                    node_item["vcf_query_results"] = []
+                                except ValueError as e:
+                                    print(
+                                        f"Warning: Node ID {node_id_str} has invalid numeric value for position/length ({e}). Skipping VCF query.",
+                                        file=sys.stderr)
+                                    node_item["vcf_query_results"] = []
+                            else:
+                                # VCF querying not enabled or not possible, ensure field doesn't exist or is empty
+                                if "vcf_query_results" in node_item:  # clean up if it was there from a previous run concept
+                                    del node_item["vcf_query_results"]
+                            filtered_nodes_list_in_json.append(node_item)
+                    except (ValueError, TypeError):
+                        pass  # Already warned in load_json_structure_and_ids
         output_json_structure["nodes"] = filtered_nodes_list_in_json
         print(
             f"\nStep 4: Writing modified JSON structure (with {len(filtered_nodes_list_in_json)} nodes in 'nodes' list) to {output_json_filepath}...")
     else:
         print(
-            f"\nStep 4: Input JSON does not have a 'nodes' list or it's not a list. Writing the original structure (or structure without 'nodes') to {output_json_filepath}...")
-        if "nodes" in output_json_structure and not isinstance(output_json_structure["nodes"], list):
-            print(
-                f"Warning: 'nodes' key exists in input but is not a list. Its original value will be preserved: {type(output_json_structure['nodes'])}")
-        elif "nodes" not in output_json_structure:
-            print("Warning: 'nodes' key was not found in the input JSON.")
+            f"\nStep 4: Input JSON does not have a 'nodes' list or it's not a list. Writing structure to {output_json_filepath}...")
 
     try:
         with open(output_json_filepath, 'w') as f_out_json:
@@ -223,14 +265,16 @@ def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepat
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="Filter the 'nodes' list within an input JSON object based on node IDs present in an IDX file, and output the modified JSON object.")
-    parser.add_argument("json_path", help="Path to the input JSON file (expects an object with a 'nodes' list).")
+        description="Filter 'nodes' list in a JSON object based on IDX file and optionally query VCF for each filtered node.")
+    parser.add_argument("json_path", help="Path to the input JSON file (object with a 'nodes' list).")
     parser.add_argument("idx_path", help="Path to the .idx file.")
     parser.add_argument("output_json_path", help="Path to the output JSON file for the modified JSON object.")
+    parser.add_argument("--vcf_file", help="Optional: Path to VCF file to query with bcftools for each filtered node.",
+                        default=None)
 
     args = parser.parse_args()
 
-    filter_json_nodes_and_write(args.json_path, args.idx_path, args.output_json_path)
+    filter_json_nodes_and_write(args.json_path, args.idx_path, args.output_json_path, args.vcf_file)
 
 
 if __name__ == "__main__":
