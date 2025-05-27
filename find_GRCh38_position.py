@@ -36,48 +36,56 @@ def parse_p_line_path(p_segments_str):
     return oriented_segments
 
 
-def find_path_line_with_grep_direct(gfa_file_path, user_key_input):
+def find_path_line_with_grep_direct(gfa_file_path, user_key_input_raw):
     """
-    Uses grep -P to find a line based on a user-provided key starting with 'W\t' or 'P\t'.
+    Uses grep -P to find a line based on a user-provided key.
+    The key can optionally start with '^', which will be stripped.
+    It must then start with 'W\t' or 'P\t'.
     Returns (line_content, "W" or "P", identifier_for_json_output)
-    identifier_for_json_output is a tuple for W-lines (Sample, Hap, SeqName) or string for P-lines (PathName).
     """
+    processed_key = user_key_input_raw
+    if user_key_input_raw.startswith("^"):
+        processed_key = user_key_input_raw[1:]
+        logging.debug(
+            f"User input '{user_key_input_raw}' started with '^'; stripped to '{processed_key}' for internal processing.")
+    else:
+        logging.debug(f"User input '{user_key_input_raw}' processed as is (no leading '^' found).")
+
     path_type = None
-    grep_pattern_core = ""  # The part of the pattern constructed from user input after W/P prefix
+    grep_pattern_core = ""
     identifier_for_json_output = None
 
-    if user_key_input.startswith("W\t"):
-        parts = user_key_input.split('\t', 3)  # Expects W<tab>Sample<tab>Haplotype<tab>SeqName
-        if len(parts) == 4:
+    if processed_key.startswith("W\t"):
+        parts = processed_key.split('\t', 3)
+        if len(parts) == 4:  # W, Sample, Haplotype, SeqName
             path_type = "W"
             sample_id, haplotype_id, seq_name = parts[1], parts[2], parts[3]
-            # Escape each part of the identifier for regex safety
             grep_pattern_core = f"W\t{re.escape(sample_id)}\t{re.escape(haplotype_id)}\t{re.escape(seq_name)}"
             identifier_for_json_output = (sample_id, haplotype_id, seq_name)
             logging.info(
-                f"Interpreted input as W-line key: Sample='{sample_id}', Haplotype='{haplotype_id}', SeqName='{seq_name}'")
+                f"Interpreted processed key '{processed_key}' as W-line key: Sample='{sample_id}', Haplotype='{haplotype_id}', SeqName='{seq_name}'")
         else:
             logging.error(
-                f"W-line key '{user_key_input}' not in expected format 'W\\tSampleID\\tHaplotypeID\\tSeqName'. At least 4 tab-separated fields required including 'W'.")
+                f"Processed W-line key '{processed_key}' (from input '{user_key_input_raw}') not in expected format 'W\\tSampleID\\tHaplotypeID\\tSeqName'.")
             return None, None, None
-    elif user_key_input.startswith("P\t"):
-        parts = user_key_input.split('\t', 1)  # Expects P<tab>PathName
-        if len(parts) == 2:
+    elif processed_key.startswith("P\t"):
+        parts = processed_key.split('\t', 1)
+        if len(parts) == 2:  # P, PathName
             path_type = "P"
             path_name = parts[1]
             grep_pattern_core = f"P\t{re.escape(path_name)}"
             identifier_for_json_output = path_name
-            logging.info(f"Interpreted input as P-line key: PathName='{path_name}'")
+            logging.info(f"Interpreted processed key '{processed_key}' as P-line key: PathName='{path_name}'")
         else:
             logging.error(
-                f"P-line key '{user_key_input}' not in expected format 'P\\tPathName'. At least 2 tab-separated fields required including 'P'.")
+                f"Processed P-line key '{processed_key}' (from input '{user_key_input_raw}') not in expected format 'P\\tPathName'.")
             return None, None, None
     else:
         logging.error(
-            f"Invalid path_name input: '{user_key_input}'. Must start with 'W\\t' or 'P\\t' (using actual tabs).")
+            f"Invalid path_name input '{user_key_input_raw}'. After optional '^' stripping (resulting in '{processed_key}'), key must start with 'W\\t' or 'P\\t' (using actual tabs).")
         return None, None, None
 
-    # Final grep pattern: anchors to start of line, requires a tab after the key
+    # Final grep pattern always anchors to start of line, and requires a tab after the core key.
     pattern = f"^{grep_pattern_core}\t"
     cmd = ['grep', '-P', '-m', '1', pattern, gfa_file_path]
     logging.debug(f"Executing grep: {' '.join(cmd)}")
@@ -86,21 +94,21 @@ def find_path_line_with_grep_direct(gfa_file_path, user_key_input):
         result = subprocess.run(cmd, capture_output=True, text=True, check=False, encoding='utf-8')
         if result.returncode == 0 and result.stdout.strip():
             line_content = result.stdout.strip()
-            logging.info(f"{path_type}-line found via grep using key derived from '{user_key_input}'.")
+            logging.info(f"{path_type}-line found via grep using key derived from '{user_key_input_raw}'.")
             return line_content, path_type, identifier_for_json_output
-        elif result.returncode == 1:  # grep found nothing
+        elif result.returncode == 1:
             logging.info(
-                f"No {path_type}-line found via grep for key derived from '{user_key_input}' (pattern: '{pattern}').")
+                f"No {path_type}-line found via grep for key derived from '{user_key_input_raw}' (pattern: '{pattern}').")
             return None, None, None
-        else:  # grep command itself had an error
+        else:
             logging.warning(
-                f"grep for {path_type}-line with key derived from '{user_key_input}' failed (RC={result.returncode}): {result.stderr.strip()}")
+                f"grep for {path_type}-line with key derived from '{user_key_input_raw}' failed (RC={result.returncode}): {result.stderr.strip()}")
             return None, None, None
     except FileNotFoundError:
         logging.error("grep command not found. Please ensure grep is installed and in PATH.")
         return None, None, None
     except Exception as e:
-        logging.error(f"Exception running grep for key derived from '{user_key_input}': {e}")
+        logging.error(f"Exception running grep for key derived from '{user_key_input_raw}': {e}")
         return None, None, None
 
 
@@ -112,34 +120,31 @@ def extract_path_info_from_gfa(gfa_file_path, target_path_key_input):
 
     if not found_line_content:
         err_msg = f"Path for key '{target_path_key_input}' not found using grep."
-        # Specific error/reason should have been logged by find_path_line_with_grep_direct
         return json.dumps({"error": err_msg, "status": "error_path_not_found_grep"})
 
     # Step 2: Parse the found path line
     final_path_segments_oriented = []
-    path_identifier_gfa = ""  # For JSON output, e.g., "W:Sample/Hap/Seq" or "P:Name"
+    path_identifier_gfa = ""
 
     line_parts = found_line_content.split('\t')
 
     if path_source_type == "W":
-        if len(line_parts) < 7:  # W(0) Samp(1) Hap(2) SeqN(3) Start(4) End(5) Path(6)
+        if len(line_parts) < 7:
             err_msg = f"Malformed W-line structure returned by grep: '{found_line_content}'"
             logging.error(err_msg)
             return json.dumps({"error": err_msg, "status": "error_malformed_grep_w_line"})
         w_path_str = line_parts[6]
         final_path_segments_oriented = parse_w_line_path(w_path_str)
-        # matched_identifier_parts is (Sample, Haplotype, SeqName)
         path_identifier_gfa = f"W:{matched_identifier_parts[0]}/{matched_identifier_parts[1]}/{matched_identifier_parts[2]}"
         logging.info(
             f"Parsed W-line '{path_identifier_gfa}'; {len(final_path_segments_oriented)} segment refs from path string.")
     elif path_source_type == "P":
-        if len(line_parts) < 3:  # P(0) PathName(1) Segments(2)
+        if len(line_parts) < 3:
             err_msg = f"Malformed P-line structure returned by grep: '{found_line_content}'"
             logging.error(err_msg)
             return json.dumps({"error": err_msg, "status": "error_malformed_grep_p_line"})
         p_segments_str = line_parts[2]
         final_path_segments_oriented = parse_p_line_path(p_segments_str)
-        # matched_identifier_parts is the PathName string
         path_identifier_gfa = f"P:{matched_identifier_parts}"
         logging.info(
             f"Parsed P-line '{path_identifier_gfa}'; {len(final_path_segments_oriented)} segment refs from segment string.")
@@ -210,10 +215,11 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         "path_name",
-        help="Target path key. Must start with 'W\\t' or 'P\\t' (using actual tabs from your shell).\n"
+        help="Target path key. Should effectively start with 'W\\t' or 'P\\t' (using actual tabs from your shell).\n"
+             "A single leading '^' character will be automatically stripped by the script if present.\n"
              "Examples:\n"
-             "- For P-line: $'P\\tpathName1' (Bash syntax for tab)\n"
-             "- For W-line: $'W\\tSampleID\\tHaplotypeID\\tSeqName'\n"
+             "- For P-line: $'P\\tpathName1' or $'P\\tpathName1' (Bash syntax for tab)\n"
+             "- For W-line: $'W\\tSampleID\\tHaplotypeID\\tSeqName' or $'^W\\tSampleID\\tHaplotypeID\\tSeqName'\n"
              "The parts of the key (like PathName, SampleID, etc.) will be regex-escaped by the script."
     )
     parser.add_argument(
@@ -241,7 +247,8 @@ if __name__ == '__main__':
         logging.critical(f"Critical: grep command not found or not functional. Error: {e}")
         sys.exit(1)
 
-    logging.info(f"Starting GFA path extraction. File: '{args.gfa_file}', Target Path Key: '{args.path_name}'")
+    logging.info(
+        f"Starting GFA path extraction. File: '{args.gfa_file}', Target Path Key (raw input): '{args.path_name}'")
     json_result_str = extract_path_info_from_gfa(args.gfa_file, args.path_name)
 
     try:
