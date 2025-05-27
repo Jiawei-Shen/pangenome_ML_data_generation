@@ -1,291 +1,182 @@
-import re
-import argparse
 import json
-import datetime # For timestamps
 
-def parse_gfa_to_grch38_positions(gfa_filepath, target_path_prefix="GRCh38", target_chromosome_arg=None):
+
+def extract_path_info_from_gfa(gfa_file_path, target_path_name_input):
     """
-    Parses a GFA file to map node IDs from specified GRCh38 paths
-    to their genomic coordinates, strand, and length.
-    Assumes paths representing GRCh38 chromosomes start at position 1.
-    Can filter for a specific chromosome.
+    Extracts nodes from a specified path in a GFA file, calculates their
+    cumulative positions, and outputs the information in JSON format.
 
     Args:
-        gfa_filepath (str): Path to the GFA file.
-        target_path_prefix (str): Prefix to identify relevant GRCh38 paths.
-        target_chromosome_arg (str, optional): Specific chromosome to process (e.g., "1", "chr1", "X").
-                                              If None, all relevant GRCh38 paths are processed.
+        gfa_file_path (str): The path to the GFA file.
+        target_path_name_input (str): The name of the path to extract
+                                     (e.g., "GRCh38\t0\tchr1" or "chr1").
 
     Returns:
-        dict: A dictionary where keys are node IDs and values are dicts
-              containing {'strand', 'length', 'grch38_position'}.
-        dict: path_node_details for more granular path-specific info.
+        str: A JSON string containing the node information for the target path,
+             or an error message if the path is not found or an issue occurs.
     """
-    print("\n[LOG] Initializing GFA parsing function...")
-    node_lengths = {}
-    path_segments_temp = {}
+    segments = {}  # To store segment sequences and lengths {segment_id: {'seq': 'ACGT', 'len': 4}}
+    path_segments_oriented = []
+    found_path = False
 
-    # --- Pass 1: Read S lines for lengths and P/W lines for path segments ---
-    print("[LOG] Starting Pass 1: Reading GFA segments and path definitions...")
-    found_segments_count = 0
-    found_potential_paths_count = 0
+    # Determine the actual path name to search for in the GFA P records
+    # This logic tries to infer the actual GFA PathName from the potentially composite user input.
+    # If target_path_name_input contains tabs, it's likely a composite identifier.
+    # We might try matching parts of it, or the user should provide the exact GFA PathName.
+
+    # For this version, we will first try to match target_path_name_input directly.
+    # If that fails and it contains tabs, we'll try common interpretations.
+
+    potential_path_names_to_try = [target_path_name_input]
+    if '\t' in target_path_name_input:
+        parts = target_path_name_input.split('\t')
+        if len(parts) > 0 and parts[-1] not in potential_path_names_to_try:  # e.g., "chr1"
+            potential_path_names_to_try.append(parts[-1])
+        if len(parts) > 0 and parts[0] not in potential_path_names_to_try:  # e.g., "GRCh38"
+            potential_path_names_to_try.append(parts[0])
+        # Consider a version with underscores if tabs were replaced
+        underscored_name = target_path_name_input.replace('\t', '_')
+        if underscored_name not in potential_path_names_to_try:
+            potential_path_names_to_try.append(underscored_name)
+
     try:
-        with open(gfa_filepath, 'r') as f:
-            for line_num, line in enumerate(f, 1):
+        with open(gfa_file_path, 'r') as f_gfa:
+            for line in f_gfa:
                 parts = line.strip().split('\t')
-                if not parts: continue
                 record_type = parts[0]
 
                 if record_type == 'S':
-                    found_segments_count +=1
-                    if len(parts) < 3:
-                        # This warning is already good
-                        # print(f"Warning: Malformed S line at line {line_num}: {line.strip()}")
-                        continue
-                    node_id = parts[1]
+                    segment_id = parts[1]
                     sequence = parts[2]
-                    length = len(sequence)
-                    for tag in parts[3:]:
-                        if tag.startswith("LN:i:"):
-                            try: length = int(tag.split(":")[2])
-                            except (ValueError, IndexError):
-                                print(f"Warning: Could not parse LN tag for segment {node_id} at line {line_num}: {tag}")
-                            break
-                    node_lengths[node_id] = length
+                    # Optional fields like LN:i:<length> can also be parsed if present
+                    # For now, relying on len(sequence)
+                    segments[segment_id] = {'seq': sequence, 'len': len(sequence)}
+                elif record_type == 'P':
+                    path_id_from_file = parts[1]  # GFA PathName is parts[1]
 
-                elif record_type == 'P' or record_type == 'W':
-                    if len(parts) < 3:
-                        # print(f"Warning: Malformed {record_type} line at line {line_num}: {line.strip()}")
-                        continue
-                    path_name = parts[1]
+                    if path_id_from_file in potential_path_names_to_try:
+                        # Store the successfully matched name to use in messages
+                        matched_path_name_in_gfa = path_id_from_file
+                        found_path = True
+                        segment_names_with_orientations = parts[2].split(',')
+                        for seg_orient in segment_names_with_orientations:
+                            path_segments_oriented.append(
+                                {'id': seg_orient[:-1], 'strand': seg_orient[-1]}
+                            )
+                        break  # Found the path, stop reading P lines for this path
 
-                    if path_name.startswith(target_path_prefix) and "chr" in path_name.lower():
-                        found_potential_paths_count +=1
-                        segment_ids_orientations_str = parts[2]
-                        if record_type == 'P' or (record_type == 'W' and ',' in segment_ids_orientations_str):
-                            segment_definitions = segment_ids_orientations_str.split(',')
-                            parsed_segments = []
-                            for seg_orient in segment_definitions:
-                                if not seg_orient: continue
-                                node = seg_orient[:-1]
-                                orientation = seg_orient[-1]
-                                if orientation not in ['+', '-']:
-                                    node = seg_orient
-                                    orientation = '?'
-                                parsed_segments.append({'id': node, 'orientation': orientation})
-                            path_segments_temp[path_name] = parsed_segments
-                        elif record_type == 'W':
-                             print(f"Info: Single-step W line {path_name} at line {line_num} not processed by default path logic.")
-        print(f"[LOG] Pass 1 complete. Found {len(node_lengths)} unique segments with lengths.")
-        print(f"[LOG] Identified {len(path_segments_temp)} potential reference paths matching prefix and 'chr' pattern.")
+            # If path was found, ensure all its segments were loaded (if P appeared before all S)
+            # This simple parser assumes S records are generally before or sufficiently populated
+            # when P record is found. A multi-pass parser could be more robust.
 
     except FileNotFoundError:
-        print(f"Error: GFA file not found at {gfa_filepath}")
-        return {}, {}
+        return json.dumps({"error": f"File not found: {gfa_file_path}"})
     except Exception as e:
-        print(f"An error occurred during GFA parsing (Pass 1): {e}")
-        return {}, {}
+        return json.dumps({"error": f"Error reading GFA file: {str(e)}"})
 
-    # --- Normalize target_chromosome_arg for comparison ---
-    normalized_target_chromosome_filter = None
-    if target_chromosome_arg:
-        temp_target = str(target_chromosome_arg).lower()
-        if not temp_target.startswith("chr"):
-            normalized_target_chromosome_filter = f"chr{temp_target}"
+    if not segments:
+        return json.dumps({"error": "No segments (S records) found in the GFA file."})
+
+    if not found_path:
+        # Constructing the error message carefully to avoid problematic f-string expressions
+        error_message_main = f"Path matching '{target_path_name_input}' not found in the GFA file."
+        tried_names_str = ", ".join(
+            [f"'{name}'" for name in potential_path_names_to_try if name != target_path_name_input])
+        if tried_names_str:
+            error_message_detail = f" Also tried interpreting it as: {tried_names_str}."
+            full_error_message = error_message_main + error_message_detail
         else:
-            normalized_target_chromosome_filter = temp_target
-        # Log about active filter is now more prominent here
+            full_error_message = error_message_main
+        return json.dumps({"error": full_error_message})
 
-    # --- Pass 2: Calculate coordinates and build output data ---
-    print("[LOG] Starting Pass 2: Calculating GRCh38 positions and building output data...")
-    if normalized_target_chromosome_filter:
-        print(f"[LOG] Filtering for paths matching chromosome: '{normalized_target_chromosome_filter}'")
-    else:
-        print("[LOG] No specific chromosome filter applied; processing all matched reference paths.")
+    if not path_segments_oriented:
+        # Use matched_path_name_in_gfa if path was found but empty
+        return json.dumps({"error": f"Path '{matched_path_name_in_gfa}' was found but contains no segments."})
 
-    output_node_data = {}
-    path_node_details_output = {}
-    processed_paths_count = 0
+    output_nodes = []
+    current_cumulative_pos = 0
 
-    for path_name, segments in path_segments_temp.items():
-        chromosome_name_from_path = None
-        match_chr = re.search(r"chr([a-zA-Z0-9_.-]+)", path_name, re.IGNORECASE)
-        if match_chr:
-            chromosome_name_from_path = f"chr{match_chr.group(1).lower()}"
-        else:
-            match_direct_chr = re.search(r"(chr[a-zA-Z0-9_.-]+)", path_name, re.IGNORECASE)
-            if match_direct_chr:
-                chromosome_name_from_path = match_direct_chr.group(1).lower()
-            else:
-                match_num = re.search(r"([XYM]|(?:[0-9]+))([_.-][a-zA-Z0-9]+)?$", path_name)
-                if match_num:
-                    chromosome_name_from_path = f"chr{match_num.group(1).lower()}"
+    for seg_info in path_segments_oriented:
+        seg_id = seg_info['id']
+        strand = seg_info['strand']
 
-        if not chromosome_name_from_path:
-            # This warning is fine as is, if it occurs.
-            # print(f"Warning: Could not reliably extract chromosome name from path '{path_name}'. Skipping this path.")
-            continue
+        if seg_id not in segments:
+            return json.dumps(
+                {"error": f"Segment '{seg_id}' from path '{matched_path_name_in_gfa}' not found in S records."})
 
-        if normalized_target_chromosome_filter and chromosome_name_from_path != normalized_target_chromosome_filter:
-            continue # Skip if not the target chromosome
+        node_data = segments[seg_id]
+        node_len = node_data['len']
+        node_seq = node_data['seq']
 
-        processed_paths_count += 1
-        # Optional: Log each path being processed if verbose mode is desired later
-        # print(f"[LOG] Processing path: {path_name} (as {chromosome_name_from_path})")
+        output_nodes.append({
+            "node_id": seg_id,
+            "grch38_position_start": current_cumulative_pos,
+            "strand_in_path": strand,
+            "sequence": node_seq,
+            "length": node_len
+        })
+        current_cumulative_pos += node_len
 
+    return json.dumps(output_nodes, indent=4)
 
-        current_chromosome_position = 1
-        path_specific_node_list = []
-
-        for seg_info in segments:
-            node_id = seg_info['id']
-            orientation = seg_info['orientation']
-
-            if node_id not in node_lengths:
-                print(f"Warning: Node ID '{node_id}' (path '{path_name}') not in S lines. Skipping.")
-                continue
-            node_len = node_lengths[node_id]
-            if node_len == 0:
-                print(f"Info: Node ID '{node_id}' (path '{path_name}') has length 0. Skipping.")
-                continue
-
-            start_pos = current_chromosome_position
-            end_pos = current_chromosome_position + node_len - 1
-            grch38_pos_str = f"{chromosome_name_from_path}:{start_pos}-{end_pos}"
-
-            output_node_data[node_id] = {
-                "strand": orientation,
-                "length": node_len,
-                "grch38_position": grch38_pos_str
-            }
-            path_specific_node_list.append({
-                'id': node_id, 'len': node_len, 'strand': orientation,
-                'chr': chromosome_name_from_path, 'start': start_pos, 'end': end_pos
-            })
-            current_chromosome_position = end_pos + 1
-
-        if path_specific_node_list:
-            path_node_details_output[path_name] = path_specific_node_list
-
-    print(f"[LOG] Pass 2 complete. Processed {processed_paths_count} paths matching criteria.")
-    print(f"[LOG] Generated mapping data for {len(output_node_data)} unique nodes.")
-    print("[LOG] GFA parsing function finished.")
-    return output_node_data, path_node_details_output
 
 if __name__ == '__main__':
-    start_time = datetime.datetime.now()
-    print("===================================================")
-    print(" GFA to GRCh38 Position Mapping Script ")
-    print(f" Start Timestamp: {start_time.strftime('%Y-%m-%d %H:%M:%S')} ")
-    print("===================================================")
-
-    parser = argparse.ArgumentParser(
-        description="Parse a GFA file to map node IDs from GRCh38 paths to genomic coordinates, "
-                    "strand, and length. Saves output to JSON. "
-                    "Assumes GRCh38 paths start at position 1 of the chromosome. Can filter by chromosome."
-    )
-    parser.add_argument("gfa_file", help="Path to the GFA input file.")
-    parser.add_argument(
-        "--prefix", default="GRCh38",
-        help="Prefix for GFA path names to identify as reference paths (e.g., 'GRCh38'). Default is 'GRCh38'."
-    )
-    parser.add_argument(
-        "--chromosome", "--chr", metavar="CHR", type=str, default=None,
-        help="Optional: Specific chromosome to process (e.g., '1', 'chr1', 'X'). Processes all if not set."
-    )
-    parser.add_argument(
-        "--output_json", "--out", metavar="FILE.json", type=str, default=None,
-        help="Optional: Path to save the output JSON file."
-    )
-    args = parser.parse_args()
-
-    gfa_file_to_process = args.gfa_file
-    generate_dummy = False
-
-    print("\n--- Input Parameters ---")
-    print(f"GFA File: {gfa_file_to_process}")
-    print(f"Path Prefix: '{args.prefix}'")
-    if args.chromosome:
-        # Normalize and print target chromosome here for clarity before parsing
-        temp_target_chr_arg = str(args.chromosome).lower()
-        if not temp_target_chr_arg.startswith("chr"):
-            normalized_display_chr = f"chr{temp_target_chr_arg}"
-        else:
-            normalized_display_chr = temp_target_chr_arg
-        print(f"Target Chromosome: '{args.chromosome}' (normalized to '{normalized_display_chr}' for filtering)")
-    else:
-        print("Target Chromosome: Not specified (will process all matching paths)")
-    if args.output_json:
-        print(f"Output JSON File: {args.output_json}")
-    else:
-        print("Output JSON File: Not specified (will print sample to console)")
-    print("------------------------")
-
-
-    try:
-        # Check file existence before creating dummy, if user provided a path
-        if not generate_dummy: # Avoid this check if we are about to create the dummy
-            with open(args.gfa_file, 'r') as f_check: pass
-    except Exception:
-        print(f"\nWarning: Problem accessing GFA file '{args.gfa_file}'.")
-        print("Generating a dummy 'example.gfa' for demonstration.\n")
-        dummy_gfa_content = """H\tVN:Z:1.0
-S\tseg1\tAAAA\tLN:i:4
-S\tseg2\tTTTTT\tLN:i:5
-S\tseg3\tGG\tLN:i:2
-S\tseg4\tCCCCCCCCCC\tLN:i:10
-S\tseg5\tNNN\tLN:i:3
-S\tseg6\tACGT\tLN:i:4
-S\tseg7\tGATTACA\tLN:i:7
-S\tseg8\tTTCC\tLN:i:4
-P\tGRCh38#0#chr1\tseg1+,seg2+,seg3-\t*
-P\tGRCh38.chrX\tseg4+,seg5-\t*
-P\tGRCh38_chr2_customName\tseg6+,seg7-\t*
-P\tGRCh38.1alt\tseg1+,seg8+\t*
-P\tMyAssembly_chr1\tseg1+,seg8-\t*
-P\tother_contig_path\tseg4+,seg1-\t*
+    dummy_gfa_content = """H\tVN:Z:1.0
+S\t1\tACGT\tLN:i:4
+S\t2\tTGA\tLN:i:3
+S\t3\tCCGGAA\tLN:i:6
+S\t4\tN\tLN:i:1
+S\tGRCh38_s1\tGATTACA
+S\tGRCh38_s2\tTCAT
+P\tGRCh38_path1\tGRCh38_s1+,GRCh38_s2-\t*
+P\tchr1\t1+,2-,3+\t45M,3M,6M
+P\tpathX\t1+,4-\t*
+P\tGRCh38_0_chr1\t1+,2-\t*
 """
-        gfa_file_to_process = "example.gfa" # Ensure this is updated if dummy is created
-        with open(gfa_file_to_process, "w") as f: f.write(dummy_gfa_content)
-        generate_dummy = True
-        print(f"Dummy GFA file '{gfa_file_to_process}' created for testing.\n")
+    file_path = "example.gfa"
+    with open(file_path, "w") as f:
+        f.write(dummy_gfa_content)
 
+    # Scenario 1: User provides the exact path name as in GFA P record
+    print("--- Scenario 1: Exact GFA Path Name 'chr1' ---")
+    json_output_scenario1 = extract_path_info_from_gfa(file_path, "chr1")
+    print("JSON Output:")
+    print(json_output_scenario1)
+    print("-" * 30)
 
-    node_data_for_json, _ = parse_gfa_to_grch38_positions(
-        gfa_file_to_process,
-        args.prefix,
-        args.chromosome
-    )
+    # Scenario 2: User provides a composite name "GRCh38\t0\tchr1"
+    # The script will try "GRCh38\t0\tchr1", then "chr1", then "GRCh38", then "GRCh38_0_chr1"
+    user_composite_path = "GRCh38\t0\tchr1"  # \t is a tab character
+    # This will match "chr1" from the dummy GFA, or "GRCh38_0_chr1" if present.
+    # In this dummy GFA, "chr1" and "GRCh38_0_chr1" both exist. "GRCh38_0_chr1" might be tried first if target_path_name_input is that.
+    # The order in potential_path_names_to_try matters.
 
-    print("\n--- Output Summary ---")
-    if node_data_for_json:
-        if args.output_json:
-            print(f"[LOG] Writing output to JSON file: {args.output_json}...")
-            try:
-                with open(args.output_json, 'w') as f_json:
-                    json.dump(node_data_for_json, f_json, indent=4)
-                print(f"[LOG] Output successfully saved to: {args.output_json}")
-            except IOError as e:
-                print(f"\nError: Could not write to JSON file {args.output_json}: {e}")
-        else:
-            print("[LOG] JSON output not requested. Displaying sample of results to console:")
-            count = 0
-            for node_id, data in sorted(node_data_for_json.items()):
-                print(f"Node {node_id}: {data}")
-                count += 1
-                if count >= 5 and len(node_data_for_json) > 10: # Print first 5 if many
-                    print(f"... and {len(node_data_for_json) - count} more nodes.")
-                    break
-            if not node_data_for_json: # Should be caught by outer if, but good for consistency
-                 print("No node data was generated based on criteria.")
-    else:
-        print("No node data was generated based on the specified criteria.")
+    print(f"--- Scenario 2: User composite path '{user_composite_path}' ---")  # Prints with tab
+    # For a literal display showing \t:
+    # print(f"--- Scenario 2: User composite path 'GRCh38\\t0\\tchr1' ---")
+    json_output_scenario2 = extract_path_info_from_gfa(file_path, user_composite_path)
+    print("JSON Output:")
+    print(json_output_scenario2)  # Should find 'chr1' or 'GRCh38_0_chr1' based on current logic
+    print("-" * 30)
 
-    if generate_dummy:
-        print(f"\nNote: A dummy GFA file '{gfa_file_to_process}' was used for this demonstration.")
+    # Scenario 3: Path name with underscores that matches GFA
+    print("--- Scenario 3: Path name 'GRCh38_0_chr1' ---")
+    json_output_scenario3 = extract_path_info_from_gfa(file_path, "GRCh38_0_chr1")
+    print("JSON Output:")
+    print(json_output_scenario3)
+    print("-" * 30)
 
-    end_time = datetime.datetime.now()
-    print("---------------------------------------------------")
-    print(f" Script Finished. Total execution time: {end_time - start_time} ")
-    print(f" End Timestamp: {end_time.strftime('%Y-%m-%d %H:%M:%S')} ")
-    print("===================================================")
+    # Scenario 4: Path not found
+    print("--- Scenario 4: Path not found 'nonexistent_path' ---")
+    json_output_scenario4 = extract_path_info_from_gfa(file_path, "nonexistent_path")
+    print("JSON Output:")
+    print(json_output_scenario4)
+    print("-" * 30)
+
+    # Scenario 5: Path not found with composite name
+    user_nonexistent_composite_path = "MyGenome\tX\tgene1"
+    print(f"--- Scenario 5: Composite Path not found '{user_nonexistent_composite_path}' ---")
+    json_output_scenario5 = extract_path_info_from_gfa(file_path, user_nonexistent_composite_path)
+    print("JSON Output:")
+    print(json_output_scenario5)
+    print("-" * 30)
