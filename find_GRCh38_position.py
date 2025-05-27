@@ -55,8 +55,18 @@ def find_path_line_with_grep_direct(gfa_file_path, user_key_input_raw):
     grep_pattern_core = ""
     identifier_for_json_output = None
 
-    if processed_key.startswith("W\t"):
+    # Enhanced debugging for string checks
+    is_w_type = processed_key.startswith("W\t")
+    is_p_type = processed_key.startswith("P\t")
+    logging.debug(
+        f"For processed_key='{processed_key}' (length {len(processed_key)}): is_w_type={is_w_type}, is_p_type={is_p_type}")
+    # For further debugging, show byte representation if tabs are tricky
+    # logging.debug(f"Processed key bytes: {processed_key.encode('utf-8')}")
+
+    if is_w_type:
         parts = processed_key.split('\t', 3)
+        logging.debug(
+            f"W-type detected for '{processed_key}'. Parts after split('\\t', 3): {parts} (length: {len(parts)})")
         if len(parts) == 4:  # W, Sample, Haplotype, SeqName
             path_type = "W"
             sample_id, haplotype_id, seq_name = parts[1], parts[2], parts[3]
@@ -66,10 +76,12 @@ def find_path_line_with_grep_direct(gfa_file_path, user_key_input_raw):
                 f"Interpreted processed key '{processed_key}' as W-line key: Sample='{sample_id}', Haplotype='{haplotype_id}', SeqName='{seq_name}'")
         else:
             logging.error(
-                f"Processed W-line key '{processed_key}' (from input '{user_key_input_raw}') not in expected format 'W\\tSampleID\\tHaplotypeID\\tSeqName'.")
+                f"Processed W-line key '{processed_key}' (from input '{user_key_input_raw}') not in expected format 'W\\tSampleID\\tHaplotypeID\\tSeqName'. Expected 4 parts after splitting on tab (W, S, H, N), got {len(parts)} parts: {parts}.")
             return None, None, None
-    elif processed_key.startswith("P\t"):
+    elif is_p_type:
         parts = processed_key.split('\t', 1)
+        logging.debug(
+            f"P-type detected for '{processed_key}'. Parts after split('\\t', 1): {parts} (length: {len(parts)})")
         if len(parts) == 2:  # P, PathName
             path_type = "P"
             path_name = parts[1]
@@ -78,7 +90,7 @@ def find_path_line_with_grep_direct(gfa_file_path, user_key_input_raw):
             logging.info(f"Interpreted processed key '{processed_key}' as P-line key: PathName='{path_name}'")
         else:
             logging.error(
-                f"Processed P-line key '{processed_key}' (from input '{user_key_input_raw}') not in expected format 'P\\tPathName'.")
+                f"Processed P-line key '{processed_key}' (from input '{user_key_input_raw}') not in expected format 'P\\tPathName'. Expected 2 parts after splitting on tab (P, Name), got {len(parts)} parts: {parts}.")
             return None, None, None
     else:
         logging.error(
@@ -112,6 +124,8 @@ def find_path_line_with_grep_direct(gfa_file_path, user_key_input_raw):
         return None, None, None
 
 
+# extract_path_info_from_gfa and if __name__ == '__main__' remain the same as the previous full script.
+# ... (rest of the script from the previous full version) ...
 def extract_path_info_from_gfa(gfa_file_path, target_path_key_input):
     # Step 1: Find the specific W or P line using grep based on user's direct key
     found_line_content, path_source_type, matched_identifier_parts = find_path_line_with_grep_direct(
@@ -120,31 +134,34 @@ def extract_path_info_from_gfa(gfa_file_path, target_path_key_input):
 
     if not found_line_content:
         err_msg = f"Path for key '{target_path_key_input}' not found using grep."
+        # Specific error/reason should have been logged by find_path_line_with_grep_direct
         return json.dumps({"error": err_msg, "status": "error_path_not_found_grep"})
 
     # Step 2: Parse the found path line
     final_path_segments_oriented = []
-    path_identifier_gfa = ""
+    path_identifier_gfa = ""  # For JSON output, e.g., "W:Sample/Hap/Seq" or "P:Name"
 
     line_parts = found_line_content.split('\t')
 
     if path_source_type == "W":
-        if len(line_parts) < 7:
+        if len(line_parts) < 7:  # W(0) Samp(1) Hap(2) SeqN(3) Start(4) End(5) Path(6)
             err_msg = f"Malformed W-line structure returned by grep: '{found_line_content}'"
             logging.error(err_msg)
             return json.dumps({"error": err_msg, "status": "error_malformed_grep_w_line"})
         w_path_str = line_parts[6]
         final_path_segments_oriented = parse_w_line_path(w_path_str)
+        # matched_identifier_parts is (Sample, Haplotype, SeqName)
         path_identifier_gfa = f"W:{matched_identifier_parts[0]}/{matched_identifier_parts[1]}/{matched_identifier_parts[2]}"
         logging.info(
             f"Parsed W-line '{path_identifier_gfa}'; {len(final_path_segments_oriented)} segment refs from path string.")
     elif path_source_type == "P":
-        if len(line_parts) < 3:
+        if len(line_parts) < 3:  # P(0) PathName(1) Segments(2)
             err_msg = f"Malformed P-line structure returned by grep: '{found_line_content}'"
             logging.error(err_msg)
             return json.dumps({"error": err_msg, "status": "error_malformed_grep_p_line"})
         p_segments_str = line_parts[2]
         final_path_segments_oriented = parse_p_line_path(p_segments_str)
+        # matched_identifier_parts is the PathName string
         path_identifier_gfa = f"P:{matched_identifier_parts}"
         logging.info(
             f"Parsed P-line '{path_identifier_gfa}'; {len(final_path_segments_oriented)} segment refs from segment string.")
@@ -218,7 +235,7 @@ if __name__ == '__main__':
         help="Target path key. Should effectively start with 'W\\t' or 'P\\t' (using actual tabs from your shell).\n"
              "A single leading '^' character will be automatically stripped by the script if present.\n"
              "Examples:\n"
-             "- For P-line: $'P\\tpathName1' or $'P\\tpathName1' (Bash syntax for tab)\n"
+             "- For P-line: $'P\\tpathName1' or $'^P\\tpathName1' (Bash syntax for tab)\n"
              "- For W-line: $'W\\tSampleID\\tHaplotypeID\\tSeqName' or $'^W\\tSampleID\\tHaplotypeID\\tSeqName'\n"
              "The parts of the key (like PathName, SampleID, etc.) will be regex-escaped by the script."
     )
