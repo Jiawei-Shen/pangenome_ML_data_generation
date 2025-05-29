@@ -60,35 +60,43 @@ def query_vcf_chr1(vcf_file_path):
 def load_node_positions(json_file_path):
     """
     Loads node position information from the provided JSON file.
-    Returns a dictionary mapping target_node_id (str) to grch38_start_position.
-    Only records entries for 'chr1' and where grch38_start_position is not null.
+    Returns a dictionary mapping top_level_node_id (str) to grch38_start_position (int).
+    Only records entries for 'chr1' and where grch38_start_position is a valid integer.
     """
-    print(f"🗺️ Loading node positions from '{json_file_path}' for chr1...")
+    print(f"Loading node positions from '{json_file_path}' for chr1...")
     node_positions = {}
     try:
         with open(json_file_path, 'r') as f:
             data = json.load(f)
         for entry in data:
+            # Check for chr1 and if grch38_start_position exists
             if (entry.get("grch38_chromosome_region") == "chr1" and
-                    entry.get("grch38_start_position") is not None):
+                entry.get("grch38_start_position") is not None): # Ensure key exists and is not null
                 try:
-                    node_id = str(entry.get("target_node_id_queried"))
-                    start_pos = int(entry.get("grch38_start_position"))
-                    node_positions[node_id] = start_pos
-                except (ValueError, TypeError):
-                    print(f"⚠️ Warning: Skipping entry with invalid start position or node ID: {entry}",
-                          file=sys.stderr)
+                    # Use 'top_level_node_id' as the identifier
+                    node_id = str(entry.get("top_level_node_id"))
+                    # Convert 'grch38_start_position' (which is a string in the new format) to int
+                    start_pos_str = entry.get("grch38_start_position")
+                    if start_pos_str: # Ensure the string is not empty
+                        start_pos = int(start_pos_str)
+                        node_positions[node_id] = start_pos
+                    else:
+                        print(f"Warning: Skipping entry with empty start position string: {entry}", file=sys.stderr)
+                except (ValueError, TypeError) as e:
+                     # Catches errors from int() conversion if start_pos_str is not a valid number,
+                     # or from str() if node_id is problematic, or if node_id is None.
+                     print(f"Warning: Skipping entry due to invalid/missing node ID or start position: {entry} (Error: {e})", file=sys.stderr)
 
-        print(f"✔ Loaded start positions for {len(node_positions)} nodes on chr1.")
+        print(f"Loaded start positions for {len(node_positions)} nodes on chr1.")
         return node_positions
     except FileNotFoundError:
-        print(f"❌ Error: Node position JSON file not found at '{json_file_path}'", file=sys.stderr)
+        print(f"Error: Node position JSON file not found at '{json_file_path}'", file=sys.stderr)
         return None
     except json.JSONDecodeError:
-        print(f"❌ Error: Could not decode JSON from '{json_file_path}'", file=sys.stderr)
+        print(f"Error: Could not decode JSON from '{json_file_path}'", file=sys.stderr)
         return None
     except Exception as e:
-        print(f"❌ Error loading node positions: {e}", file=sys.stderr)
+        print(f"Error loading node positions: {e}", file=sys.stderr)
         return None
 
 
