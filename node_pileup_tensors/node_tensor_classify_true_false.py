@@ -62,7 +62,7 @@ def load_node_positions(json_file_path):
     node_positions = {}
     try:
         with open(json_file_path, 'r') as f:
-            loaded_json_object = json.load(f)  # Load the entire JSON object
+            loaded_json_object = json.load(f)
 
         if not isinstance(loaded_json_object, dict):
             print(
@@ -70,7 +70,7 @@ def load_node_positions(json_file_path):
                 file=sys.stderr)
             return None
 
-        node_entries_list = loaded_json_object.get("nodes")  # Access the list under the "nodes" key
+        node_entries_list = loaded_json_object.get("nodes")
 
         if not isinstance(node_entries_list, list):
             print(f"Error: The 'nodes' key in '{json_file_path}' does not contain a list of node entries.",
@@ -86,26 +86,22 @@ def load_node_positions(json_file_path):
 
             start_pos_val = entry.get("grch38_position_start")
 
-            if start_pos_val is not None:  # Handles integer 0 correctly, but not None
+            if start_pos_val is not None:
                 try:
                     node_id_val = entry.get("node_id")
-                    if node_id_val is None:  # Check if node_id key exists and has a value
+                    if node_id_val is None:
                         print(f"Warning: Skipping entry {entry_num} in 'nodes' list due to missing 'node_id': {entry}",
                               file=sys.stderr)
                         continue
                     node_id_str = str(node_id_val)
 
-                    # Handles if start_pos_val is already int or a string representation of int
                     start_pos_int = int(start_pos_val)
                     node_positions[node_id_str] = start_pos_int
 
                 except (ValueError, TypeError) as e:
-                    # Catches errors from int() conversion or str() if node_id is problematic
                     print(
                         f"Warning: Skipping entry {entry_num} in 'nodes' list due to invalid data type for 'node_id' or 'grch38_position_start': {entry} (Error: {e})",
                         file=sys.stderr)
-            # else: No start position or it's null
-            # print(f"Debug: Entry {entry_num} in 'nodes' list skipped, 'grch38_position_start' is missing or null: {entry}", file=sys.stderr)
 
         print(f"Loaded start positions for {len(node_positions)} nodes from the 'nodes' list.")
         return node_positions
@@ -115,9 +111,10 @@ def load_node_positions(json_file_path):
     except json.JSONDecodeError as jde:
         print(f"Error: Could not decode JSON from '{json_file_path}'. Malformed JSON. Error: {jde}", file=sys.stderr)
         return None
-    except Exception as e:  # Catch other potential errors
+    except Exception as e:
         print(f"Error loading node positions: {e}", file=sys.stderr)
         return None
+
 
 def calculate_genomic_position(node_start_pos, variant_pos_on_node):
     """
@@ -125,7 +122,7 @@ def calculate_genomic_position(node_start_pos, variant_pos_on_node):
     Assumes VCF is 1-based and .pth variant position is 0-based relative to node start.
     Node start from JSON is assumed to be 1-based GRCh38 coordinate.
     """
-    return node_start_pos + variant_pos_on_node
+    return node_start_pos + variant_pos_on_node + 1
 
 
 # --- Main Script Logic ---
@@ -136,7 +133,7 @@ def main():
                         help="Path to the folder containing node subdirectories with .pth files and variant_summary.json.")
     parser.add_argument("vcf_file", help="Path to the VCF file to query (e.g., dbSNP for chr1).")
     parser.add_argument("node_pos_json",
-                        help="Path to the JSON file with node GRCh38 position information (standard JSON array format expected).")
+                        help="Path to the JSON file with node GRCh38 position information (expects a top-level object with a 'nodes' list).")
     parser.add_argument("--output_folder", default="./classification_results",
                         help="Path to the folder where 'true' and 'false' subfolders and summary will be created.")
     args = parser.parse_args()
@@ -175,6 +172,7 @@ def main():
     pth_files_copied_true = 0
     pth_files_copied_false = 0
     actual_pth_files_found_and_considered = 0
+    nodes_processed_for_report = 0  # Counter for progress report
 
     print(f"Processing .pth files from base folder: {args.pth_folder_path}")
     for node_id_str in os.listdir(args.pth_folder_path):
@@ -183,19 +181,35 @@ def main():
             continue
 
         if node_id_str not in all_node_start_positions:
+            # This node directory does not have position info, skip it.
             continue
+
+        # Increment counter for nodes that we will attempt to process (have position info)
+        nodes_processed_for_report += 1
 
         node_grch38_start_pos = all_node_start_positions[node_id_str]
 
         summary_json_path = os.path.join(node_dir_path, "variant_summary.json")
         if not os.path.isfile(summary_json_path):
-            continue
+            # Node directory processed for reporting purposes, but no summary to read.
+            if nodes_processed_for_report > 0 and nodes_processed_for_report % 100 == 0:
+                print(f"\nProgress Report: After processing {nodes_processed_for_report} node directories.")
+                print(f"  Total .pth files considered (from summaries): {total_pth_files_processed_from_summaries}")
+                print(f"  Total .pth files physically found & processed: {actual_pth_files_found_and_considered}")
+                print(f"  Copied to 'true': {pth_files_copied_true}, Copied to 'false': {pth_files_copied_false}\n")
+            continue  # Move to the next node directory
 
         try:
             with open(summary_json_path, 'r') as sjf:
                 node_summary_data = json.load(sjf)
         except Exception as e:
             print(f"Warning: Could not read or parse {summary_json_path}: {e}. Skipping.", file=sys.stderr)
+            # Node directory processed for reporting, but summary was unreadable.
+            if nodes_processed_for_report > 0 and nodes_processed_for_report % 100 == 0:
+                print(f"\nProgress Report: After processing {nodes_processed_for_report} node directories.")
+                print(f"  Total .pth files considered (from summaries): {total_pth_files_processed_from_summaries}")
+                print(f"  Total .pth files physically found & processed: {actual_pth_files_found_and_considered}")
+                print(f"  Copied to 'true': {pth_files_copied_true}, Copied to 'false': {pth_files_copied_false}\n")
             continue
 
         for variant_info in node_summary_data.get("variants", []):
@@ -254,6 +268,13 @@ def main():
                 shutil.copy2(pth_file_full_path, os.path.join(false_folder, destination_filename))
                 pth_files_copied_false += 1
 
+        # Progress report after processing all variants for the current node directory
+        if nodes_processed_for_report > 0 and nodes_processed_for_report % 100 == 0:
+            print(f"\nProgress Report: After processing {nodes_processed_for_report} node directories.")
+            print(f"  Total .pth files considered (from summaries): {total_pth_files_processed_from_summaries}")
+            print(f"  Total .pth files physically found & processed: {actual_pth_files_found_and_considered}")
+            print(f"  Copied to 'true': {pth_files_copied_true}, Copied to 'false': {pth_files_copied_false}\n")
+
     # 5. Write the overall classification summary JSON
     summary_output_path = os.path.join(args.output_folder, "classification_summary.json")
     try:
@@ -268,6 +289,7 @@ def main():
     print(f"Total .pth files found and considered for copying: {actual_pth_files_found_and_considered}")
     print(f"Copied to 'true' folder: {pth_files_copied_true}")
     print(f"Copied to 'false' folder: {pth_files_copied_false}")
+    print(f"Total node directories processed for reporting: {nodes_processed_for_report}")
     print("Classification finished.")
 
 
