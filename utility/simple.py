@@ -27,13 +27,14 @@ def load_json_variants(json_file):
             data = json.load(f)
         for node in data.get("nodes", []):
             for result in node.get("vcf_query_results", []):
-                chrom = result.get("chrom") or result.get("CHROM")
-                pos = result.get("pos") or result.get("POS")
-                ref = result.get("ref") or result.get("REF")
-                alt = result.get("alt") or result.get("ALT")
-                if chrom and pos and ref and alt:
-                    for allele in alt.split(','):
-                        variants.add((str(chrom), int(pos), str(ref), str(allele)))
+                if isinstance(result, dict):  # ← FIX: ensure result is a dictionary
+                    chrom = result.get("chrom") or result.get("CHROM")
+                    pos = result.get("pos") or result.get("POS")
+                    ref = result.get("ref") or result.get("REF")
+                    alt = result.get("alt") or result.get("ALT")
+                    if chrom and pos and ref and alt:
+                        for allele in alt.split(','):
+                            variants.add((str(chrom), int(pos), str(ref), str(allele)))
     except Exception as e:
         print(f"Error reading JSON file: {e}")
     return variants
