@@ -13,7 +13,7 @@ def load_vcf_variants(vcf_file, target_chr):
                 continue
             fields = line.strip().split('\t')
             chrom, pos, ref, alt = fields[0], fields[1], fields[3], fields[4]
-            for allele in alt.split(','):  # handle multi-allelics
+            for allele in alt.split(','):
                 variants.add((chrom, int(pos), ref, allele))
     except Exception as e:
         print(f"Error reading VCF with bcftools: {e}")
@@ -43,15 +43,9 @@ def load_json_variants(json_file):
 
 def compare_variants(vcf_variants, json_variants):
     missing = vcf_variants - json_variants
-    print(f"\nTotal variants in VCF: {len(vcf_variants)}")
+    print(f"Total variants in VCF: {len(vcf_variants)}")
     print(f"Total variants in JSON: {len(json_variants)}")
     print(f"Variants present in VCF but missing in JSON: {len(missing)}")
-
-    if missing:
-        print("\nExamples (up to 10):")
-        for i, var in enumerate(sorted(missing)[:10], 1):
-            print(f"{i}. {var}")
-    return missing
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Compare VCF and JSON vcf_query_results for a given chromosome")
