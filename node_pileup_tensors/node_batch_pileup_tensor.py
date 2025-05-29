@@ -300,15 +300,18 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
     node_id, dat_file_offset, n_records, node_sequence, min_af_threshold = task_args_with_af_thresh
     global worker_dat_file, worker_base_output_dir
 
+    # Default pth count to 0 in case of early exit
+    pth_files_generated_for_node = 0
+
     if worker_dat_file is None or worker_base_output_dir is None:
         sys.stderr.write(
             f"❌ Error [Worker {os.getpid()} for Node {node_id}]: Worker not initialized properly (dat_file or output_dir missing).\n")
-        return node_id, None
+        return node_id, None, pth_files_generated_for_node
 
     if not node_sequence:
         sys.stderr.write(
             f"ℹ️ [Worker {os.getpid()} for Node {node_id}]: No sequence provided. Skipping tensor/summary generation.\n")
-        return node_id, {}
+        return node_id, {}, pth_files_generated_for_node
 
     node_specific_output_dir = os.path.join(worker_base_output_dir, str(node_id))
     try:
@@ -316,7 +319,7 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
     except OSError as e:
         sys.stderr.write(
             f"❌ Error [Worker {os.getpid()} for Node {node_id}]: Could not create directory {node_specific_output_dir}: {e}\n")
-        return node_id, None
+        return node_id, None, pth_files_generated_for_node
 
     node_len = len(node_sequence)
     variant_headers_for_node = []
@@ -339,16 +342,13 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
                 cigar_str_original = raw_cigar.rstrip(b'\x00').decode('ascii', errors='replace')
                 strand_char = strand_byte.decode('ascii')
             except UnicodeDecodeError:
-                # sys.stderr.write(f"⚠️ Warning [Worker {os.getpid()} for Node {node_id}]: Unicode decode error for a read. Skipping.\n")
                 continue
 
             if len(seq) == 0 or len(seq) != len(qual_str):
-                # sys.stderr.write(f"⚠️ Warning [Worker {os.getpid()} for Node {node_id}]: Mismatch length seq vs qual or empty seq. Skipping read.\n")
                 continue
 
             original_decoded_cigar_ops = decode_cigar_to_int_ops(cigar_str_original)
             if not original_decoded_cigar_ops and cigar_str_original != '*':
-                # sys.stderr.write(f"⚠️ Warning [Worker {os.getpid()} for Node {node_id}]: Bad CIGAR '{cigar_str_original}'. Skipping read.\n")
                 continue
 
             current_read_sequence = seq
@@ -360,22 +360,16 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
                 current_read_sequence = reverse_complement(seq)
                 current_quality_str = qual_str[::-1]
 
-                # Reverse CIGAR operations list
                 temp_rev_cigar_ops = []
-                for length, op_code in original_decoded_cigar_ops:  # Iterate original CIGAR
-                    temp_rev_cigar_ops.insert(0, (length, op_code))  # Prepend to reverse order
+                for length, op_code in original_decoded_cigar_ops:
+                    temp_rev_cigar_ops.insert(0, (length, op_code))
                 current_decoded_cigar_ops = temp_rev_cigar_ops
 
-                # Offset calculation as per your provided "User-confirmed fix"
                 alignment_span_on_node = len(current_read_sequence)  # User-confirmed fix
-                if alignment_span_on_node > 0:  # Should always be true if len(seq)>0
+                if alignment_span_on_node > 0:
                     current_offset_on_node = node_len - alignment_span_on_node - off_from_file
                     if current_offset_on_node < 0:
-                        # sys.stderr.write(f"⚠️ Warning [Worker {os.getpid()} for Node {node_id}]: Negative offset for strand '-', off {off_from_file}, span {alignment_span_on_node}, node_len {node_len}. Skipping.\n")
                         continue
-                        # The conditional -1 based on off_from_file !=0 was discussed previously. (Comment from original script)
-                # Sticking to the script version confirmed by the user. (Comment from original script)
-
             aligned_read_segments.append({
                 "offset_on_node": current_offset_on_node,
                 "read_sequence": current_read_sequence,
@@ -386,7 +380,7 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
             })
     except Exception as e:
         sys.stderr.write(f"❌ Error [Worker {os.getpid()} for Node {node_id}] reading records: {e}\n")
-        return node_id, None
+        return node_id, None, pth_files_generated_for_node
 
     candidate_variants = defaultdict(int)
     for segment in aligned_read_segments:
@@ -546,6 +540,7 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
             sys.stderr.write(
                 f"❌ Error [Worker {os.getpid()} for Node {node_id}]: Failed to create or save tensor for {variant_key_str}: {e}\n")
 
+    pth_files_generated_for_node = len(variant_headers_for_node)
     if variant_headers_for_node:
         summary_json_path = os.path.join(node_specific_output_dir, "variant_summary.json")
         try:
@@ -559,7 +554,7 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
         except Exception as e:
             sys.stderr.write(f"❌ Error [Worker {os.getpid()} for Node {node_id}]: Failed to write summary JSON: {e}\n")
 
-    return node_id, view_oriented_variant_data
+    return node_id, view_oriented_variant_data, pth_files_generated_for_node
 
 
 ## ─────────────────────────────────────────────────────────────────────────────
@@ -754,9 +749,13 @@ def main():
     processed_nodes_count = 0
     successful_nodes_with_output = 0
     overall_start_time = time.time()
+    total_pth_files_generated = 0  # Initialize counter for all .pth files
+    nodes_iterated_count = 0  # Initialize counter for nodes iterated from file list
 
     for target_node_id in target_node_ids:
-        print(f"\n═════════════════════════════ PROCESSING NODE ID: {target_node_id} ═════════════════════════════")
+        nodes_iterated_count += 1  # Increment for each node ID we start to process from the list
+        print(
+            f"\n═════════════════════════════ PROCESSING NODE ID: {target_node_id} ({nodes_iterated_count}/{len(target_node_ids)}) ═════════════════════════════")
         node_specific_start_time = time.time()
         node_sequence = None
 
@@ -764,6 +763,9 @@ def main():
         node_dat_info = parse_idx_file_for_single_node(args.idx, target_node_id)
         if not node_dat_info:
             print(f"❌ Skipping node {target_node_id} due to index parsing failure.", file=sys.stderr)
+            if args.node_id_file and nodes_iterated_count > 0 and nodes_iterated_count % 100 == 0:
+                print(
+                    f"ℹ️ Progress after iterating {nodes_iterated_count} node(s) from file: {total_pth_files_generated} .pth files generated so far.")
             continue
         dat_offset, n_records = node_dat_info
         print(f"✔ Index parsing for node {target_node_id} took {time.time() - idx_parse_start_time:.2f}s.")
@@ -782,13 +784,22 @@ def main():
                 node_sequences_map[node_id_str] = node_sequence
             else:
                 print(f"❌ Skipping node {target_node_id}: Failed to load sequence from GFA.", file=sys.stderr)
+                if args.node_id_file and nodes_iterated_count > 0 and nodes_iterated_count % 100 == 0:
+                    print(
+                        f"ℹ️ Progress after iterating {nodes_iterated_count} node(s) from file: {total_pth_files_generated} .pth files generated so far.")
                 continue
         else:
             print(f"❌ Skipping node {target_node_id}: Sequence not in cache and --gfa not provided.", file=sys.stderr)
+            if args.node_id_file and nodes_iterated_count > 0 and nodes_iterated_count % 100 == 0:
+                print(
+                    f"ℹ️ Progress after iterating {nodes_iterated_count} node(s) from file: {total_pth_files_generated} .pth files generated so far.")
             continue
 
         if not node_sequence:
             print(f"❌ Skipping node {target_node_id}: Sequence could not be obtained.", file=sys.stderr)
+            if args.node_id_file and nodes_iterated_count > 0 and nodes_iterated_count % 100 == 0:
+                print(
+                    f"ℹ️ Progress after iterating {nodes_iterated_count} node(s) from file: {total_pth_files_generated} .pth files generated so far.")
             continue
 
         task_payload = (target_node_id, dat_offset, n_records, node_sequence, args.min_af)
@@ -798,29 +809,39 @@ def main():
         node_processing_start_time = time.time()
         processed_node_id_result = None
         view_data_for_node = None
+        pth_files_for_this_node = 0  # Default to 0
 
         try:
             with ProcessPoolExecutor(max_workers=1, initializer=init_worker,
                                      initargs=(args.dat, args.output)) as executor:
                 future = executor.submit(process_single_node_for_pileup, task_payload)
-                processed_node_id_result, view_data_for_node = future.result()
+                processed_node_id_result, view_data_for_node, pth_files_for_this_node = future.result()
+
+            total_pth_files_generated += pth_files_for_this_node
 
             if processed_node_id_result is None:
                 print(
-                    f"❌ Critical Error: Worker failed to return results for node {target_node_id}. Might be an issue in init_worker or early in process_single_node_for_pileup.",
+                    f"❌ Critical Error: Worker failed to return results for node {target_node_id}. Check worker logs.",
                     file=sys.stderr)
-                continue
+                if args.node_id_file and nodes_iterated_count > 0 and nodes_iterated_count % 100 == 0:
+                    print(
+                        f"ℹ️ Progress after iterating {nodes_iterated_count} node(s) from file: {total_pth_files_generated} .pth files generated so far.")
+                continue  # Skip this node from being counted in processed_nodes_count and further display
 
-            if view_data_for_node is None:
+            if view_data_for_node is None:  # Indicates an issue within the worker task after it started
                 print(
-                    f"⚠️ Warning: Processing for node {target_node_id} returned no view data, suggesting an error within the worker task. Check logs.",
+                    f"⚠️ Warning: Processing for node {target_node_id} returned no view data (worker error). pth files for this node: {pth_files_for_this_node}",
                     file=sys.stderr)
 
         except Exception as e:
             print(f"❌ An error occurred launching or during processing for node {target_node_id}: {e}", file=sys.stderr)
+            if args.node_id_file and nodes_iterated_count > 0 and nodes_iterated_count % 100 == 0:
+                print(
+                    f"ℹ️ Progress after iterating {nodes_iterated_count} node(s) from file: {total_pth_files_generated} .pth files generated so far.")
             continue
 
-        print(f"✔ Worker task for node {target_node_id} finished in {time.time() - node_processing_start_time:.2f}s.")
+        print(
+            f"✔ Worker task for node {target_node_id} finished in {time.time() - node_processing_start_time:.2f}s. Generated {pth_files_for_this_node} .pth file(s).")
         processed_nodes_count += 1
 
         if args.view is not None:
@@ -830,7 +851,7 @@ def main():
                 print(
                     f"🔹 Displaying {view_limit_msg} pileups for node {target_node_id} (max {args.max_view_reads} reads/variant)...")
                 display_pileup_data(view_data_for_node, node_id_str, node_sequence, args.max_view_reads, max_v_to_show)
-            elif view_data_for_node is not None:
+            elif view_data_for_node is not None:  # view_data_for_node is {}
                 print(
                     f"ℹ️ --view specified for node {target_node_id}, but no variants met AF threshold or were found to display.")
 
@@ -838,13 +859,18 @@ def main():
         if os.path.exists(node_summary_file_path):
             print(f"✅ Output generated for node {target_node_id} in: {os.path.dirname(node_summary_file_path)}")
             successful_nodes_with_output += 1
-        elif view_data_for_node is not None and not view_data_for_node:
+        elif view_data_for_node is not None and not view_data_for_node and pth_files_for_this_node == 0:
             print(f"ℹ️ No variants met AF threshold for node {target_node_id}. No tensor or summary files generated.")
         else:
             print(
-                f"ℹ️ No output summary file found for node {target_node_id} at {node_summary_file_path}. Check logs if output was expected.")
+                f"ℹ️ No output summary file found for node {target_node_id} at {node_summary_file_path}. (Generated {pth_files_for_this_node} .pth files for this node).")
 
         print(f"✔ Completed processing for node {target_node_id} in {time.time() - node_specific_start_time:.2f}s.")
+
+        # Progress report every 100 nodes iterated from the file list
+        if args.node_id_file and nodes_iterated_count > 0 and nodes_iterated_count % 100 == 0:
+            print(
+                f"\nℹ️ Progress after iterating {nodes_iterated_count} node(s) from file: {total_pth_files_generated} .pth files generated so far.\n")
 
     print("\n═════════════════════════════ PROCESSING COMPLETE ═════════════════════════════")
 
@@ -859,7 +885,7 @@ def main():
                 print(f"❌ Error saving sequences to cache {args.save_cache}: {e}", file=sys.stderr)
         elif os.path.exists(args.save_cache):
             print(
-                f"ℹ️ --save-cache specified ({args.save_cache}), but no sequences were loaded or fetched into memory. The cache file will not be modified if it exists and was not loaded from, or will be overwritten if it was the source of an empty load.")
+                f"ℹ️ --save-cache specified ({args.save_cache}), but no sequences were loaded or fetched into memory.")
             if args.load_cache == args.save_cache and not node_sequences_map:
                 try:
                     with open(args.save_cache, 'w') as wcf:
@@ -871,13 +897,15 @@ def main():
             print(f"ℹ️ --save-cache specified, but no sequences were loaded or fetched. No cache file created/updated.")
 
     total_script_time = time.time() - overall_start_time
-    print(f"\nProcessed {processed_nodes_count}/{len(target_node_ids)} nodes.")
+    print(
+        f"\nProcessed {processed_nodes_count}/{len(target_node_ids)} node IDs from input list that were submitted to worker.")
     if successful_nodes_with_output > 0:
-        print(f"✅ Output (summary/tensors) successfully generated for {successful_nodes_with_output} node(s).")
-    if processed_nodes_count < len(target_node_ids):
+        print(f"✅ Output summary files successfully generated for {successful_nodes_with_output} node(s).")
+    if processed_nodes_count < nodes_iterated_count:  # nodes_iterated_count includes those skipped before worker submission
         print(
-            f"⚠️ {len(target_node_ids) - processed_nodes_count} node(s) were skipped due to errors before task submission.")
+            f"⚠️ {nodes_iterated_count - processed_nodes_count} node(s) were skipped before worker submission (e.g., index/sequence error).")
 
+    print(f"ℹ️ A grand total of {total_pth_files_generated} .pth files were generated.")
     print(f"🏁 Script finished in {total_script_time:.2f} seconds.")
 
 
