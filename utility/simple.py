@@ -20,21 +20,23 @@ def load_vcf_variants(vcf_file, target_chr):
     return variants
 
 def load_json_variants(json_file):
-    """Extract variants from JSON vcf_query_results."""
+    """Extract (chrom, pos, ref, alt) from raw VCF strings in vcf_query_results."""
     variants = set()
     try:
         with open(json_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
+
         for node in data.get("nodes", []):
-            for result in node.get("vcf_query_results", []):
-                if isinstance(result, dict):  # ← FIX: ensure result is a dictionary
-                    chrom = result.get("chrom") or result.get("CHROM")
-                    pos = result.get("pos") or result.get("POS")
-                    ref = result.get("ref") or result.get("REF")
-                    alt = result.get("alt") or result.get("ALT")
-                    if chrom and pos and ref and alt:
+            for line in node.get("vcf_query_results", []):
+                if isinstance(line, str):
+                    fields = line.strip().split('\t')
+                    if len(fields) >= 5:
+                        chrom = fields[0]
+                        pos = int(fields[1])
+                        ref = fields[3]
+                        alt = fields[4]
                         for allele in alt.split(','):
-                            variants.add((str(chrom), int(pos), str(ref), str(allele)))
+                            variants.add((chrom, pos, ref, allele))
     except Exception as e:
         print(f"Error reading JSON file: {e}")
     return variants
