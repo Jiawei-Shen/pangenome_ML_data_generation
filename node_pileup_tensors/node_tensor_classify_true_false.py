@@ -55,35 +55,43 @@ def query_vcf_chr1(vcf_file_path):
 def load_node_positions(json_file_path):
     """
     Loads node position information from the provided JSON file.
-    Expects a single JSON array where each element is an object representing a node.
+    Expects a single JSON object at the top level, with a "nodes" key containing a list of node objects.
     Returns a dictionary mapping node_id (str) to grch38_position_start (int).
-    Only records entries where grch38_position_start is a valid integer.
     """
     print(f"Loading node positions from '{json_file_path}'...")
     node_positions = {}
     try:
         with open(json_file_path, 'r') as f:
-            data_list = json.load(f)  # Load the entire JSON structure
+            loaded_json_object = json.load(f)  # Load the entire JSON object
 
-        if not isinstance(data_list, list):
+        if not isinstance(loaded_json_object, dict):
             print(
-                f"Error: Node position JSON file '{json_file_path}' does not contain a list of nodes at the top level.",
+                f"Error: Node position JSON file '{json_file_path}' is not a JSON object at the top level as expected.",
                 file=sys.stderr)
             return None
 
-        for entry_num, entry in enumerate(data_list, 1):
+        node_entries_list = loaded_json_object.get("nodes")  # Access the list under the "nodes" key
+
+        if not isinstance(node_entries_list, list):
+            print(f"Error: The 'nodes' key in '{json_file_path}' does not contain a list of node entries.",
+                  file=sys.stderr)
+            return None
+
+        for entry_num, entry in enumerate(node_entries_list, 1):
             if not isinstance(entry, dict):
-                print(f"Warning: Item {entry_num} in '{json_file_path}' is not a dictionary. Skipping.",
-                      file=sys.stderr)
+                print(
+                    f"Warning: Item {entry_num} in the 'nodes' list of '{json_file_path}' is not a dictionary. Skipping.",
+                    file=sys.stderr)
                 continue
 
             start_pos_val = entry.get("grch38_position_start")
 
-            if start_pos_val is not None:
+            if start_pos_val is not None:  # Handles integer 0 correctly, but not None
                 try:
                     node_id_val = entry.get("node_id")
-                    if node_id_val is None:
-                        print(f"Warning: Skipping entry {entry_num} with missing 'node_id': {entry}", file=sys.stderr)
+                    if node_id_val is None:  # Check if node_id key exists and has a value
+                        print(f"Warning: Skipping entry {entry_num} in 'nodes' list due to missing 'node_id': {entry}",
+                              file=sys.stderr)
                         continue
                     node_id_str = str(node_id_val)
 
@@ -92,12 +100,14 @@ def load_node_positions(json_file_path):
                     node_positions[node_id_str] = start_pos_int
 
                 except (ValueError, TypeError) as e:
+                    # Catches errors from int() conversion or str() if node_id is problematic
                     print(
-                        f"Warning: Skipping entry {entry_num} due to invalid/missing node ID or non-integer start position: {entry} (Error: {e})",
+                        f"Warning: Skipping entry {entry_num} in 'nodes' list due to invalid data type for 'node_id' or 'grch38_position_start': {entry} (Error: {e})",
                         file=sys.stderr)
             # else: No start position or it's null
+            # print(f"Debug: Entry {entry_num} in 'nodes' list skipped, 'grch38_position_start' is missing or null: {entry}", file=sys.stderr)
 
-        print(f"Loaded start positions for {len(node_positions)} nodes.")
+        print(f"Loaded start positions for {len(node_positions)} nodes from the 'nodes' list.")
         return node_positions
     except FileNotFoundError:
         print(f"Error: Node position JSON file not found at '{json_file_path}'", file=sys.stderr)
@@ -105,10 +115,9 @@ def load_node_positions(json_file_path):
     except json.JSONDecodeError as jde:
         print(f"Error: Could not decode JSON from '{json_file_path}'. Malformed JSON. Error: {jde}", file=sys.stderr)
         return None
-    except Exception as e:
+    except Exception as e:  # Catch other potential errors
         print(f"Error loading node positions: {e}", file=sys.stderr)
         return None
-
 
 def calculate_genomic_position(node_start_pos, variant_pos_on_node):
     """
