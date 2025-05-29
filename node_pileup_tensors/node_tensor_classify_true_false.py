@@ -69,8 +69,7 @@ def load_node_positions(json_file_path):
         with open(json_file_path, 'r') as f:
             data = json.load(f)
         for entry in data:
-            if (entry.get("status") != "task_execution_error" and
-                    entry.get("grch38_chromosome_region") == "chr1" and
+            if (entry.get("grch38_chromosome_region") == "chr1" and
                     entry.get("grch38_start_position") is not None):
                 try:
                     node_id = str(entry.get("target_node_id_queried"))
