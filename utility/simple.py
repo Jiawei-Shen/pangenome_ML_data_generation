@@ -47,11 +47,16 @@ def compare_and_output_missing(vcf_variants, json_variants, output_file):
     print(f"Total variants in JSON: {len(json_variants)}")
     print(f"Variants present in VCF but missing in JSON: {len(missing)}")
 
+    if missing:
+        print("\nMissing variants:")
+        for chrom, pos, ref, alt in missing:
+            print(f"{chrom}\t{pos}\t.\t{ref}\t{alt}\t.\t.\t.")
+
     with open(output_file, 'w', encoding='utf-8') as out_f:
         for chrom, pos, ref, alt in missing:
             out_f.write(f"{chrom}\t{pos}\t.\t{ref}\t{alt}\t.\t.\t.\n")
 
-    print(f"Missing variants written to: {output_file}")
+    print(f"\nMissing variants written to: {output_file}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Compare VCF and JSON vcf_query_results for a given chromosome")
