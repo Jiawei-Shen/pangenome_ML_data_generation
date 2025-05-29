@@ -55,8 +55,8 @@ def query_vcf_chr1(vcf_file_path):
 def load_node_positions(json_file_path):
     """
     Loads node position information from the provided JSON file (expected JSON Lines format).
-    Returns a dictionary mapping top_level_node_id (str) to grch38_start_position (int).
-    Only records entries where grch38_start_position is a valid integer.
+    Returns a dictionary mapping node_id (str) to grch38_position_start (int).
+    Only records entries where grch38_position_start is a valid integer.
     """
     print(f"Loading node positions from '{json_file_path}'...")
     node_positions = {}
@@ -73,21 +73,23 @@ def load_node_positions(json_file_path):
                     continue
 
                 # Process the entry (which should now be a dictionary)
-                if entry.get("grch38_start_position") is not None:  # Ensure key exists and is not null
-                    try:
-                        node_id_val = entry.get("top_level_node_id")
-                        if node_id_val is None:
-                            print(
-                                f"Warning: Skipping entry on line {line_num} with missing 'top_level_node_id': {entry}",
-                                file=sys.stderr)
-                            continue
-                        node_id = str(node_id_val)
+                # Use new key "grch38_position_start"
+                start_pos_val = entry.get("grch38_position_start")
 
-                        start_pos_val = entry.get("grch38_start_position")
+                if start_pos_val is not None:  # Ensure key exists and is not null
+                    try:
+                        # Use new key "node_id" as the identifier
+                        node_id_val = entry.get("node_id")
+                        if node_id_val is None:
+                            print(f"Warning: Skipping entry on line {line_num} with missing 'node_id': {entry}",
+                                  file=sys.stderr)
+                            continue
+                        node_id_str = str(node_id_val)
+
                         # Handles if start_pos_val is already int or a string representation of int
                         if isinstance(start_pos_val, (str, int, float)):  # Allow int/float and convert
-                            start_pos = int(start_pos_val)
-                            node_positions[node_id] = start_pos
+                            start_pos_int = int(start_pos_val)
+                            node_positions[node_id_str] = start_pos_int
                         else:
                             print(
                                 f"Warning: Skipping entry on line {line_num} with non-numeric start position type ('{type(start_pos_val)}'): {entry}",
@@ -95,11 +97,13 @@ def load_node_positions(json_file_path):
                             continue
 
                     except (ValueError, TypeError) as e:
+                        # Catches errors from int() conversion if start_pos_val is not a valid number,
+                        # or from str() if node_id is problematic.
                         print(
                             f"Warning: Skipping entry on line {line_num} due to invalid/missing node ID or start position: {entry} (Error: {e})",
                             file=sys.stderr)
                 # else: # No start position, or it's null
-                # print(f"Debug: Entry on line {line_num} skipped, no valid grch38_start_position: {entry}", file=sys.stderr)
+                # print(f"Debug: Entry on line {line_num} skipped, no valid grch38_position_start: {entry}", file=sys.stderr)
 
         print(f"Loaded start positions for {len(node_positions)} nodes.")
         return node_positions
@@ -153,7 +157,6 @@ def main():
             file=sys.stderr)
 
     # 3. Load node position information
-    # This will load positions for all nodes, not just chr1
     all_node_start_positions = load_node_positions(args.node_pos_json)
     if all_node_start_positions is None:
         print("Exiting due to failure in loading node positions.", file=sys.stderr)
@@ -175,18 +178,13 @@ def main():
         if not os.path.isdir(node_dir_path):
             continue
 
-        # Check if we have this node's start position (it's no longer filtered by chr1 here)
         if node_id_str not in all_node_start_positions:
-            # This means the node_id from the directory name was not in the positions JSON,
-            # or its entry was invalid.
-            # print(f"Info: Skipping node {node_id_str}: Start position unknown based on node position JSON.")
             continue
 
-        node_grch38_start_pos = all_node_start_positions[node_id_str]  # 1-based
+        node_grch38_start_pos = all_node_start_positions[node_id_str]
 
         summary_json_path = os.path.join(node_dir_path, "variant_summary.json")
         if not os.path.isfile(summary_json_path):
-            # print(f"Warning: variant_summary.json not found in {node_dir_path}. Skipping this node's .pth files.", file=sys.stderr)
             continue
 
         try:
@@ -226,13 +224,8 @@ def main():
                 continue
 
             genomic_variant_pos = calculate_genomic_position(node_grch38_start_pos, variant_pos_on_node)
-
-            # Classification is still based on vcf_chr1_variants.
-            # Variants not on chr1 (based on their calculated genomic_variant_pos falling outside typical chr1 range,
-            # or more directly, their original node not being chr1 according to node_pos_json if that info was kept)
-            # will not be in vcf_chr1_variants and thus be 'false'.
             vcf_tuple_to_check = (genomic_variant_pos, variant_ref_on_node, variant_alt_on_node)
-            is_true_variant = vcf_tuple_to_check in vcf_chr1_variants  # This implicitly filters for chr1 positions too
+            is_true_variant = vcf_tuple_to_check in vcf_chr1_variants
 
             variant_summary_entry = {
                 "pth_file": pth_filename,
@@ -244,7 +237,7 @@ def main():
                 "alt_allele_from_pth_summary": variant_alt_on_node,
                 "classification": "true" if is_true_variant else "false",
                 "vcf_match_key": str(vcf_tuple_to_check),
-                "found_in_vcf_chr1": is_true_variant  # Clarified that vcf set is for chr1
+                "found_in_vcf_chr1": is_true_variant
             }
             classification_summary.append(variant_summary_entry)
 
