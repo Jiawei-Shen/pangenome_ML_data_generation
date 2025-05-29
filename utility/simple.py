@@ -2,11 +2,11 @@ import json
 import argparse
 import subprocess
 
-def load_vcf_variants(vcf_file):
-    """Load variants from a VCF using bcftools."""
+def load_vcf_variants(vcf_file, target_chr):
+    """Load variants from a specific chromosome in the VCF using bcftools."""
     variants = set()
     try:
-        cmd = ["bcftools", "view", "-H", vcf_file]
+        cmd = ["bcftools", "view", "-r", target_chr, "-H", vcf_file]
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         for line in result.stdout.strip().split('\n'):
             if not line:
@@ -20,13 +20,12 @@ def load_vcf_variants(vcf_file):
     return variants
 
 def load_json_variants(json_file):
-    """Extract variants from JSON file under vcf_query_results."""
+    """Extract variants from JSON vcf_query_results."""
     variants = set()
     try:
         with open(json_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        nodes = data.get("nodes", [])
-        for node in nodes:
+        for node in data.get("nodes", []):
             for result in node.get("vcf_query_results", []):
                 chrom = result.get("chrom") or result.get("CHROM")
                 pos = result.get("pos") or result.get("POS")
@@ -52,11 +51,12 @@ def compare_variants(vcf_variants, json_variants):
     return missing
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Compare variants between VCF and JSON vcf_query_results")
-    parser.add_argument("vcf_file", help="Path to the VCF or VCF.GZ file")
+    parser = argparse.ArgumentParser(description="Compare VCF and JSON vcf_query_results for a given chromosome")
+    parser.add_argument("vcf_file", help="Path to the VCF(.gz) file")
     parser.add_argument("json_file", help="Path to the JSON file with vcf_query_results")
+    parser.add_argument("--chr", required=True, help="Chromosome to compare (e.g., chr1)")
     args = parser.parse_args()
 
-    vcf_vars = load_vcf_variants(args.vcf_file)
+    vcf_vars = load_vcf_variants(args.vcf_file, args.chr)
     json_vars = load_json_variants(args.json_file)
     compare_variants(vcf_vars, json_vars)
