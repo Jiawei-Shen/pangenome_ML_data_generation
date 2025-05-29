@@ -54,7 +54,8 @@ def query_vcf_chr1(vcf_file_path):
 
 def load_node_positions(json_file_path):
     """
-    Loads node position information from the provided JSON file (expected JSON Lines format).
+    Loads node position information from the provided JSON file.
+    Expects a single JSON array where each element is an object representing a node.
     Returns a dictionary mapping node_id (str) to grch38_position_start (int).
     Only records entries where grch38_position_start is a valid integer.
     """
@@ -62,55 +63,49 @@ def load_node_positions(json_file_path):
     node_positions = {}
     try:
         with open(json_file_path, 'r') as f:
-            for line_num, line in enumerate(f, 1):
-                line = line.strip()
-                if not line:  # Skip empty lines
-                    continue
+            data_list = json.load(f)  # Load the entire JSON structure
+
+        if not isinstance(data_list, list):
+            print(
+                f"Error: Node position JSON file '{json_file_path}' does not contain a list of nodes at the top level.",
+                file=sys.stderr)
+            return None
+
+        for entry_num, entry in enumerate(data_list, 1):
+            if not isinstance(entry, dict):
+                print(f"Warning: Item {entry_num} in '{json_file_path}' is not a dictionary. Skipping.",
+                      file=sys.stderr)
+                continue
+
+            start_pos_val = entry.get("grch38_position_start")
+
+            if start_pos_val is not None:
                 try:
-                    entry = json.loads(line)  # Parse each line as a JSON object
-                except json.JSONDecodeError as jde:
-                    print(f"Warning: Could not decode JSON line {line_num}: {line}. Error: {jde}", file=sys.stderr)
-                    continue
+                    node_id_val = entry.get("node_id")
+                    if node_id_val is None:
+                        print(f"Warning: Skipping entry {entry_num} with missing 'node_id': {entry}", file=sys.stderr)
+                        continue
+                    node_id_str = str(node_id_val)
 
-                # Process the entry (which should now be a dictionary)
-                # Use new key "grch38_position_start"
-                start_pos_val = entry.get("grch38_position_start")
+                    # Handles if start_pos_val is already int or a string representation of int
+                    start_pos_int = int(start_pos_val)
+                    node_positions[node_id_str] = start_pos_int
 
-                if start_pos_val is not None:  # Ensure key exists and is not null
-                    try:
-                        # Use new key "node_id" as the identifier
-                        node_id_val = entry.get("node_id")
-                        if node_id_val is None:
-                            print(f"Warning: Skipping entry on line {line_num} with missing 'node_id': {entry}",
-                                  file=sys.stderr)
-                            continue
-                        node_id_str = str(node_id_val)
-
-                        # Handles if start_pos_val is already int or a string representation of int
-                        if isinstance(start_pos_val, (str, int, float)):  # Allow int/float and convert
-                            start_pos_int = int(start_pos_val)
-                            node_positions[node_id_str] = start_pos_int
-                        else:
-                            print(
-                                f"Warning: Skipping entry on line {line_num} with non-numeric start position type ('{type(start_pos_val)}'): {entry}",
-                                file=sys.stderr)
-                            continue
-
-                    except (ValueError, TypeError) as e:
-                        # Catches errors from int() conversion if start_pos_val is not a valid number,
-                        # or from str() if node_id is problematic.
-                        print(
-                            f"Warning: Skipping entry on line {line_num} due to invalid/missing node ID or start position: {entry} (Error: {e})",
-                            file=sys.stderr)
-                # else: # No start position, or it's null
-                # print(f"Debug: Entry on line {line_num} skipped, no valid grch38_position_start: {entry}", file=sys.stderr)
+                except (ValueError, TypeError) as e:
+                    print(
+                        f"Warning: Skipping entry {entry_num} due to invalid/missing node ID or non-integer start position: {entry} (Error: {e})",
+                        file=sys.stderr)
+            # else: No start position or it's null
 
         print(f"Loaded start positions for {len(node_positions)} nodes.")
         return node_positions
     except FileNotFoundError:
         print(f"Error: Node position JSON file not found at '{json_file_path}'", file=sys.stderr)
         return None
-    except Exception as e:  # Catch other potential errors like read permissions
+    except json.JSONDecodeError as jde:
+        print(f"Error: Could not decode JSON from '{json_file_path}'. Malformed JSON. Error: {jde}", file=sys.stderr)
+        return None
+    except Exception as e:
         print(f"Error loading node positions: {e}", file=sys.stderr)
         return None
 
@@ -132,7 +127,7 @@ def main():
                         help="Path to the folder containing node subdirectories with .pth files and variant_summary.json.")
     parser.add_argument("vcf_file", help="Path to the VCF file to query (e.g., dbSNP for chr1).")
     parser.add_argument("node_pos_json",
-                        help="Path to the JSON file with node GRCh38 position information (JSON Lines format expected).")
+                        help="Path to the JSON file with node GRCh38 position information (standard JSON array format expected).")
     parser.add_argument("--output_folder", default="./classification_results",
                         help="Path to the folder where 'true' and 'false' subfolders and summary will be created.")
     args = parser.parse_args()
