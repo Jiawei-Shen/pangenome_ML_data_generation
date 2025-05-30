@@ -122,7 +122,7 @@ def calculate_genomic_position(node_start_pos, variant_pos_on_node):
     Assumes VCF is 1-based and .pth variant position is 0-based relative to node start.
     Node start from JSON is assumed to be 1-based GRCh38 coordinate.
     """
-    return node_start_pos + variant_pos_on_node + 1
+    return node_start_pos + variant_pos_on_node
 
 
 # --- Main Script Logic ---
@@ -172,7 +172,7 @@ def main():
     pth_files_copied_true = 0
     pth_files_copied_false = 0
     actual_pth_files_found_and_considered = 0
-    nodes_processed_for_report = 0  # Counter for progress report
+    nodes_processed_for_report = 0
 
     print(f"Processing .pth files from base folder: {args.pth_folder_path}")
     for node_id_str in os.listdir(args.pth_folder_path):
@@ -181,30 +181,26 @@ def main():
             continue
 
         if node_id_str not in all_node_start_positions:
-            # This node directory does not have position info, skip it.
             continue
 
-        # Increment counter for nodes that we will attempt to process (have position info)
         nodes_processed_for_report += 1
 
         node_grch38_start_pos = all_node_start_positions[node_id_str]
 
         summary_json_path = os.path.join(node_dir_path, "variant_summary.json")
         if not os.path.isfile(summary_json_path):
-            # Node directory processed for reporting purposes, but no summary to read.
             if nodes_processed_for_report > 0 and nodes_processed_for_report % 100 == 0:
                 print(f"\nProgress Report: After processing {nodes_processed_for_report} node directories.")
                 print(f"  Total .pth files considered (from summaries): {total_pth_files_processed_from_summaries}")
                 print(f"  Total .pth files physically found & processed: {actual_pth_files_found_and_considered}")
                 print(f"  Copied to 'true': {pth_files_copied_true}, Copied to 'false': {pth_files_copied_false}\n")
-            continue  # Move to the next node directory
+            continue
 
         try:
             with open(summary_json_path, 'r') as sjf:
                 node_summary_data = json.load(sjf)
         except Exception as e:
             print(f"Warning: Could not read or parse {summary_json_path}: {e}. Skipping.", file=sys.stderr)
-            # Node directory processed for reporting, but summary was unreadable.
             if nodes_processed_for_report > 0 and nodes_processed_for_report % 100 == 0:
                 print(f"\nProgress Report: After processing {nodes_processed_for_report} node directories.")
                 print(f"  Total .pth files considered (from summaries): {total_pth_files_processed_from_summaries}")
@@ -241,6 +237,9 @@ def main():
                     file=sys.stderr)
                 continue
 
+            # Get allele frequency from the variant_info dictionary
+            allele_frequency = variant_info.get("alt_allele_frequency", "N/A")
+
             genomic_variant_pos = calculate_genomic_position(node_grch38_start_pos, variant_pos_on_node)
             vcf_tuple_to_check = (genomic_variant_pos, variant_ref_on_node, variant_alt_on_node)
             is_true_variant = vcf_tuple_to_check in vcf_chr1_variants
@@ -253,6 +252,7 @@ def main():
                 "grch38_calculated_pos_1_based": genomic_variant_pos,
                 "ref_allele_from_pth_summary": variant_ref_on_node,
                 "alt_allele_from_pth_summary": variant_alt_on_node,
+                "allele_frequency": allele_frequency,  # Added allele frequency
                 "classification": "true" if is_true_variant else "false",
                 "vcf_match_key": str(vcf_tuple_to_check),
                 "found_in_vcf_chr1": is_true_variant
@@ -268,7 +268,6 @@ def main():
                 shutil.copy2(pth_file_full_path, os.path.join(false_folder, destination_filename))
                 pth_files_copied_false += 1
 
-        # Progress report after processing all variants for the current node directory
         if nodes_processed_for_report > 0 and nodes_processed_for_report % 100 == 0:
             print(f"\nProgress Report: After processing {nodes_processed_for_report} node directories.")
             print(f"  Total .pth files considered (from summaries): {total_pth_files_processed_from_summaries}")

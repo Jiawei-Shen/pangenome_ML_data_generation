@@ -155,7 +155,7 @@ def run_bcftools_region_extract(bcftools_path, vcf_filepath, chromosome, start_1
 # ─────────────────────────────────────────────────────────────────────────────
 # Main processing function
 # ─────────────────────────────────────────────────────────────────────────────
-def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepath, vcf_file=None):
+def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepath, vcf_file=None, txt_output_path=None):
     bcftools_path = None
     if vcf_file:
         bcftools_path = shutil.which("bcftools")
@@ -175,6 +175,23 @@ def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepat
         print("Warning: Node IDs were extracted from JSON, but node map creation failed. Check JSON integrity.",
               file=sys.stderr)
 
+    # --- Added section for writing node IDs to TXT file ---
+    if txt_output_path:
+        if target_node_ids_from_json:
+            print(f"\nStep 1.5: Writing all {len(target_node_ids_from_json)} node IDs from JSON to {txt_output_path}...")
+            try:
+                with open(txt_output_path, 'w') as f_txt:
+                    for node_id in sorted(list(target_node_ids_from_json)): # Sort for consistent output
+                        f_txt.write(f"{node_id}\n")
+                print(f"Successfully wrote node IDs to {txt_output_path}")
+            except IOError as e:
+                print(f"Error: Could not write node IDs to TXT file {txt_output_path}. Details: {e}", file=sys.stderr)
+            except Exception as e:
+                print(f"An unexpected error occurred while writing node IDs to TXT file {txt_output_path}: {e}", file=sys.stderr)
+        else:
+            print(f"\nStep 1.5: No node IDs found in the JSON to write to {txt_output_path}.")
+    # --- End of added section ---
+
     chromosome_for_vcf = None
     if vcf_file and bcftools_path:
         path_pattern = main_json_structure.get("path_name_input_pattern")
@@ -185,7 +202,7 @@ def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepat
             print(
                 "Attempting to use 'chr1' as a fallback chromosome for VCF queries. This may not be correct for your data.",
                 file=sys.stderr)
-            chromosome_for_vcf = "chr1"
+            chromosome_for_vcf = "chr1" # Fallback
         else:
             print(f"Extracted chromosome '{chromosome_for_vcf}' for VCF queries.")
 
@@ -295,17 +312,21 @@ def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepat
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="Filter 'nodes' list in a JSON object based on IDX file and optionally query VCF for each filtered node.")
+        description="Filter 'nodes' list in a JSON object based on IDX file and optionally query VCF for each filtered node. Can also output all node IDs from input JSON to a text file.")
     parser.add_argument("json_path", help="Path to the input JSON file (object with a 'nodes' list).")
     parser.add_argument("idx_path", help="Path to the .idx file.")
     parser.add_argument("output_json_path", help="Path to the output JSON file for the modified JSON object.")
     parser.add_argument("--vcf_file",
                         help="Optional: Path to a bgzipped and tabix-indexed VCF file to query with bcftools for each filtered node.",
                         default=None)
+    parser.add_argument("--txt",
+                        dest="txt_output_path",
+                        help="Optional: Path to a .txt file to output all node IDs found in the input JSON (one ID per line).",
+                        default=None)
 
     args = parser.parse_args()
 
-    filter_json_nodes_and_write(args.json_path, args.idx_path, args.output_json_path, args.vcf_file)
+    filter_json_nodes_and_write(args.json_path, args.idx_path, args.output_json_path, args.vcf_file, args.txt_output_path)
 
 
 if __name__ == "__main__":
