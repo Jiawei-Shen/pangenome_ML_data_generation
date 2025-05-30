@@ -75,12 +75,11 @@ def load_json_data_ids_and_map(json_filepath):
                 print(
                     f"Warning: 'nodes' key not found or not a list in {json_filepath}. No nodes to process from JSON.",
                     file=sys.stderr)
-                # Return main_json_data as it might have other useful top-level info, but no nodes.
                 return main_json_data, set(), {}
 
             for item_index, item in enumerate(node_list_from_json):
                 if not isinstance(item, dict):
-                    continue  # Skip non-dict items in the nodes list
+                    continue
                 try:
                     node_id_str = item.get("node_id")
                     if node_id_str is None:
@@ -90,7 +89,7 @@ def load_json_data_ids_and_map(json_filepath):
                         continue
                     node_id_int = int(node_id_str)
                     node_ids_set.add(node_id_int)
-                    json_nodes_map[node_id_int] = item  # Map the original item
+                    json_nodes_map[node_id_int] = item
                 except (ValueError, TypeError) as e:
                     print(
                         f"Warning: Could not convert node_id '{node_id_str}' to int or item format error for item {item_index} in 'nodes' list (JSON). Error: {e}. Skipping.",
@@ -171,26 +170,9 @@ def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepat
     if main_json_structure is None:
         print("Could not load main JSON structure. Cannot proceed.")
         return
-    if not json_nodes_map and target_node_ids_from_json:  # IDs were found but mapping failed (should not happen if IDs found)
+    if not json_nodes_map and target_node_ids_from_json:
         print("Warning: Node IDs were extracted from JSON, but node map creation failed. Check JSON integrity.",
               file=sys.stderr)
-
-    # --- Added section for writing node IDs to TXT file ---
-    if txt_output_path:
-        if target_node_ids_from_json:
-            print(f"\nStep 1.5: Writing all {len(target_node_ids_from_json)} node IDs from JSON to {txt_output_path}...")
-            try:
-                with open(txt_output_path, 'w') as f_txt:
-                    for node_id in sorted(list(target_node_ids_from_json)): # Sort for consistent output
-                        f_txt.write(f"{node_id}\n")
-                print(f"Successfully wrote node IDs to {txt_output_path}")
-            except IOError as e:
-                print(f"Error: Could not write node IDs to TXT file {txt_output_path}. Details: {e}", file=sys.stderr)
-            except Exception as e:
-                print(f"An unexpected error occurred while writing node IDs to TXT file {txt_output_path}: {e}", file=sys.stderr)
-        else:
-            print(f"\nStep 1.5: No node IDs found in the JSON to write to {txt_output_path}.")
-    # --- End of added section ---
 
     chromosome_for_vcf = None
     if vcf_file and bcftools_path:
@@ -199,10 +181,9 @@ def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepat
         if not chromosome_for_vcf:
             print(f"Warning: Could not extract chromosome from 'path_name_input_pattern': '{path_pattern}'.",
                   file=sys.stderr)
-            print(
-                "Attempting to use 'chr1' as a fallback chromosome for VCF queries. This may not be correct for your data.",
-                file=sys.stderr)
-            chromosome_for_vcf = "chr1" # Fallback
+            print("Attempting to use 'chr1' as a fallback chromosome for VCF queries. This may not be correct for your data.",
+                  file=sys.stderr)
+            chromosome_for_vcf = "chr1"
         else:
             print(f"Extracted chromosome '{chromosome_for_vcf}' for VCF queries.")
 
@@ -211,34 +192,57 @@ def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepat
     available_idx_node_ids = set(idx_data.keys())
     print(f"Found {len(available_idx_node_ids)} unique node IDs in {idx_filepath}")
 
-    print("\nStep 3: Identifying common node IDs...")
+    print("\nStep 3: Identifying common node IDs (filtered nodes)...")
     common_node_ids_int = set()
     if target_node_ids_from_json and available_idx_node_ids:
         common_node_ids_int = target_node_ids_from_json.intersection(available_idx_node_ids)
 
     num_common_nodes = len(common_node_ids_int)
     if num_common_nodes == 0:
-        print("No common node IDs found between JSON and IDX. Output 'nodes' list will be empty.")
+        print("No common node IDs found between JSON and IDX. Output 'nodes' list will be empty, and TXT output (if requested) will be empty.")
     else:
-        print(f"Found {num_common_nodes} common node ID(s). These will be processed for the output JSON.")
+        print(f"Found {num_common_nodes} common (filtered) node ID(s). These will be processed for the output JSON.")
 
-    output_json_structure = copy.deepcopy(main_json_structure)  # Preserve top-level keys
+    # --- Moved and modified section for writing FILTERED node IDs to TXT file ---
+    if txt_output_path:
+        if common_node_ids_int:
+            print(f"\nStep 3.5: Writing {len(common_node_ids_int)} filtered node IDs to {txt_output_path}...")
+            try:
+                with open(txt_output_path, 'w') as f_txt:
+                    for node_id in sorted(list(common_node_ids_int)): # Sort for consistent output
+                        f_txt.write(f"{node_id}\n")
+                print(f"Successfully wrote filtered node IDs to {txt_output_path}")
+            except IOError as e:
+                print(f"Error: Could not write filtered node IDs to TXT file {txt_output_path}. Details: {e}", file=sys.stderr)
+            except Exception as e:
+                print(f"An unexpected error occurred while writing filtered node IDs to TXT file {txt_output_path}: {e}", file=sys.stderr)
+        else:
+            print(f"\nStep 3.5: No filtered node IDs to write to {txt_output_path} (file will be empty or not created if it doesn't exist).")
+            # Optionally, create an empty file if that's desired behavior for no filtered nodes
+            try:
+                with open(txt_output_path, 'w') as f_txt: # Creates or truncates the file
+                    pass # Ensure an empty file is created if path is given but no common nodes
+                print(f"Created empty TXT file at {txt_output_path} as no filtered nodes were found.")
+            except IOError as e:
+                 print(f"Error: Could not create/truncate TXT file {txt_output_path}. Details: {e}", file=sys.stderr)
+
+    # --- End of moved and modified section ---
+
+    output_json_structure = copy.deepcopy(main_json_structure)
     filtered_nodes_list_in_json = []
     nodes_queried_with_bcftools_count = 0
 
-    if num_common_nodes > 0:
-        print(f"\nProcessing {num_common_nodes} common nodes for inclusion in output and potential VCF query...")
-        # Sort common IDs for consistent output order, if desired
+    if num_common_nodes > 0: # This check is now equivalent to 'if common_node_ids_int:'
+        print(f"\nStep 4: Processing {num_common_nodes} common nodes for inclusion in output and potential VCF query...")
         sorted_common_ids = sorted(list(common_node_ids_int))
 
         for node_id_int in sorted_common_ids:
             original_node_item = json_nodes_map.get(node_id_int)
             if not original_node_item:
-                # This should ideally not happen if common_node_ids_int was derived from json_nodes_map's keys
                 print(f"Warning: Common node ID {node_id_int} not found in JSON node map. Skipping.", file=sys.stderr)
                 continue
 
-            current_node_copy = copy.deepcopy(original_node_item)  # Work with a copy
+            current_node_copy = copy.deepcopy(original_node_item)
 
             if vcf_file and bcftools_path and chromosome_for_vcf:
                 try:
@@ -278,13 +282,12 @@ def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepat
 
             filtered_nodes_list_in_json.append(current_node_copy)
 
-    output_json_structure["nodes"] = filtered_nodes_list_in_json  # Replace "nodes" list
+    output_json_structure["nodes"] = filtered_nodes_list_in_json
     print(
-        f"\nStep 4: Writing final JSON structure (with {len(filtered_nodes_list_in_json)} nodes in 'nodes' list) to {output_json_filepath}...")
+        f"\nStep 5: Writing final JSON structure (with {len(filtered_nodes_list_in_json)} nodes in 'nodes' list) to {output_json_filepath}...")
 
     if vcf_file:
         if bcftools_path:
-            # Print final progress update if the last chunk was < 100
             if nodes_queried_with_bcftools_count > 0 and nodes_queried_with_bcftools_count % 100 != 0:
                 print(f"    ... completed all {nodes_queried_with_bcftools_count} VCF queries for common nodes.",
                       file=sys.stderr)
@@ -292,10 +295,8 @@ def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepat
                 print(
                     f"    ... no VCF queries were performed (possibly due to missing fields or zero length for all {num_common_nodes} common nodes).",
                     file=sys.stderr)
-
             print(
                 f"Completed: Attempted VCF queries with bcftools for {nodes_queried_with_bcftools_count} filtered and eligible node(s).")
-        # else: warning already printed if bcftools not found
 
     try:
         with open(output_json_filepath, 'w') as f_out_json:
@@ -312,7 +313,7 @@ def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepat
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="Filter 'nodes' list in a JSON object based on IDX file and optionally query VCF for each filtered node. Can also output all node IDs from input JSON to a text file.")
+        description="Filter 'nodes' list in a JSON object based on IDX file and optionally query VCF for each filtered node. Can also output filtered node IDs to a text file.") # Updated description
     parser.add_argument("json_path", help="Path to the input JSON file (object with a 'nodes' list).")
     parser.add_argument("idx_path", help="Path to the .idx file.")
     parser.add_argument("output_json_path", help="Path to the output JSON file for the modified JSON object.")
@@ -321,7 +322,7 @@ def main():
                         default=None)
     parser.add_argument("--txt",
                         dest="txt_output_path",
-                        help="Optional: Path to a .txt file to output all node IDs found in the input JSON (one ID per line).",
+                        help="Optional: Path to a .txt file to output the filtered node IDs (IDs common to JSON and IDX) (one ID per line).", # Updated help text
                         default=None)
 
     args = parser.parse_args()
