@@ -9,7 +9,7 @@ import numpy as np
 from collections import defaultdict
 import re
 from concurrent.futures import ProcessPoolExecutor
-import torch  # Added for tensor operations
+import torch  # Still needed for tensor creation before converting to NumPy
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -247,7 +247,7 @@ def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
     current_read_pos_in_read = 0
     for cigar_len, cigar_op in segment_cigar_ops:
         if current_node_pos_in_read >= window_start_node + current_tensor_window_size and cigar_op in (
-        'M', 'D', 'N', '=', 'X'):
+                'M', 'D', 'N', '=', 'X'):
             break
         if current_read_pos_in_read >= len(segment_read_sequence):
             break
@@ -310,10 +310,9 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
         return node_id, None
 
     if not node_sequence:
-        # It's possible to have a node with reads but no sequence if GFA loading failed but processing was forced
         sys.stderr.write(
             f"ℹ️ [Worker {os.getpid()}]: No sequence provided for node {node_id}. Skipping tensor/summary generation.\n")
-        return node_id, {}  # Return empty dict for view_data if no sequence
+        return node_id, {}
 
     node_specific_output_dir = os.path.join(worker_base_output_dir, str(node_id))
     try:
@@ -341,10 +340,8 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
                 cigar_str_original = raw_cigar.rstrip(b'\x00').decode('ascii', errors='replace')
                 strand_char = strand_byte.decode('ascii')
             except UnicodeDecodeError:
-                # sys.stderr.write(f"⚠️ Warning [Worker {os.getpid()}]: Unicode decode error for a read on node {node_id}. Skipping.\n")
                 continue
-            if len(seq) == 0 or len(seq) != len(qual_str):  # Ensure non-empty and matching lengths
-                # sys.stderr.write(f"⚠️ Warning [Worker {os.getpid()}]: Mismatch length seq vs qual or empty seq for a read on node {node_id}. Skipping read.\n")
+            if len(seq) == 0 or len(seq) != len(qual_str):
                 continue
 
             original_decoded_cigar_ops = decode_cigar_to_int_ops(cigar_str_original)
@@ -357,14 +354,11 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
                 current_read_sequence = reverse_complement(seq)
                 current_quality_str = qual_str[::-1]
                 current_decoded_cigar_ops.reverse()
-                alignment_span_on_node = len(current_read_sequence)  # User-confirmed fix
-                if alignment_span_on_node > 0:  # Should always be true if len(seq)>0
+                alignment_span_on_node = len(current_read_sequence)
+                if alignment_span_on_node > 0:
                     current_offset_on_node = node_len - alignment_span_on_node - off_from_file
                     if current_offset_on_node < 0:
-                        # sys.stderr.write(f"⚠️ Warning [Worker {os.getpid()}]: Negative offset for node {node_id}, strand '-', off {off_from_file}, span {alignment_span_on_node}. Skipping.\n")
                         continue
-                        # The conditional -1 based on off_from_file !=0 was discussed previously.
-                # Sticking to the script version confirmed by the user in the last "Remember this new script" prompt.
 
             aligned_read_segments.append({
                 "offset_on_node": current_offset_on_node,
@@ -457,8 +451,8 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
         window_start_on_node_tensor = window_start_on_node_view
 
         ref_base_indices_row = [PADDING_BASE_INDEX] * TENSOR_WINDOW_SIZE
-        ref_qual_scores_row = [DEFAULT_QUALITY_PADDING] * TENSOR_WINDOW_SIZE  # CH2 Ref Quals
-        ref_mismatch_row = [MISMATCH_CHANNEL_REF_ROW_VALUE] * TENSOR_WINDOW_SIZE  # CH3 Ref Mismatches
+        ref_qual_scores_row = [DEFAULT_QUALITY_PADDING] * TENSOR_WINDOW_SIZE
+        ref_mismatch_row = [MISMATCH_CHANNEL_REF_ROW_VALUE] * TENSOR_WINDOW_SIZE
         for i in range(TENSOR_WINDOW_SIZE):
             actual_node_pos = window_start_on_node_tensor + i
             if 0 <= actual_node_pos < node_len:
@@ -499,21 +493,26 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
             tensor_ch3_mismatches_list.append([MISMATCH_COMPARISON_PADDING_VALUE] * TENSOR_WINDOW_SIZE)
 
         try:
-            # Ensure all sublists have the same length for tensor conversion
-            # This should be guaranteed by TENSOR_WINDOW_SIZE initialization
-            final_tensor = torch.tensor([
+            # Create PyTorch tensor first as before
+            pytorch_tensor = torch.tensor([
                 tensor_ch1_bases_list,
                 tensor_ch2_qualities_list,
                 tensor_ch3_mismatches_list
             ], dtype=torch.int8)
 
-            tensor_filename = f"{variant_key_str}.pth"
+            # Convert PyTorch tensor to NumPy array
+            numpy_array = pytorch_tensor.numpy()
+
+            # Change filename extension to .npy
+            tensor_filename = f"{variant_key_str}.npy"
             tensor_filepath = os.path.join(node_specific_output_dir, tensor_filename)
-            torch.save(final_tensor, tensor_filepath)
+
+            # Save as .npy file
+            np.save(tensor_filepath, numpy_array)
 
             variant_headers_for_node.append({
                 "variant_key": variant_key_str,
-                "tensor_file": tensor_filename,
+                "tensor_file": tensor_filename,  # Reflects the .npy extension
                 "alt_allele_count": af_alt_count,
                 "ref_allele_count_at_locus": af_ref_count,
                 "other_allele_count_at_locus": af_other_count,
@@ -531,14 +530,11 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
                 json.dump({
                     "node_id": node_id,
                     "node_length": node_len,
-                    "node_sequence": node_sequence,  # Added node sequence
+                    "node_sequence": node_sequence,
                     "variants": variant_headers_for_node
                 }, sjf, indent=2)
         except Exception as e:
             sys.stderr.write(f"❌ Error [Worker {os.getpid()}]: Failed to write summary JSON for node {node_id}: {e}\n")
-            # If summary fails, we might still have .pth files.
-            # Decide if view_oriented_variant_data should be cleared or returned partially.
-            # For now, if summary fails, we still return view_data if it was populated.
 
     return node_id, view_oriented_variant_data
 
@@ -759,7 +755,7 @@ def main():
             if args.view < -1: print("⚠️ Warning: Invalid number for --view. Showing all.", file=sys.stderr)
             view_msg = f"all variants (max {args.max_view_reads} reads/variant)..."
             if max_v_show != float(
-                'inf'): view_msg = f"first {int(max_v_show)} variants (max {args.max_view_reads} reads/variant)..."
+                    'inf'): view_msg = f"first {int(max_v_show)} variants (max {args.max_view_reads} reads/variant)..."
             print(f"🔹 Displaying pileups for node {target_node_id}: {view_msg}")
             display_pileup_data(view_data_for_node, str(target_node_id),
                                 node_sequence, args.max_view_reads, max_v_show)
@@ -774,7 +770,7 @@ def main():
     elif processed_node_id_result is not None and view_data_for_node is not None and not view_data_for_node:
         print(f"ℹ️ No variants met AF threshold for node {target_node_id}. No tensors or summary file generated.")
     elif processed_node_id_result is not None and view_data_for_node is None:
-        pass
+        pass  # Error message already printed from worker result check
     else:
         print(f"ℹ️ No output summary found for node {target_node_id}. Check logs for errors.")
 

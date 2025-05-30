@@ -186,9 +186,9 @@ if __name__ == '__main__':
         help="The exact grep pattern (Perl-compatible, PCRE) to find the desired W or P line.\n"
              "The script will run 'grep -P -m 1 \"YOUR_PATTERN\" GFA_FILE'.\n"
              "Example to find a specific W-line (ensure your shell passes tabs correctly, e.g., using $'...'):\n"
-             "  $'^W\\tGRCh38\\t0\\tchr1\\t'\n"
+             "  '^W\tGRCh38\t0\tchr1'\n"
              "Example for a P-line:\n"
-             "  $'^P\\tmyPathName\\t'"
+             "  '^P\tmyPathName'"
     )
     parser.add_argument(
         "--output_file", "-o",
