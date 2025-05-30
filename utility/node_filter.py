@@ -87,7 +87,7 @@ def load_json_data_ids_and_map(json_filepath):
                             f"Warning: Item at index {item_index} in 'nodes' list (JSON) is missing 'node_id'. Skipping.",
                             file=sys.stderr)
                         continue
-                    node_id_int = int(node_id_str)
+                    node_id_int = int(node_id_str)  # Assuming node_id is string convertible to int
                     node_ids_set.add(node_id_int)
                     json_nodes_map[node_id_int] = item
                 except (ValueError, TypeError) as e:
@@ -159,8 +159,9 @@ def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepat
     if vcf_file:
         bcftools_path = shutil.which("bcftools")
         if not bcftools_path:
-            print("Warning: --vcf_file provided, but bcftools command not found in PATH. VCF queries will be skipped.",
-                  file=sys.stderr)
+            print(
+                "Warning: --vcf_file provided, but bcftools command not found in PATH. VCF queries will be skipped, and VCF-based filtering will not apply.",
+                file=sys.stderr)
         else:
             print(f"Using bcftools found at: {bcftools_path}")
 
@@ -175,14 +176,15 @@ def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepat
               file=sys.stderr)
 
     chromosome_for_vcf = None
-    if vcf_file and bcftools_path:
+    if vcf_file and bcftools_path:  # Only try to extract chromosome if bcftools is available
         path_pattern = main_json_structure.get("path_name_input_pattern")
         chromosome_for_vcf = extract_chromosome_from_path_pattern(path_pattern)
         if not chromosome_for_vcf:
             print(f"Warning: Could not extract chromosome from 'path_name_input_pattern': '{path_pattern}'.",
                   file=sys.stderr)
-            print("Attempting to use 'chr1' as a fallback chromosome for VCF queries. This may not be correct for your data.",
-                  file=sys.stderr)
+            print(
+                "Attempting to use 'chr1' as a fallback chromosome for VCF queries. This may not be correct for your data.",
+                file=sys.stderr)
             chromosome_for_vcf = "chr1"
         else:
             print(f"Extracted chromosome '{chromosome_for_vcf}' for VCF queries.")
@@ -192,57 +194,35 @@ def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepat
     available_idx_node_ids = set(idx_data.keys())
     print(f"Found {len(available_idx_node_ids)} unique node IDs in {idx_filepath}")
 
-    print("\nStep 3: Identifying common node IDs (filtered nodes)...")
+    print("\nStep 3: Identifying common node IDs (initial filter)...")
     common_node_ids_int = set()
     if target_node_ids_from_json and available_idx_node_ids:
         common_node_ids_int = target_node_ids_from_json.intersection(available_idx_node_ids)
 
-    num_common_nodes = len(common_node_ids_int)
-    if num_common_nodes == 0:
-        print("No common node IDs found between JSON and IDX. Output 'nodes' list will be empty, and TXT output (if requested) will be empty.")
+    num_initial_common_nodes = len(common_node_ids_int)
+    if num_initial_common_nodes == 0:
+        print("No common node IDs found between JSON and IDX. Output 'nodes' list will be empty.")
     else:
-        print(f"Found {num_common_nodes} common (filtered) node ID(s). These will be processed for the output JSON.")
+        print(f"Found {num_initial_common_nodes} common node ID(s) between JSON and IDX.")
 
-    # --- Moved and modified section for writing FILTERED node IDs to TXT file ---
-    if txt_output_path:
-        if common_node_ids_int:
-            print(f"\nStep 3.5: Writing {len(common_node_ids_int)} filtered node IDs to {txt_output_path}...")
-            try:
-                with open(txt_output_path, 'w') as f_txt:
-                    for node_id in sorted(list(common_node_ids_int)): # Sort for consistent output
-                        f_txt.write(f"{node_id}\n")
-                print(f"Successfully wrote filtered node IDs to {txt_output_path}")
-            except IOError as e:
-                print(f"Error: Could not write filtered node IDs to TXT file {txt_output_path}. Details: {e}", file=sys.stderr)
-            except Exception as e:
-                print(f"An unexpected error occurred while writing filtered node IDs to TXT file {txt_output_path}: {e}", file=sys.stderr)
-        else:
-            print(f"\nStep 3.5: No filtered node IDs to write to {txt_output_path} (file will be empty or not created if it doesn't exist).")
-            # Optionally, create an empty file if that's desired behavior for no filtered nodes
-            try:
-                with open(txt_output_path, 'w') as f_txt: # Creates or truncates the file
-                    pass # Ensure an empty file is created if path is given but no common nodes
-                print(f"Created empty TXT file at {txt_output_path} as no filtered nodes were found.")
-            except IOError as e:
-                 print(f"Error: Could not create/truncate TXT file {txt_output_path}. Details: {e}", file=sys.stderr)
+    # This list will hold the nodes that pass all filters, including VCF prerequisites if applicable
+    ultimate_filtered_nodes_list = []
+    nodes_actually_queried_with_bcftools = 0
 
-    # --- End of moved and modified section ---
-
-    output_json_structure = copy.deepcopy(main_json_structure)
-    filtered_nodes_list_in_json = []
-    nodes_queried_with_bcftools_count = 0
-
-    if num_common_nodes > 0: # This check is now equivalent to 'if common_node_ids_int:'
-        print(f"\nStep 4: Processing {num_common_nodes} common nodes for inclusion in output and potential VCF query...")
-        sorted_common_ids = sorted(list(common_node_ids_int))
+    if num_initial_common_nodes > 0:
+        print(
+            f"\nStep 4: Processing {num_initial_common_nodes} common nodes for final filtering and VCF query (if applicable)...")
+        sorted_common_ids = sorted(list(common_node_ids_int))  # Integer IDs
 
         for node_id_int in sorted_common_ids:
             original_node_item = json_nodes_map.get(node_id_int)
             if not original_node_item:
-                print(f"Warning: Common node ID {node_id_int} not found in JSON node map. Skipping.", file=sys.stderr)
+                print(f"Warning: Common node ID {node_id_int} (integer) not found in JSON node map. Skipping.",
+                      file=sys.stderr)
                 continue
 
             current_node_copy = copy.deepcopy(original_node_item)
+            include_node_in_final_output = True  # Assume inclusion by default
 
             if vcf_file and bcftools_path and chromosome_for_vcf:
                 try:
@@ -250,54 +230,111 @@ def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepat
                     length_str = current_node_copy.get("length")
 
                     if start_0based_str is None or length_str is None:
-                        raise KeyError("grch38_position_start or length missing")
-
-                    start_0based = int(start_0based_str)
-                    length = int(length_str)
-
-                    if length <= 0:
-                        current_node_copy["vcf_query_results"] = []
+                        print(
+                            f"Info: Node ID {current_node_copy.get('node_id')} missing 'grch38_position_start' or 'length'. Excluding from VCF query and final output due to --vcf_file option.",
+                            file=sys.stderr)
+                        include_node_in_final_output = False
                     else:
-                        query_start_1based = start_0based + 1
-                        query_end_1based = start_0based + length
-                        vcf_results = run_bcftools_region_extract(bcftools_path, vcf_file, chromosome_for_vcf,
-                                                                  query_start_1based, query_end_1based)
-                        current_node_copy["vcf_query_results"] = vcf_results
-                        nodes_queried_with_bcftools_count += 1
+                        start_0based = int(start_0based_str)
+                        length = int(length_str)
 
-                        if nodes_queried_with_bcftools_count > 0 and nodes_queried_with_bcftools_count % 100 == 0:
+                        if length <= 0:
                             print(
-                                f"    ... {nodes_queried_with_bcftools_count} nodes queried with bcftools (out of {num_common_nodes} common nodes).",
+                                f"Info: Node ID {current_node_copy.get('node_id')} has non-positive length ({length}). Excluding from VCF query and final output due to --vcf_file option.",
                                 file=sys.stderr)
-                except KeyError as e:
-                    print(
-                        f"Warning: Node ID {node_id_int} missing required field ('{e}') for VCF query. Skipping VCF query.",
-                        file=sys.stderr)
-                    current_node_copy["vcf_query_results"] = []
-                except ValueError as e:
-                    print(
-                        f"Warning: Node ID {node_id_int} has invalid numeric value for position/length ({e}). Skipping VCF query.",
-                        file=sys.stderr)
-                    current_node_copy["vcf_query_results"] = []
+                            include_node_in_final_output = False
+                        else:
+                            # Node is eligible for VCF query
+                            query_start_1based = start_0based + 1
+                            query_end_1based = start_0based + length
+                            vcf_results = run_bcftools_region_extract(bcftools_path, vcf_file, chromosome_for_vcf,
+                                                                      query_start_1based, query_end_1based)
+                            current_node_copy["vcf_query_results"] = vcf_results
+                            nodes_actually_queried_with_bcftools += 1
 
-            filtered_nodes_list_in_json.append(current_node_copy)
+                            if nodes_actually_queried_with_bcftools > 0 and nodes_actually_queried_with_bcftools % 100 == 0:
+                                print(
+                                    f"    ... {nodes_actually_queried_with_bcftools} nodes queried with bcftools (out of {num_initial_common_nodes} initially common nodes).",
+                                    file=sys.stderr)
 
-    output_json_structure["nodes"] = filtered_nodes_list_in_json
-    print(
-        f"\nStep 5: Writing final JSON structure (with {len(filtered_nodes_list_in_json)} nodes in 'nodes' list) to {output_json_filepath}...")
+                except ValueError as e:  # Catches int conversion errors for start/length
+                    print(
+                        f"Info: Node ID {current_node_copy.get('node_id')} has invalid numeric value for position/length ('{e}'). Excluding from VCF query and final output due to --vcf_file option.",
+                        file=sys.stderr)
+                    include_node_in_final_output = False
+
+            if include_node_in_final_output:
+                ultimate_filtered_nodes_list.append(current_node_copy)
+
+    # Prepare the output JSON structure
+    output_json_structure = copy.deepcopy(main_json_structure)
+    output_json_structure["nodes"] = ultimate_filtered_nodes_list
+
+    num_ultimate_nodes = len(ultimate_filtered_nodes_list)
+    print(f"\nStep 5: Final processing complete. {num_ultimate_nodes} nodes will be in the output JSON.")
 
     if vcf_file:
         if bcftools_path:
-            if nodes_queried_with_bcftools_count > 0 and nodes_queried_with_bcftools_count % 100 != 0:
-                print(f"    ... completed all {nodes_queried_with_bcftools_count} VCF queries for common nodes.",
-                      file=sys.stderr)
-            elif nodes_queried_with_bcftools_count == 0 and num_common_nodes > 0:
-                print(
-                    f"    ... no VCF queries were performed (possibly due to missing fields or zero length for all {num_common_nodes} common nodes).",
-                    file=sys.stderr)
-            print(
-                f"Completed: Attempted VCF queries with bcftools for {nodes_queried_with_bcftools_count} filtered and eligible node(s).")
+            if nodes_actually_queried_with_bcftools > 0 and nodes_actually_queried_with_bcftools % 100 != 0:
+                print(f"    ... completed all {nodes_actually_queried_with_bcftools} VCF queries.", file=sys.stderr)
+            elif nodes_actually_queried_with_bcftools == 0 and num_initial_common_nodes > 0:
+                active_vcf_filtering_occurred = any("Excluding from VCF query and final output" in line for line in
+                                                    iter(lambda: sys.stderr.readline(),
+                                                         ''))  # Heuristic check if stderr had filtering messages
+                if num_ultimate_nodes < num_initial_common_nodes:  # Check if any nodes were actually filtered out by VCF criteria
+                    print(
+                        f"    ... no VCF queries were performed because all initially common nodes failed VCF prerequisite checks (e.g., missing fields, zero/negative length).",
+                        file=sys.stderr)
+                elif num_initial_common_nodes > 0:  # Common nodes existed, but none were eligible
+                    print(
+                        f"    ... no VCF queries were performed (potentially no nodes were eligible or all eligible nodes resulted in no bcftools calls).",
+                        file=sys.stderr)
 
+            print(
+                f"Completed: Attempted VCF queries with bcftools for {nodes_actually_queried_with_bcftools} node(s) that met prerequisites.")
+        # else: warning about bcftools not found was already printed
+
+    # --- Write the ultimate filtered node IDs to TXT file (if requested) ---
+    if txt_output_path:
+        print(f"\nStep 6: Writing {num_ultimate_nodes} ultimate filtered node ID(s) to {txt_output_path}...")
+        if ultimate_filtered_nodes_list:
+            try:
+                with open(txt_output_path, 'w') as f_txt:
+                    # node_id in ultimate_filtered_nodes_list items is the original string from JSON
+                    # Sort them numerically if they are numbers, otherwise lexicographically
+                    ids_to_write = [str(node.get("node_id")) for node in ultimate_filtered_nodes_list if
+                                    node.get("node_id") is not None]
+
+                    # Attempt to sort as integers, fallback to string sort if mixed/non-numeric
+                    try:
+                        sorted_ids = sorted(ids_to_write, key=int)
+                    except ValueError:
+                        print(f"Warning: Node IDs in TXT output are not all numeric, using lexicographical sort.",
+                              file=sys.stderr)
+                        sorted_ids = sorted(ids_to_write)
+
+                    for node_id_str in sorted_ids:
+                        f_txt.write(f"{node_id_str}\n")
+                print(f"Successfully wrote ultimate filtered node IDs to {txt_output_path}")
+            except IOError as e:
+                print(f"Error: Could not write ultimate filtered node IDs to TXT file {txt_output_path}. Details: {e}",
+                      file=sys.stderr)
+            except Exception as e:
+                print(
+                    f"An unexpected error occurred while writing ultimate filtered node IDs to TXT file {txt_output_path}: {e}",
+                    file=sys.stderr)
+        else:
+            print(f"No ultimate filtered node IDs to write to {txt_output_path}.")
+            try:
+                with open(txt_output_path, 'w') as f_txt:  # Create empty file
+                    pass
+                print(f"Created empty TXT file at {txt_output_path} as no ultimate filtered nodes were found.")
+            except IOError as e:
+                print(f"Error: Could not create/truncate TXT file {txt_output_path}. Details: {e}", file=sys.stderr)
+
+    # --- Write the final JSON output ---
+    print(
+        f"\nStep 7: Writing final JSON structure (with {num_ultimate_nodes} nodes in 'nodes' list) to {output_json_filepath}...")
     try:
         with open(output_json_filepath, 'w') as f_out_json:
             json.dump(output_json_structure, f_out_json, indent=4)
@@ -313,21 +350,22 @@ def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepat
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="Filter 'nodes' list in a JSON object based on IDX file and optionally query VCF for each filtered node. Can also output filtered node IDs to a text file.") # Updated description
+        description="Filter 'nodes' list in a JSON object based on IDX file. Optionally query VCF and further filter based on VCF prerequisites if --vcf_file is used. Can output 'ultimate filtered' node IDs to a text file.")
     parser.add_argument("json_path", help="Path to the input JSON file (object with a 'nodes' list).")
     parser.add_argument("idx_path", help="Path to the .idx file.")
     parser.add_argument("output_json_path", help="Path to the output JSON file for the modified JSON object.")
     parser.add_argument("--vcf_file",
-                        help="Optional: Path to a bgzipped and tabix-indexed VCF file to query with bcftools for each filtered node.",
+                        help="Optional: Path to a bgzipped and tabix-indexed VCF file. If provided, nodes are also filtered based on VCF prerequisites (must have valid coordinates and length > 0) and queried.",
                         default=None)
     parser.add_argument("--txt",
                         dest="txt_output_path",
-                        help="Optional: Path to a .txt file to output the filtered node IDs (IDs common to JSON and IDX) (one ID per line).", # Updated help text
+                        help="Optional: Path to a .txt file to output the 'ultimate filtered' node IDs (one ID per line). These are IDs present in the final output JSON's 'nodes' list.",
                         default=None)
 
     args = parser.parse_args()
 
-    filter_json_nodes_and_write(args.json_path, args.idx_path, args.output_json_path, args.vcf_file, args.txt_output_path)
+    filter_json_nodes_and_write(args.json_path, args.idx_path, args.output_json_path, args.vcf_file,
+                                args.txt_output_path)
 
 
 if __name__ == "__main__":
