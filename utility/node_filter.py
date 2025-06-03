@@ -5,6 +5,7 @@ import argparse
 import sys
 import copy
 import subprocess
+import time
 import shutil  # For checking bcftools availability
 import re  # For extracting chromosome name
 
