@@ -16,7 +16,7 @@ import torch
 RECORD_STRUCT = struct.Struct("<h150s150s20shc")
 RECORD_SIZE = RECORD_STRUCT.size
 BASE_TO_INDEX = {'A': 0, 'C': 1, 'G': 2, 'T': 3, 'N': 4, '*': 5, ' ': 6, '-': 6}
-INDEX_TO_BASE_FOR_VIEW = {0: 'A', 1: 'C', 2: 'G', 3: 'T': 4: 'N', 5: '*', 6: ' '}
+INDEX_TO_BASE_FOR_VIEW = {0: 'A', 1: 'C', 2: 'G', 3: 'T', 4: 'N', 5: '*', 6: ' '}
 TENSOR_WINDOW_SIZE = 100
 TENSOR_MAX_READ_ROWS = 200
 PADDING_BASE_INDEX = BASE_TO_INDEX[' ']
