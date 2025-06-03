@@ -4,8 +4,8 @@ import struct
 import argparse
 import sys
 import copy
-import subprocess
 import time
+import subprocess
 import shutil  # For checking bcftools availability
 import re  # For extracting chromosome name
 
@@ -26,17 +26,17 @@ def load_index(idx_path):
             for i in range(blocks_num):
                 header_data = f.read(4 + 8 + 4 + 4 + 2)
                 if len(header_data) < (4 + 8 + 4 + 4 + 2):
-                    print(
-                        f"Warning: Truncated block header in {idx_path} at block index {i}. Reached end of file unexpectedly.",
-                        file=sys.stderr)
+                    # print( # Commented out for less verbosity
+                    #     f"Warning: Truncated block header in {idx_path} at block index {i}. Reached end of file unexpectedly.",
+                    #     file=sys.stderr)
                     break
                 block_id, block_start, block_size, n_records, metadata_len = struct.unpack("<I Q I I H", header_data)
                 if metadata_len > 0:
                     skipped_bytes = f.read(metadata_len)
                     if len(skipped_bytes) < metadata_len:
-                        print(
-                            f"Warning: Truncated metadata in {idx_path} for block_id {block_id}. Reached end of file unexpectedly.",
-                            file=sys.stderr)
+                        # print( # Commented out for less verbosity
+                        #     f"Warning: Truncated metadata in {idx_path} for block_id {block_id}. Reached end of file unexpectedly.",
+                        #     file=sys.stderr)
                         break
                 node_index[block_id] = {"start": block_start, "size": block_size, "n_records": n_records}
     except FileNotFoundError:
@@ -66,6 +66,7 @@ def load_json_data_ids_and_map(json_filepath):
                 return None, set(), {}
             node_list_from_json = main_json_data.get("nodes")
             if not isinstance(node_list_from_json, list):
+                # This warning is important if "nodes" is expected but missing/wrong type
                 print(f"Warning: 'nodes' key not found or not a list in {json_filepath}.", file=sys.stderr)
                 return main_json_data, set(), {}
             for item_index, item in enumerate(node_list_from_json):
@@ -73,17 +74,15 @@ def load_json_data_ids_and_map(json_filepath):
                 try:
                     node_id_str = item.get("node_id")
                     if node_id_str is None:
-                        # print(f"Warning: Item at index {item_index} in 'nodes' (JSON) missing 'node_id'. Skipping.", file=sys.stderr) # Can be too verbose
-                        continue
+                        continue  # Silently skip items missing node_id for less verbosity
                     node_id_int = int(node_id_str)
                     node_ids_set.add(node_id_int)
                     json_nodes_map[node_id_int] = item
                 except (ValueError, TypeError) as e:
+                    # This warning can be important for malformed node_ids
                     print(
                         f"Warning: Node ID format error for item {item_index} in 'nodes' (JSON): '{node_id_str}'. Error: {e}. Skipping.",
                         file=sys.stderr)
-            # This print is a good summary after loading
-            # print(f"Read JSON {json_filepath}: {len(node_list_from_json)} items in 'nodes' list, {len(node_ids_set)} unique IDs, {len(json_nodes_map)} mapped nodes.")
             return main_json_data, node_ids_set, json_nodes_map
     except FileNotFoundError:
         print(f"Error: JSON file not found: {json_filepath}", file=sys.stderr)
@@ -114,11 +113,11 @@ def extract_chromosome_from_path_pattern(path_pattern):
 def run_bcftools_region_extract(bcftools_path, vcf_filepath, chromosome, start_1based, end_1based):
     results = []
     region = f"{chromosome}:{start_1based}-{end_1based}"
-    command = [bcftools_path, 'view', '-H', '-r', region, vcf_filepath]  # -H added
+    command = [bcftools_path, 'view', '-H', '-r', region, vcf_filepath]
     try:
         process = subprocess.run(command, capture_output=True, text=True, check=False)
         if process.stdout:
-            for line in process.stdout.splitlines():  # No need to check for '#'
+            for line in process.stdout.splitlines():
                 results.append(line)
 
         if process.returncode != 0:
@@ -127,12 +126,11 @@ def run_bcftools_region_extract(bcftools_path, vcf_filepath, chromosome, start_1
                 error_keywords = ["failed", "error", "could not", "non-existent", "unable to open"]
                 is_actual_error = any(keyword in stderr_output.lower() for keyword in error_keywords)
                 is_no_match_message = "no lines matching" in stderr_output.lower()
-
-                # Report error unless it's *only* a "no lines matching" message for an empty region
-                if is_actual_error or (is_no_match_message and results):  # If "no lines" but got results, it's weird
-                    print(f"Error/Warning from 'bcftools view -H' for region {region}: {stderr_output}",
-                          file=sys.stderr)
-                # If it's "no lines matching" and results is empty, that's expected for an empty region, so no error print.
+                if is_actual_error or (is_no_match_message and results):
+                    # Still print actual errors from bcftools, but not the "no lines matching" if results is empty
+                    if not (is_no_match_message and not results):
+                        print(f"Error/Warning from 'bcftools view -H' for region {region}: {stderr_output}",
+                              file=sys.stderr)
     except FileNotFoundError:
         print(f"Error: bcftools command not found at '{bcftools_path}'. VCF operations will fail.", file=sys.stderr)
         return []
@@ -187,14 +185,11 @@ def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepat
         print(f"Found {num_initial_common_nodes} common node IDs between JSON and IDX for potential processing.")
 
     ultimate_filtered_nodes_list = []
-
-    # Counters for overall summary
     total_nodes_queried_with_bcftools = 0
     total_nodes_filtered_out_by_vcf_prereq = 0
     total_nodes_filtered_out_by_empty_vcf = 0
     total_nodes_kept_with_vcf_results = 0
 
-    # Counters for batch reporting in Step 4
     batch_node_counter_step4 = 0
     batch_queried_for_vcf_step4 = 0
     batch_kept_with_vcf_results_step4 = 0
@@ -207,7 +202,7 @@ def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepat
 
         for node_idx_step4, node_id_int in enumerate(sorted_common_ids):
             original_node_item = json_nodes_map.get(node_id_int)
-            if not original_node_item:  # Should not happen if common_node_ids_int is derived correctly
+            if not original_node_item:
                 sys.stderr.write(f"Internal Warning: Common node ID {node_id_int} not in JSON map. Skipping.\n")
                 continue
 
@@ -217,14 +212,13 @@ def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepat
             node_had_vcf_results = False
 
             if vcf_file and bcftools_path and chromosome_for_vcf:
-                node_was_eligible_for_vcf_query = True  # Assume eligible initially
+                node_was_eligible_for_vcf_query = True
                 try:
                     start_0based_str = current_node_copy.get("grch38_position_start")
                     length_str = current_node_copy.get("length")
 
                     if start_0based_str is None or length_str is None:
-                        sys.stderr.write(
-                            f"Info: Node ID {current_node_copy.get('node_id')} missing coordinate/length. Excluding from VCF query and final output.\n")
+                        # sys.stderr.write(f"Info: Node ID {current_node_copy.get('node_id')} missing coordinate/length. Excluding from VCF query and final output.\n") # REMOVED
                         include_node_in_final_output = False
                         node_was_eligible_for_vcf_query = False
                         total_nodes_filtered_out_by_vcf_prereq += 1
@@ -232,13 +226,11 @@ def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepat
                         start_0based = int(start_0based_str)
                         length = int(length_str)
                         if length <= 0:
-                            sys.stderr.write(
-                                f"Info: Node ID {current_node_copy.get('node_id')} has non-positive length ({length}). Excluding from VCF query and final output.\n")
+                            # sys.stderr.write(f"Info: Node ID {current_node_copy.get('node_id')} has non-positive length ({length}). Excluding from VCF query and final output.\n") # REMOVED
                             include_node_in_final_output = False
                             node_was_eligible_for_vcf_query = False
                             total_nodes_filtered_out_by_vcf_prereq += 1
                         else:
-                            # Node is eligible for VCF query
                             query_start_1based = start_0based + 1
                             query_end_1based = start_0based + length
 
@@ -249,35 +241,31 @@ def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepat
                             batch_queried_for_vcf_step4 += 1
 
                             if not vcf_results:
-                                sys.stderr.write(
-                                    f"Info: Node ID {current_node_copy.get('node_id')} had no VCF results for region {chromosome_for_vcf}:{query_start_1based}-{query_end_1based}. Excluding from final output.\n")
+                                # sys.stderr.write(f"Info: Node ID {current_node_copy.get('node_id')} had no VCF results for region {chromosome_for_vcf}:{query_start_1based}-{query_end_1based}. Excluding from final output.\n") # REMOVED
                                 include_node_in_final_output = False
                                 total_nodes_filtered_out_by_empty_vcf += 1
                             else:
                                 node_had_vcf_results = True
-                except ValueError as e:
-                    sys.stderr.write(
-                        f"Info: Node ID {current_node_copy.get('node_id')} invalid numeric for position/length ('{e}'). Excluding from VCF query and final output.\n")
+                except ValueError as e:  # Catches int conversion errors
+                    # sys.stderr.write(f"Info: Node ID {current_node_copy.get('node_id')} invalid numeric for position/length ('{e}'). Excluding from VCF query and final output.\n") # REMOVED
                     include_node_in_final_output = False
-                    node_was_eligible_for_vcf_query = False  # Not eligible due to parsing error
+                    node_was_eligible_for_vcf_query = False
                     total_nodes_filtered_out_by_vcf_prereq += 1
 
             if include_node_in_final_output:
                 ultimate_filtered_nodes_list.append(current_node_copy)
-                if node_was_eligible_for_vcf_query and node_had_vcf_results:  # Count if kept AND had VCF data
+                if node_was_eligible_for_vcf_query and node_had_vcf_results:
                     batch_kept_with_vcf_results_step4 += 1
                     total_nodes_kept_with_vcf_results += 1
 
             batch_node_counter_step4 += 1
-            # Batch reporting logic
             if (batch_node_counter_step4 % 1000 == 0 and batch_node_counter_step4 > 0) or \
                     (node_idx_step4 + 1 == num_initial_common_nodes and batch_node_counter_step4 > 0):
                 batch_time_step4 = time.time() - batch_start_time_step4
                 print(
                     f"  Step 4 Batch: Processed {batch_node_counter_step4} nodes ({node_idx_step4 + 1}/{num_initial_common_nodes} total common). "
-                    f"VCF queried: {batch_queried_for_vcf_step4}. Kept with VCF results: {batch_kept_with_vcf_results_step4}. "
+                    f"VCF queried in batch: {batch_queried_for_vcf_step4}. Kept with VCF results in batch: {batch_kept_with_vcf_results_step4}. "
                     f"Time: {batch_time_step4:.2f}s.")
-                # Reset batch counters
                 batch_node_counter_step4 = 0
                 batch_queried_for_vcf_step4 = 0
                 batch_kept_with_vcf_results_step4 = 0
@@ -306,7 +294,6 @@ def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepat
                     try:
                         sorted_ids = sorted(ids_to_write, key=int)
                     except ValueError:
-                        # print("Warning: Node IDs in TXT not all numeric, using lexicographical sort.", file=sys.stderr) # Less verbose
                         sorted_ids = sorted(ids_to_write)
                     for node_id_str in sorted_ids: f_txt.write(f"{node_id_str}\n")
                 print(f"Successfully wrote ultimate filtered node IDs to {txt_output_path}")
