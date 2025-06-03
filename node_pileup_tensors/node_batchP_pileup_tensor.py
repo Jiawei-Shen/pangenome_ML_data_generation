@@ -699,81 +699,32 @@ def main():
     if not tasks_to_submit: sys.exit("ℹ️ No valid tasks to process. Exiting.")
 
     # --- Parallel Processing ---
-    overall_start_time = time.time()  # Marks the start of the parallel execution phase
-    total_pth_files_generated = 0  # Cumulative total .pth files
-    processed_nodes_count = 0  # Cumulative count of futures that completed (success or failure)
-    successful_nodes_output = 0  # Cumulative count of nodes for which output files were made
-
+    overall_start_time = time.time()
+    total_pth, processed_nodes, successful_nodes_output = 0, 0, 0
     results_for_viewing = {}  # node_id_int -> (view_data, node_sequence)
-
-    # For batch reporting
-    batch_start_time = time.time()
-    batch_nodes_processed_count = 0
-    batch_pth_files_generated = 0
 
     print(f"\n🔹 Submitting {len(tasks_to_submit)} node tasks to {num_workers} worker(s)...")
     with ProcessPoolExecutor(max_workers=num_workers, initializer=init_worker,
                              initargs=(args.dat, args.output)) as executor:
         future_to_node_id = {executor.submit(process_single_node_for_pileup, task): task[0] for task in tasks_to_submit}
-
-        for future_idx, future in enumerate(as_completed(future_to_node_id)):
-            current_completed_total_count = future_idx + 1  # 1-indexed count of all completed futures
-            original_node_id_for_future = future_to_node_id[future]
-
+        for i, future in enumerate(as_completed(future_to_node_id)):
+            orig_node_id = future_to_node_id[future]
             try:
-                # Attempt to get the result from the worker
-                res_node_id, view_data, pth_files_for_this_node = future.result()
-
-                processed_nodes_count += 1  # A future completed and returned a result (even if res_node_id is None)
-
+                res_node_id, view_data, pth_count = future.result()
+                processed_nodes += 1
                 if res_node_id is None:
-                    # Worker signaled an internal issue by returning None for node_id
-                    sys.stderr.write(
-                        f"❌ Worker task for node {original_node_id_for_future} indicated failure (returned None ID).\n")
-                else:
-                    # Worker processed the node and returned data
-                    total_pth_files_generated += pth_files_for_this_node
-                    batch_pth_files_generated += pth_files_for_this_node  # Accumulate for current batch report
-
-                    # Check if output was actually generated for this node
-                    summary_file_path = os.path.join(args.output, str(res_node_id), "variant_summary.json")
-                    if pth_files_for_this_node > 0 or os.path.exists(summary_file_path):
-                        successful_nodes_output += 1
-
-                    # Store data for --view option if enabled
-                    if args.view is not None and view_data:  # view_data might be {}
-                        sequence_for_viewing = node_sequences_map.get(str(res_node_id))
-                        if sequence_for_viewing:
-                            results_for_viewing[res_node_id] = (view_data, sequence_for_viewing)
-                        # else: # Should be rare if node_sequences_map is correctly populated
-                        #     sys.stderr.write(f"⚠️ Warning: Sequence for node {res_node_id} not found in map for viewing.\n")
-
+                    sys.stderr.write(f"❌ Worker failed for node {orig_node_id}.\n")
+                    continue
+                total_pth += pth_count
+                summary_file = os.path.join(args.output, str(res_node_id), "variant_summary.json")
+                if pth_count > 0 or os.path.exists(summary_file): successful_nodes_output += 1
+                print(f"✔ [{i + 1}/{len(tasks_to_submit)}] Node {res_node_id} done. {pth_count} .pth files.")
+                if args.view is not None and view_data:
+                    seq_for_view = node_sequences_map.get(str(res_node_id))
+                    if seq_for_view: results_for_viewing[res_node_id] = (view_data, seq_for_view)
             except Exception as exc:
-                processed_nodes_count += 1  # A future completed by raising an exception
-                sys.stderr.write(
-                    f"❌ Error processing node {original_node_id_for_future} (future raised exception): {exc}\n")
-                # For detailed debugging, you might want to uncomment the next two lines:
-                # import traceback
-                # traceback.print_exc(file=sys.stderr)
-
-            batch_nodes_processed_count += 1
-
-            # --- Batch Reporting Logic ---
-            # Report every 1000 nodes processed in the batch, or if it's the very last task
-            if batch_nodes_processed_count == 1000 or current_completed_total_count == len(tasks_to_submit):
-                batch_end_time = time.time()
-                batch_duration_seconds = batch_end_time - batch_start_time
-                nodes_per_second_in_batch = batch_nodes_processed_count / batch_duration_seconds if batch_duration_seconds > 0 else 0
-
-                print(f"  Processed batch of {batch_nodes_processed_count} nodes "
-                      f"({current_completed_total_count}/{len(tasks_to_submit)} total completed) "
-                      f"in {batch_duration_seconds:.2f}s ({nodes_per_second_in_batch:.2f} nodes/sec). "
-                      f"Generated {batch_pth_files_generated} .pth files in this batch.")
-
-                # Reset for the next batch
-                batch_start_time = time.time()  # Mark start of a new batch
-                batch_nodes_processed_count = 0
-                batch_pth_files_generated = 0
+                processed_nodes += 1
+                sys.stderr.write(f"❌ Error processing node {orig_node_id}: {exc}\n")
 
     # --- Display Pileups (if --view) ---
     if args.view is not None and results_for_viewing:
