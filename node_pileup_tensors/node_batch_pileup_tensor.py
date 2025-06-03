@@ -8,14 +8,17 @@ import time
 import numpy as np
 from collections import defaultdict
 import re
+# ProcessPoolExecutor removed as this version is serial
 import torch  # Still needed for tensor creation before converting to NumPy
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
-RECORD_STRUCT = struct.Struct("<h150s150s20shc")
+RECORD_STRUCT = struct.Struct("<h150s150s20shc")  # Read offset, sequence, RAW QUALITIES, CIGAR, MAPQ, strand
 RECORD_SIZE = RECORD_STRUCT.size
+
 BASE_TO_INDEX = {'A': 0, 'C': 1, 'G': 2, 'T': 3, 'N': 4, '*': 5, ' ': 6, '-': 6}
 INDEX_TO_BASE_FOR_VIEW = {0: 'A', 1: 'C', 2: 'G', 3: 'T', 4: 'N', 5: '*', 6: ' '}  # As provided by user
+
 TENSOR_WINDOW_SIZE = 100
 TENSOR_MAX_READ_ROWS = 200
 PADDING_BASE_INDEX = BASE_TO_INDEX[' ']
@@ -25,8 +28,10 @@ MISMATCH_COMPARISON_PADDING_VALUE = -1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helper Functions (Assumed to be the same as your last provided script)
+# Helper Functions
+# (These remain largely the same as your provided script, with minor verbosity tweaks if any)
 # ─────────────────────────────────────────────────────────────────────────────
+
 def reverse_complement(sequence):
     complement_map = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")
     return sequence.translate(complement_map)[::-1]
@@ -101,9 +106,9 @@ def load_multiple_node_sequences_from_gfa(gfa_path, target_node_ids_set):
                         print(
                             f"✔ Found all {len(target_node_ids_set)} requested node sequences in GFA ({line_counter:,} lines checked).")
                         break
-            if nodes_to_find:  # Some were not found
+            if nodes_to_find:
                 print(
-                    f"✔ GFA scan complete ({line_counter:,} lines). Found {len(node_sequences)}/{len(target_node_ids_set)} target sequences.")
+                    f"✔ GFA scan complete ({line_counter:,} lines). Found {len(node_sequences)}/{len(target_node_ids_set)} sequences.")
                 print(
                     f"⚠️ Could not find GFA sequences for {len(nodes_to_find)} ID(s). Examples: {list(nodes_to_find)[:5]}")
     except FileNotFoundError:
@@ -111,7 +116,7 @@ def load_multiple_node_sequences_from_gfa(gfa_path, target_node_ids_set):
         return {}
     except Exception as e:
         sys.stderr.write(f"❌ Error reading GFA file {gfa_path}: {e}\n")
-        return node_sequences  # Return what was found
+        return node_sequences
     return node_sequences
 
 
@@ -122,7 +127,7 @@ def decode_cigar_to_int_ops(cigar_string):
         for length_str, op_char in re.findall(r'(\d+)([MIDNSHPX=])', cigar_string):
             ops.append((int(length_str), op_char))
     except Exception:
-        return []
+        return []  # Keep it silent on failure for this helper
     return ops
 
 
@@ -247,14 +252,16 @@ def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
                         try:
                             quals[win_idx] = ord(segment_quality_str[r_aln]) - 33
                         except:
-                            pass
+                            pass  # Keep default qual on error
+                    # else default qual is already set
             node_pos += L;
             read_pos += L
         elif op in ('D', 'N'):
             for i in range(L):
                 n_aln = node_pos + i
                 if window_start_node <= n_aln < window_start_node + tensor_win_size:
-                    bases[n_aln - window_start_node] = BASE_TO_INDEX['*']
+                    win_idx = n_aln - window_start_node
+                    bases[win_idx] = BASE_TO_INDEX['*']  # quals remain default (padding)
             node_pos += L
         elif op in ('I', 'S'):
             read_pos += L
@@ -274,10 +281,10 @@ def process_node_serially(dat_file_path, base_output_dir,
         os.makedirs(node_specific_output_dir, exist_ok=True)
     except OSError as e:
         sys.stderr.write(f"❌ Error creating dir {node_specific_output_dir} for Node {node_id}: {e}\n")
-        return node_id, None, npy_files_generated
+        return node_id, None, npy_files_generated  # None for view_data signals error
 
-    if not node_sequence:
-        sys.stderr.write(f"ℹ️ Node {node_id}: No sequence. Skipping.\n")
+    if not node_sequence:  # Should be pre-checked, but safeguard
+        sys.stderr.write(f"ℹ️ Node {node_id}: No sequence. Skipping processing.\n")
         return node_id, {}, npy_files_generated
 
     node_len = len(node_sequence)
@@ -298,13 +305,15 @@ def process_node_serially(dat_file_path, base_output_dir,
                 except UnicodeDecodeError:
                     continue
                 if not seq or len(seq) != len(qual): continue
+
                 cigar_ops_orig = decode_cigar_to_int_ops(cigar_orig)
                 if not cigar_ops_orig and cigar_orig != '*': continue
+
                 cur_seq, cur_qual, cur_cigar_ops, cur_offset = seq, qual, list(cigar_ops_orig), off
                 if strand == '-':
                     cur_seq, cur_qual = reverse_complement(seq), qual[::-1]
                     cur_cigar_ops = [op for op in reversed(cigar_ops_orig)] if cigar_ops_orig else []
-                    read_len_span = len(cur_seq)
+                    read_len_span = len(cur_seq)  # User confirmed logic for offset
                     if read_len_span > 0:
                         cur_offset = node_len - read_len_span - off
                         if cur_offset < 0: continue
@@ -447,13 +456,11 @@ def process_node_serially(dat_file_path, base_output_dir,
 # ─────────────────────────────────────────────────────────────────────────────
 def display_pileup_data(node_data_for_display_view, node_id_str_for_display, full_node_sequence,
                         max_reads_to_display_per_variant, max_variants_to_display=float('inf')):
-    if not node_data_for_display_view:
-        # This message will now only be shown if verbose_node_output is true and view was requested (but data is empty)
-        # print(f"ℹ️ No valid pileup data to display for node {node_id_str_for_display}.", file=sys.stderr)
-        return  # Silently return if no data, main loop handles info messages based on verbosity
-
+    if not node_data_for_display_view:  # Handles None or empty dict
+        print(f"ℹ️ No valid pileup data to display for node {node_id_str_for_display}.", file=sys.stderr)
+        return
     print(f"\n=== Displaying Pileups for Node ID: {node_id_str_for_display} (Length: {len(full_node_sequence)}) ===")
-    if not node_data_for_display_view:  # Check if dict is empty
+    if not node_data_for_display_view:  # Explicitly check if dict is empty
         print(f"ℹ️ No variants met AF threshold or found for node {node_id_str_for_display}.")
         return
 
@@ -463,7 +470,7 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
     display_window_size, half_display_window = TENSOR_WINDOW_SIZE, TENSOR_WINDOW_SIZE // 2
 
     for variant_key in sorted_variant_keys:
-        if variants_displayed_count >= max_variants_to_display:  # max_variants_to_display comes from args.view
+        if variants_displayed_count >= max_variants_to_display:
             print(
                 f"\n  ... ({len(node_data_for_display_view) - variants_displayed_count} more variants for node {node_id_str_for_display} not shown)")
             break
@@ -506,7 +513,7 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
                 print(
                     f"  Read {i + 1:3d}: {bases_str}  (Off:{read_info['offset']},Str:{read_info['strand']},CIG:{read_info.get('cigar', 'N/A')})")
         variants_displayed_count += 1
-    print()
+    print()  # Final newline
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -526,12 +533,12 @@ def main():
     parser.add_argument("--load-cache", help="Load sequences from JSON cache.")
     parser.add_argument("--save-cache", help="Save/update sequences to JSON cache.")
     parser.add_argument("--view", nargs='?', const=-1, default=None, type=int, metavar='N_VARIANTS',
-                        help="Print pileups. 0 to disable all per-node stdout and pileup views. No value or -1 for all variants. N (>0) for first N variants/node.")
+                        help="Print pileups. 0 to disable. No value or -1 for all. N for first N variants/node.")
     parser.add_argument("--max_view_reads", type=int, default=20, help="Max reads per pileup in view.")
     parser.add_argument("--min_af", type=float, default=0.1, help="Min allele frequency for processing.")
     args = parser.parse_args()
 
-    for f_path in [args.dat, args.idx]:
+    for f_path in [args.dat, args.idx]:  # Basic file checks
         if not os.path.isfile(f_path): sys.exit(f"❌ Error: File not found: {f_path}")
     if not args.load_cache and not args.gfa: sys.exit("❌ Must provide --gfa or --load-cache.")
     if args.load_cache and not os.path.isfile(args.load_cache) and os.path.exists(args.load_cache):
@@ -588,106 +595,80 @@ def main():
     processed_count, successful_output_count, total_npy_count = 0, 0, 0
     sorted_target_ids = sorted(list(target_node_ids))
 
+    # Variables for batch timing/reporting in serial loop
     batch_start_time_serial = time.time()
     nodes_in_current_batch_serial = 0
     npy_in_current_batch_serial = 0
 
-    # Determine verbosity for per-node output based on --view argument
-    # If args.view is 0, verbose_node_output will be False.
-    # If args.view is None (not specified), it implies default view behavior (verbose, all variants).
-    # If args.view is -1 or >0, it's also verbose.
-    verbose_node_output = not (args.view == 0)  # True if view is not 0
-
     for i, node_id_int in enumerate(sorted_target_ids):
         node_id_str = str(node_id_int)
+        print(f"\n══════ PROCESSING NODE: {node_id_int} ({i + 1}/{len(sorted_target_ids)}) ══════")
         node_loop_start_time = time.time()
 
         dat_info = idx_data.get(node_id_int)
         seq = seq_map.get(node_id_str)
+        if not dat_info:
+            sys.stderr.write(f"❌ Node {node_id_int}: Not in IDX data. Skipping.\n");
+            continue
+        if not seq:
+            sys.stderr.write(f"❌ Node {node_id_int}: Sequence unavailable. Skipping.\n");
+            continue
 
-        if not dat_info or not seq:
-            if not dat_info: sys.stderr.write(f"❌ Node {node_id_int}: Not found in IDX data. Skipping.\n")
-            if not seq: sys.stderr.write(f"❌ Node {node_id_int}: Sequence unavailable. Skipping.\n")
-            # Still count towards batch for reporting iteration progress
-            nodes_in_current_batch_serial += 1
-            # Trigger batch report if needed, then continue
-            if nodes_in_current_batch_serial == 1000 or (i + 1) == len(sorted_target_ids):
-                if nodes_in_current_batch_serial > 0:  # Check to prevent empty final batch print if last node was skipped
-                    batch_duration_serial = time.time() - batch_start_time_serial
-                    nodes_per_sec_serial = nodes_in_current_batch_serial / batch_duration_serial if batch_duration_serial > 0 else 0
-                    print(f"\n--- Batch Report (Serial Processing) ---")
-                    print(f"  Attempted/Skipped batch of {nodes_in_current_batch_serial} nodes.")
-                    print(f"  Total iterated so far: {i + 1}/{len(sorted_target_ids)}")
-                    print(f"  Time for this batch: {batch_duration_serial:.2f}s ({nodes_per_sec_serial:.2f} nodes/sec)")
-                    print(
-                        f"  .npy files in this batch (from successfully processed nodes): {npy_in_current_batch_serial}")
-                    print(f"  Cumulative .npy files generated: {total_npy_count}")
-                    print(f"--------------------------------------\n")
-                    batch_start_time_serial = time.time()
-                    nodes_in_current_batch_serial = 0
-                    npy_in_current_batch_serial = 0
-            continue  # Skip to the next node_id_int
-
-        if verbose_node_output:
-            print(f"\n══════ PROCESSING NODE: {node_id_int} ({i + 1}/{len(sorted_target_ids)}) ══════")
-            offset, n_recs = dat_info
-            print(f"  Node {node_id_int}: Len={len(seq)}bp, Records={n_recs}, MinAF={args.min_af}")
+        offset, n_recs = dat_info
+        print(f"  Node {node_id_int}: Len={len(seq)}bp, Records={n_recs}, MinAF={args.min_af}")
 
         try:
             _, view_data, npy_this_node = process_node_serially(
                 args.dat, args.output, node_id_int, offset, n_recs, seq, args.min_af)
 
-            processed_count += 1  # Successfully started processing logic for this node
+            processed_count += 1
             total_npy_count += npy_this_node
-            npy_in_current_batch_serial += npy_this_node
+            npy_in_current_batch_serial += npy_this_node  # For batch report
 
             summary_path = os.path.join(args.output, node_id_str, "variant_summary.json")
             if npy_this_node > 0 or os.path.exists(summary_path):
+                print(
+                    f"  ✅ Output for node {node_id_int}. Summary: {summary_path if os.path.exists(summary_path) else 'Not found'}")
                 successful_output_count += 1
-                if verbose_node_output:
-                    print(
-                        f"  ✅ Output for node {node_id_int}. Summary: {summary_path if os.path.exists(summary_path) else 'Not found (but .npy generated)'}")
-            elif verbose_node_output:  # Only print these if verbose
-                if view_data is not None and not view_data:
-                    print(f"  ℹ️ No variants met AF for node {node_id_int}.")
-                elif view_data is None:  # Error in processing_node_serially
-                    print(f"  ⚠️ Processing error occurred for node {node_id_int} (check function logs).")
+            elif view_data is not None and not view_data:  # No variants passed AF
+                print(f"  ℹ️ No variants met AF for node {node_id_int}.")
+            elif view_data is None:  # Error in processing
+                print(f"  ⚠️ Processing error for node {node_id_int}.")
 
-            if verbose_node_output and args.view is not None:  # args.view won't be 0 here due to verbose_node_output
-                if view_data:
+            if args.view is not None and args.view != 0:
+                if view_data:  # handles empty dict too
                     max_v = float('inf') if args.view == -1 else args.view
-                    if args.view < -1: max_v = float('inf')
-                    if max_v > 0 or max_v == float('inf'):  # Only display if count is positive or all
+                    if args.view < -1: max_v = float('inf')  # Show all if invalid negative
+                    if max_v > 0 or max_v == float('inf'):
                         v_msg = f"first {int(max_v)}" if max_v != float('inf') else "all"
                         print(
                             f"  🔹 Displaying {v_msg} pileups for node {node_id_int} (max {args.max_view_reads} reads/var)...")
                         display_pileup_data(view_data, node_id_str, seq, args.max_view_reads, max_v)
                 elif view_data is not None:  # empty view_data {}
                     print(f"  ℹ️ --view: No variants met AF for node {node_id_int} to display.")
+            elif args.view == 0:
+                print(f"  ℹ️ --view 0 specified: Pileup display disabled for node {node_id_int}.")
 
-            if verbose_node_output:
-                print(f"  ✔ Node {node_id_int} processing took {time.time() - node_loop_start_time:.2f}s.")
+            print(f"  ✔ Node {node_id_int} processing took {time.time() - node_loop_start_time:.2f}s.")
 
         except Exception as e:
-            # This catches errors in the main loop's call to process_node_serially or subsequent logic
-            sys.stderr.write(f"❌ CRITICAL ERROR for node {node_id_int} in main loop iteration: {e}\n")
-            # import traceback; traceback.print_exc(file=sys.stderr) # For debugging
+            sys.stderr.write(f"❌ CRITICAL ERROR for node {node_id_int} in main loop: {e}\n")
 
         nodes_in_current_batch_serial += 1
+        # MODIFIED: Batch Reporting Logic
         if nodes_in_current_batch_serial == 1000 or (i + 1) == len(sorted_target_ids):
-            if nodes_in_current_batch_serial > 0:
+            if nodes_in_current_batch_serial > 0:  # Ensure batch is not empty for final report
                 batch_duration_serial = time.time() - batch_start_time_serial
                 nodes_per_sec_serial = nodes_in_current_batch_serial / batch_duration_serial if batch_duration_serial > 0 else 0
                 print(f"\n--- Batch Report (Serial Processing) ---")
-                print(
-                    f"  Processed/Attempted batch of {nodes_in_current_batch_serial} nodes.")  # "Attempted" is more accurate if some were skipped
-                print(f"  Total iterated so far: {i + 1}/{len(sorted_target_ids)}")
+                print(f"  Processed batch of {nodes_in_current_batch_serial} nodes.")
+                print(f"  Total processed in run so far: {i + 1}/{len(sorted_target_ids)}")
                 print(f"  Time for this batch: {batch_duration_serial:.2f}s ({nodes_per_sec_serial:.2f} nodes/sec)")
                 print(f"  .npy files in this batch: {npy_in_current_batch_serial}")
                 print(f"  Cumulative .npy files generated: {total_npy_count}")
                 print(f"--------------------------------------\n")
 
-                batch_start_time_serial = time.time()
+                batch_start_time_serial = time.time()  # Reset for next batch
                 nodes_in_current_batch_serial = 0
                 npy_in_current_batch_serial = 0
 
@@ -705,23 +686,13 @@ def main():
 
     total_time = time.time() - overall_start_time
     print(f"\nSummary:")
-    print(f"  Targeted: {len(sorted_target_ids)} unique node(s).")
-    print(f"  Successfully processed (core logic ran): {processed_count} node(s).")
-    skipped_count = len(sorted_target_ids) - processed_count
-    # This skipped_count might be off if critical errors happened mid-processing for a node.
-    # Better to count skips based on initial data availability.
-    # Let's refine this based on how many were iterated vs actually processed.
-    actual_skipped_count = len(sorted_target_ids) - processed_count
-    # This 'processed_count' is incremented if process_node_serially is successfully called and returns.
-    # Nodes skipped due to missing IDX/sequence before that call are not in 'processed_count'.
-    # The total number of nodes from input is len(sorted_target_ids)
-
-    print(f"  Nodes for which processing logic was invoked: {processed_count} node(s).")
-    print(
-        f"  Nodes skipped due to missing initial data (IDX/sequence): {len(sorted_target_ids) - processed_count if len(sorted_target_ids) > processed_count else 0} node(s).")  # Approximate
-    print(f"  Output files (summary.json and/or .npy) generated for: {successful_output_count} node(s).")
+    print(f"  Attempted: {len(sorted_target_ids)} node(s).")
+    print(f"  Successfully processed (data ops completed): {processed_count} node(s).")
+    skipped = len(sorted_target_ids) - processed_count
+    if skipped > 0: print(f"  Skipped (missing data/errors): {skipped} node(s).")
+    print(f"  Output files (summary/npy) for: {successful_output_count} node(s).")
     print(f"  Total .npy files generated: {total_npy_count}.")
-    print(f"🏁 Total script execution time: {total_time:.2f} seconds.")
+    print(f"🏁 Total script time: {total_time:.2f} seconds.")
 
 
 if __name__ == '__main__':

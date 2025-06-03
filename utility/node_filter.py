@@ -132,6 +132,7 @@ def run_bcftools_region_extract(bcftools_path, vcf_filepath, chromosome, start_1
     results = []
     region = f"{chromosome}:{start_1based}-{end_1based}"
     command = [bcftools_path, 'view', '-r', region, vcf_filepath]
+    print(command)
     try:
         process = subprocess.run(command, capture_output=True, text=True, check=False)
         if process.stdout:
