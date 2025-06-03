@@ -3,6 +3,7 @@ import json
 import struct
 import argparse
 import sys
+import time
 import copy
 import subprocess
 import shutil  # For checking bcftools availability
