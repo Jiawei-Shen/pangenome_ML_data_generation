@@ -122,7 +122,7 @@ def calculate_genomic_position(node_start_pos, variant_pos_on_node):
     Assumes VCF is 1-based and tensor variant position is 0-based relative to node start.
     Node start from JSON is assumed to be 1-based GRCh38 coordinate.
     """
-    return node_start_pos + variant_pos_on_node
+    return node_start_pos + variant_pos_on_node + 1
 
 
 # --- Main Script Logic ---
@@ -131,7 +131,7 @@ def main():
     parser = argparse.ArgumentParser(description="Classify .npy tensor files based on VCF concordance on chr1.")
     parser.add_argument("tensor_folder_path",
                         help="Path to the folder containing node subdirectories with .npy files and variant_summary.json.")
-    parser.add_argument("vcf_file", help="Path to the VCF file to query (e.g., dbSNP for chr1).")
+    parser.add_argument("vcf_file", help="Path to the VCF file to query.")
     parser.add_argument("node_pos_json",
                         help="Path to the JSON file with node GRCh38 position information (expects a top-level object with a 'nodes' list).")
     parser.add_argument("--output_folder", default="./classification_results",
