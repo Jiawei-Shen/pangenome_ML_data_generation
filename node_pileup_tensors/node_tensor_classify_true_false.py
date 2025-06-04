@@ -18,6 +18,7 @@ def query_vcf_chr1(vcf_file_path):
     print(f"Querying VCF file '{vcf_file_path}' for chr1 variants using 'bcftools' from PATH...")
     chr1_variants = set()
     cmd = ['bcftools', 'view', '-r', 'chr1', vcf_file_path]
+    print(cmd)
     try:
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, stderr=subprocess.PIPE)
         stdout, stderr = process.communicate()
