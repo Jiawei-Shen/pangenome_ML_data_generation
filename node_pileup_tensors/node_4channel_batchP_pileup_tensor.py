@@ -747,7 +747,7 @@ def main():
                 sys.stderr.write(f"❌ Error processing node {orig_node_id} (future exception): {exc}\n")
 
             nodes_in_current_batch_parallel += 1
-            if nodes_in_current_batch_parallel == 1000 or current_completed_total == len(tasks_to_submit):
+            if nodes_in_current_batch_parallel == 10 or current_completed_total == len(tasks_to_submit):
                 if nodes_in_current_batch_parallel > 0:  # Avoid division by zero if batch is tiny and fast
                     batch_duration = time.time() - batch_start_time_parallel
                     rate = nodes_in_current_batch_parallel / batch_duration if batch_duration > 0 else 0
