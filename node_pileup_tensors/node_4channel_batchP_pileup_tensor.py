@@ -18,14 +18,14 @@ RECORD_SIZE = RECORD_STRUCT.size
 
 # New Base to Index Mapping as per your request
 BASE_TO_INDEX = {
-    'A': 2, 'C': 3, 'G': 5, 'T': 7, # Standard bases
-    'N': 1,                         # Unknown or ambiguous base
-    '*': 9,                         # Deletion character from CIGAR or gap
-    '_PADDING_': 0                  # Representing padding, mapped to index 0
+    'A': 2, 'C': 3, 'G': 5, 'T': 7,  # Standard bases
+    'N': 1,  # Unknown or ambiguous base
+    '*': 9,  # Deletion character from CIGAR or gap
+    '_PADDING_': 0  # Representing padding, mapped to index 0
     # Note: The key '' for 0 is problematic in some contexts, so using a placeholder.
     # The important part is that PADDING_BASE_INDEX becomes 0.
 }
-PADDING_BASE_INDEX = 0 # Explicitly set padding index to 0
+PADDING_BASE_INDEX = 0  # Explicitly set padding index to 0
 
 # Updated Index to Base Mapping for console visualization (--view)
 INDEX_TO_BASE_FOR_VIEW = {
@@ -37,15 +37,16 @@ INDEX_TO_BASE_FOR_VIEW = {
 }
 
 TENSOR_WINDOW_SIZE = 100
-TENSOR_MAX_READ_ROWS = 200 # Max reads per tensor (excluding reference row)
+TENSOR_MAX_READ_ROWS = 200  # Max reads per tensor (excluding reference row)
 DEFAULT_QUALITY_PADDING = 0
-DEFAULT_MAPPING_QUALITY_PADDING = -1 # Padding for mapping quality channel (ref row / empty read rows) (from your script)
+DEFAULT_MAPPING_QUALITY_PADDING = -1  # Padding for mapping quality channel (ref row / empty read rows) (from your script)
 MISMATCH_CHANNEL_REF_ROW_VALUE = 0
-MISMATCH_COMPARISON_PADDING_VALUE = -1 # Padding for mismatch channel (from your script)
+MISMATCH_COMPARISON_PADDING_VALUE = -1  # Padding for mismatch channel (from your script)
 
 # Globals for worker process state
 worker_dat_file = None
 worker_base_output_dir = None
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper Functions
@@ -565,10 +566,21 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
 
         try:
             # Create tensor (C, H, W) where H = num_reads + 1 (ref), W = window_size
-            final_tensor = torch.tensor([ch1_base_indices_list, ch2_quality_scores_list,
-                                         ch3_mismatch_flags_list, ch4_mapping_qualities_list],
-                                        dtype=torch.int8)
-            numpy_array_to_save = final_tensor.numpy()  # Save as numpy array
+            # The lists ch1_..., ch2_..., etc. each represent a channel.
+            # Each list contains (TENSOR_MAX_READ_ROWS + 1) rows, and each row has TENSOR_WINDOW_SIZE columns.
+            # So, torch.tensor creates a tensor of shape (C, H, W) = (4, 201, 100)
+            tensor_chw = torch.tensor([ch1_base_indices_list, ch2_quality_scores_list,
+                                       ch3_mismatch_flags_list, ch4_mapping_qualities_list],
+                                      dtype=torch.int8)
+
+            # Permute dimensions to get (H, W, C) = (201, 100, 4)
+            # Original dim 0 (Channels) -> new dim 2
+            # Original dim 1 (Height)    -> new dim 0
+            # Original dim 2 (Width)     -> new dim 1
+            tensor_hwc = tensor_chw.permute(1, 2, 0)
+
+            numpy_array_to_save = tensor_hwc.numpy()  # Save as numpy array with new shape
+
             tensor_filename_npy = f"{variant_key_string}.npy"
             tensor_filepath_npy = os.path.join(node_specific_output_dir, tensor_filename_npy)
             np.save(tensor_filepath_npy, numpy_array_to_save)
