@@ -258,6 +258,7 @@ def main():
             genomic_variant_pos = calculate_genomic_position(node_grch38_start_pos, variant_pos_on_node)
 
             vcf_tuple_to_check = (genomic_variant_pos, variant_ref_on_node, variant_alt_on_node)
+            print(vcf_tuple_to_check)
             is_true_variant = vcf_tuple_to_check in vcf_chromosome_variants
 
             variant_summary_entry = {
