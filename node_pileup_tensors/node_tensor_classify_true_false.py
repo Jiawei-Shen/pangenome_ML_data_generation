@@ -217,8 +217,8 @@ def main():
                     f"  Copied to 'true': {tensor_files_copied_true}, Copied to 'false': {tensor_files_copied_false}\n")
             continue
 
+        print('hi', node_summary_data.get("variants", []))
         for variant_info in node_summary_data.get("variants", []):
-            print("v_infor", variant_info)
             total_tensor_files_processed_from_summaries += 1
             tensor_filename = variant_info.get("tensor_file")
             variant_key = variant_info.get("variant_key")
