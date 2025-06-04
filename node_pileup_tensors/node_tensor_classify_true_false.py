@@ -177,7 +177,6 @@ def main():
     print(f"Processing .npy files from base folder: {args.tensor_folder_path}")
     for node_id_str in os.listdir(args.tensor_folder_path):
         node_dir_path = os.path.join(args.tensor_folder_path, node_id_str)
-        print(node_dir_path)
         if not os.path.isdir(node_dir_path):
             continue
 
