@@ -119,7 +119,7 @@ def load_node_positions(json_file_path):
 def calculate_genomic_position(node_start_pos, variant_pos_on_node):
     """
     Calculates the genomic position.
-    Assumes VCF is 1-based and .pth variant position is 0-based relative to node start.
+    Assumes VCF is 1-based and tensor variant position is 0-based relative to node start.
     Node start from JSON is assumed to be 1-based GRCh38 coordinate.
     """
     return node_start_pos + variant_pos_on_node
@@ -128,9 +128,9 @@ def calculate_genomic_position(node_start_pos, variant_pos_on_node):
 # --- Main Script Logic ---
 
 def main():
-    parser = argparse.ArgumentParser(description="Classify .pth variant files based on VCF concordance on chr1.")
-    parser.add_argument("pth_folder_path",
-                        help="Path to the folder containing node subdirectories with .pth files and variant_summary.json.")
+    parser = argparse.ArgumentParser(description="Classify .npy tensor files based on VCF concordance on chr1.")
+    parser.add_argument("tensor_folder_path",
+                        help="Path to the folder containing node subdirectories with .npy files and variant_summary.json.")
     parser.add_argument("vcf_file", help="Path to the VCF file to query (e.g., dbSNP for chr1).")
     parser.add_argument("node_pos_json",
                         help="Path to the JSON file with node GRCh38 position information (expects a top-level object with a 'nodes' list).")
@@ -138,7 +138,7 @@ def main():
                         help="Path to the folder where 'true' and 'false' subfolders and summary will be created.")
     args = parser.parse_args()
 
-    print("Starting .pth file classification process...")
+    print("Starting .npy file classification process...")
 
     # 1. Create output directories
     true_folder = os.path.join(args.output_folder, "true")
@@ -154,7 +154,7 @@ def main():
         sys.exit(1)
     if not vcf_chr1_variants:
         print(
-            "Warning: No chr1 variants found in the VCF file. All .pth files will likely be classified as 'false' unless they are not on chr1 (and thus also 'false' by this VCF).",
+            "Warning: No chr1 variants found in the VCF file. All .npy files will likely be classified as 'false' unless they are not on chr1 (and thus also 'false' by this VCF).",
             file=sys.stderr)
 
     # 3. Load node position information
@@ -163,20 +163,20 @@ def main():
         print("Exiting due to failure in loading node positions.", file=sys.stderr)
         sys.exit(1)
     if not all_node_start_positions:
-        print("Warning: No node start positions loaded. Cannot calculate genomic positions for .pth files.",
+        print("Warning: No node start positions loaded. Cannot calculate genomic positions for .npy files.",
               file=sys.stderr)
 
-    # 4. Iterate through .pth files, calculate positions, classify, and copy
+    # 4. Iterate through tensor files, calculate positions, classify, and copy
     classification_summary = []
-    total_pth_files_processed_from_summaries = 0
-    pth_files_copied_true = 0
-    pth_files_copied_false = 0
-    actual_pth_files_found_and_considered = 0
+    total_tensor_files_processed_from_summaries = 0
+    tensor_files_copied_true = 0
+    tensor_files_copied_false = 0
+    actual_tensor_files_found_and_considered = 0
     nodes_processed_for_report = 0
 
-    print(f"Processing .pth files from base folder: {args.pth_folder_path}")
-    for node_id_str in os.listdir(args.pth_folder_path):
-        node_dir_path = os.path.join(args.pth_folder_path, node_id_str)
+    print(f"Processing .npy files from base folder: {args.tensor_folder_path}")
+    for node_id_str in os.listdir(args.tensor_folder_path):
+        node_dir_path = os.path.join(args.tensor_folder_path, node_id_str)
         if not os.path.isdir(node_dir_path):
             continue
 
@@ -191,9 +191,10 @@ def main():
         if not os.path.isfile(summary_json_path):
             if nodes_processed_for_report > 0 and nodes_processed_for_report % 100 == 0:
                 print(f"\nProgress Report: After processing {nodes_processed_for_report} node directories.")
-                print(f"  Total .pth files considered (from summaries): {total_pth_files_processed_from_summaries}")
-                print(f"  Total .pth files physically found & processed: {actual_pth_files_found_and_considered}")
-                print(f"  Copied to 'true': {pth_files_copied_true}, Copied to 'false': {pth_files_copied_false}\n")
+                print(f"  Total .npy files considered (from summaries): {total_tensor_files_processed_from_summaries}")
+                print(f"  Total .npy files physically found & processed: {actual_tensor_files_found_and_considered}")
+                print(
+                    f"  Copied to 'true': {tensor_files_copied_true}, Copied to 'false': {tensor_files_copied_false}\n")
             continue
 
         try:
@@ -203,28 +204,37 @@ def main():
             print(f"Warning: Could not read or parse {summary_json_path}: {e}. Skipping.", file=sys.stderr)
             if nodes_processed_for_report > 0 and nodes_processed_for_report % 100 == 0:
                 print(f"\nProgress Report: After processing {nodes_processed_for_report} node directories.")
-                print(f"  Total .pth files considered (from summaries): {total_pth_files_processed_from_summaries}")
-                print(f"  Total .pth files physically found & processed: {actual_pth_files_found_and_considered}")
-                print(f"  Copied to 'true': {pth_files_copied_true}, Copied to 'false': {pth_files_copied_false}\n")
+                print(f"  Total .npy files considered (from summaries): {total_tensor_files_processed_from_summaries}")
+                print(f"  Total .npy files physically found & processed: {actual_tensor_files_found_and_considered}")
+                print(
+                    f"  Copied to 'true': {tensor_files_copied_true}, Copied to 'false': {tensor_files_copied_false}\n")
             continue
 
         for variant_info in node_summary_data.get("variants", []):
-            total_pth_files_processed_from_summaries += 1
-            pth_filename = variant_info.get("tensor_file")
+            total_tensor_files_processed_from_summaries += 1
+            # Assuming variant_summary.json now refers to .npy files under "tensor_file" key
+            tensor_filename = variant_info.get("tensor_file")
             variant_key = variant_info.get("variant_key")
-            if not pth_filename or not variant_key:
+            if not tensor_filename or not variant_key:
                 print(f"Warning: Missing 'tensor_file' or 'variant_key' in {summary_json_path} for an entry. Skipping.",
                       file=sys.stderr)
                 continue
 
-            pth_file_full_path = os.path.join(node_dir_path, pth_filename)
-            if not os.path.isfile(pth_file_full_path):
+            # Ensure we are expecting .npy if the file names in summary are consistent
+            if not tensor_filename.endswith(".npy"):
                 print(
-                    f"Warning: .pth file not found: {pth_file_full_path} (referenced in summary). Skipping this entry.",
+                    f"Warning: Expected .npy file in summary, but found '{tensor_filename}'. Skipping entry in {summary_json_path}.",
                     file=sys.stderr)
                 continue
 
-            actual_pth_files_found_and_considered += 1
+            tensor_file_full_path = os.path.join(node_dir_path, tensor_filename)
+            if not os.path.isfile(tensor_file_full_path):
+                print(
+                    f"Warning: Tensor file not found: {tensor_file_full_path} (referenced in summary). Skipping this entry.",
+                    file=sys.stderr)
+                continue
+
+            actual_tensor_files_found_and_considered += 1
 
             try:
                 parts = variant_key.split('_')
@@ -233,11 +243,10 @@ def main():
                 variant_alt_on_node = parts[3].upper()
             except (IndexError, ValueError) as e:
                 print(
-                    f"Warning: Could not parse variant_key '{variant_key}' from {summary_json_path}: {e}. Skipping {pth_filename}.",
+                    f"Warning: Could not parse variant_key '{variant_key}' from {summary_json_path}: {e}. Skipping {tensor_filename}.",
                     file=sys.stderr)
                 continue
 
-            # Get allele frequency from the variant_info dictionary
             allele_frequency = variant_info.get("alt_allele_frequency", "N/A")
 
             genomic_variant_pos = calculate_genomic_position(node_grch38_start_pos, variant_pos_on_node)
@@ -245,34 +254,34 @@ def main():
             is_true_variant = vcf_tuple_to_check in vcf_chr1_variants
 
             variant_summary_entry = {
-                "pth_file": pth_filename,
-                "original_path": pth_file_full_path,
+                "tensor_file": tensor_filename,  # Key remains "tensor_file" for consistency
+                "original_path": tensor_file_full_path,
                 "node_id": node_id_str,
                 "variant_key": variant_key,
                 "grch38_calculated_pos_1_based": genomic_variant_pos,
                 "ref_allele_from_pth_summary": variant_ref_on_node,
                 "alt_allele_from_pth_summary": variant_alt_on_node,
-                "allele_frequency": allele_frequency,  # Added allele frequency
+                "allele_frequency": allele_frequency,
                 "classification": "true" if is_true_variant else "false",
                 "vcf_match_key": str(vcf_tuple_to_check),
                 "found_in_vcf_chr1": is_true_variant
             }
             classification_summary.append(variant_summary_entry)
 
-            destination_filename = f"{node_id_str}_{pth_filename}"
+            destination_filename = f"{node_id_str}_{tensor_filename}"
 
             if is_true_variant:
-                shutil.copy2(pth_file_full_path, os.path.join(true_folder, destination_filename))
-                pth_files_copied_true += 1
+                shutil.copy2(tensor_file_full_path, os.path.join(true_folder, destination_filename))
+                tensor_files_copied_true += 1
             else:
-                shutil.copy2(pth_file_full_path, os.path.join(false_folder, destination_filename))
-                pth_files_copied_false += 1
+                shutil.copy2(tensor_file_full_path, os.path.join(false_folder, destination_filename))
+                tensor_files_copied_false += 1
 
         if nodes_processed_for_report > 0 and nodes_processed_for_report % 100 == 0:
             print(f"\nProgress Report: After processing {nodes_processed_for_report} node directories.")
-            print(f"  Total .pth files considered (from summaries): {total_pth_files_processed_from_summaries}")
-            print(f"  Total .pth files physically found & processed: {actual_pth_files_found_and_considered}")
-            print(f"  Copied to 'true': {pth_files_copied_true}, Copied to 'false': {pth_files_copied_false}\n")
+            print(f"  Total .npy files considered (from summaries): {total_tensor_files_processed_from_summaries}")
+            print(f"  Total .npy files physically found & processed: {actual_tensor_files_found_and_considered}")
+            print(f"  Copied to 'true': {tensor_files_copied_true}, Copied to 'false': {tensor_files_copied_false}\n")
 
     # 5. Write the overall classification summary JSON
     summary_output_path = os.path.join(args.output_folder, "classification_summary.json")
@@ -284,10 +293,10 @@ def main():
         print(f"Error writing classification summary: {e}", file=sys.stderr)
 
     print("\n--- Classification Stats ---")
-    print(f"Total variant entries processed from summaries: {total_pth_files_processed_from_summaries}")
-    print(f"Total .pth files found and considered for copying: {actual_pth_files_found_and_considered}")
-    print(f"Copied to 'true' folder: {pth_files_copied_true}")
-    print(f"Copied to 'false' folder: {pth_files_copied_false}")
+    print(f"Total variant entries processed from summaries: {total_tensor_files_processed_from_summaries}")
+    print(f"Total .npy files found and considered for copying: {actual_tensor_files_found_and_considered}")
+    print(f"Copied to 'true' folder: {tensor_files_copied_true}")
+    print(f"Copied to 'false' folder: {tensor_files_copied_false}")
     print(f"Total node directories processed for reporting: {nodes_processed_for_report}")
     print("Classification finished.")
 
