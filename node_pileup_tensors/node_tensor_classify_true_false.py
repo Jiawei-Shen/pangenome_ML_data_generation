@@ -9,21 +9,22 @@ import sys
 
 # --- Helper Functions ---
 
-def query_vcf_chr1(vcf_file_path):
+def query_vcf_for_chromosome(vcf_file_path, chromosome):  # Renamed and added chromosome parameter
     """
-    Queries a VCF file for variants on chr1 using bcftools.
+    Queries a VCF file for variants on the specified chromosome using bcftools.
     Assumes 'bcftools' is in the system PATH.
-    Returns a set of (position, ref, alt) tuples for chr1 variants.
+    Returns a set of (position, ref, alt) tuples for variants on the specified chromosome.
     """
-    print(f"Querying VCF file '{vcf_file_path}' for chr1 variants using 'bcftools' from PATH...")
-    chr1_variants = set()
-    cmd = ['bcftools', 'view', '-r', 'chr1', vcf_file_path]
+    print(f"Querying VCF file '{vcf_file_path}' for '{chromosome}' variants using 'bcftools' from PATH...")
+    chromosome_variants = set()
+    cmd = ['bcftools', 'view', '-r', chromosome, vcf_file_path]  # Use the chromosome parameter
     try:
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, stderr=subprocess.PIPE)
         stdout, stderr = process.communicate()
 
         if process.returncode != 0:
-            print(f"Error: bcftools command failed with exit code {process.returncode}", file=sys.stderr)
+            print(f"Error: bcftools command failed with exit code {process.returncode} for chromosome '{chromosome}'",
+                  file=sys.stderr)
             if stderr:
                 print(f"bcftools stderr:\n{stderr.strip()}", file=sys.stderr)
             return None
@@ -37,18 +38,18 @@ def query_vcf_chr1(vcf_file_path):
                         ref = fields[3].upper()
                         alt_alleles = fields[4].upper().split(',')
                         for alt in alt_alleles:
-                            chr1_variants.add((pos, ref, alt))
+                            chromosome_variants.add((pos, ref, alt))
                     except ValueError:
                         print(f"Warning: Could not parse VCF line: {line.strip()}", file=sys.stderr)
 
-        print(f"Found {len(chr1_variants)} unique ALT variants on chr1 in VCF.")
-        return chr1_variants
+        print(f"Found {len(chromosome_variants)} unique ALT variants on '{chromosome}' in VCF.")
+        return chromosome_variants
     except FileNotFoundError:
         print(f"Error: 'bcftools' not found in PATH. Please ensure it's installed and PATH is configured correctly.",
               file=sys.stderr)
         return None
     except Exception as e:
-        print(f"Error during VCF query: {e}", file=sys.stderr)
+        print(f"Error during VCF query for chromosome '{chromosome}': {e}", file=sys.stderr)
         return None
 
 
