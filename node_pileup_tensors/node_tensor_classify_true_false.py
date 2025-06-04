@@ -217,11 +217,11 @@ def main():
                     f"  Copied to 'true': {tensor_files_copied_true}, Copied to 'false': {tensor_files_copied_false}\n")
             continue
 
+        print(node_summary_data)
         for variant_info in node_summary_data.get("variants", []):
             total_tensor_files_processed_from_summaries += 1
             tensor_filename = variant_info.get("tensor_file")
             variant_key = variant_info.get("variant_key")
-            print(variant_info)
             if not tensor_filename or not variant_key:
                 print(f"Warning: Missing 'tensor_file' or 'variant_key' in {summary_json_path} for an entry. Skipping.",
                       file=sys.stderr)
