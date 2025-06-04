@@ -193,6 +193,7 @@ def main():
         nodes_processed_for_report += 1
 
         node_grch38_start_pos = all_node_start_positions[node_id_str]
+        print(node_grch38_start_pos)
 
         summary_json_path = os.path.join(node_dir_path, "variant_summary.json")
         if not os.path.isfile(summary_json_path):
@@ -218,7 +219,6 @@ def main():
             continue
 
         for variant_info in node_summary_data.get("variants", []):
-            print(variant_info)
             total_tensor_files_processed_from_summaries += 1
             tensor_filename = variant_info.get("tensor_file")
             variant_key = variant_info.get("variant_key")
