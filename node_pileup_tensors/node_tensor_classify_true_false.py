@@ -196,7 +196,6 @@ def main():
 
         summary_json_path = os.path.join(node_dir_path, "variant_summary.json")
         if not os.path.isfile(summary_json_path):
-            print(os.path.isfile(summary_json_path))
             if nodes_processed_for_report > 0 and nodes_processed_for_report % 100 == 0:
                 print(f"\nProgress Report: After processing {nodes_processed_for_report} node directories.")
                 print(f"  Total .npy files considered (from summaries): {total_tensor_files_processed_from_summaries}")
@@ -222,6 +221,7 @@ def main():
             total_tensor_files_processed_from_summaries += 1
             tensor_filename = variant_info.get("tensor_file")
             variant_key = variant_info.get("variant_key")
+            print(variant_info)
             if not tensor_filename or not variant_key:
                 print(f"Warning: Missing 'tensor_file' or 'variant_key' in {summary_json_path} for an entry. Skipping.",
                       file=sys.stderr)
