@@ -9,7 +9,7 @@ import sys
 
 # --- Helper Functions ---
 
-def query_vcf_for_chromosome(vcf_file_path, chromosome):  # Renamed and added chromosome parameter
+def query_vcf_for_chromosome(vcf_file_path, chromosome):
     """
     Queries a VCF file for variants on the specified chromosome using bcftools.
     Assumes 'bcftools' is in the system PATH.
@@ -17,7 +17,7 @@ def query_vcf_for_chromosome(vcf_file_path, chromosome):  # Renamed and added ch
     """
     print(f"Querying VCF file '{vcf_file_path}' for '{chromosome}' variants using 'bcftools' from PATH...")
     chromosome_variants = set()
-    cmd = ['bcftools', 'view', '-r', chromosome, vcf_file_path]  # Use the chromosome parameter
+    cmd = ['bcftools', 'view', '-r', chromosome, vcf_file_path]
     try:
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, stderr=subprocess.PIPE)
         stdout, stderr = process.communicate()
@@ -123,14 +123,14 @@ def calculate_genomic_position(node_start_pos, variant_pos_on_node):
     Assumes node_start_pos is 1-based GRCh38 coordinate.
     Assumes variant_pos_on_node is 0-based offset from the start of the node.
     """
-    # Corrected calculation: 1-based start + 0-based offset = 1-based result
-    return node_start_pos + variant_pos_on_node + 1
+    return node_start_pos + variant_pos_on_node
 
 
 # --- Main Script Logic ---
 
 def main():
-    parser = argparse.ArgumentParser(description="Classify .npy tensor files based on VCF concordance on chr1.")
+    parser = argparse.ArgumentParser(
+        description="Classify .npy tensor files based on VCF concordance for a specified chromosome.")
     parser.add_argument("tensor_folder_path",
                         help="Path to the folder containing node subdirectories with .npy files and variant_summary.json.")
     parser.add_argument("vcf_file", help="Path to the VCF file to query.")
@@ -138,12 +138,16 @@ def main():
                         help="Path to the JSON file with node GRCh38 position information (expects a top-level object with a 'nodes' list).")
     parser.add_argument("--output_folder", default="./classification_results",
                         help="Path to the folder where 'true' and 'false' subfolders and summary will be created.")
-    # Added --chr argument from previous request, ensuring it's here.
     parser.add_argument("--chr", "--chromosome", default="chr1",
                         help="Chromosome to query in the VCF and use for classification (e.g., chr1, chrX, 1). Default: chr1.")
     args = parser.parse_args()
 
     print(f"Starting .npy file classification process for chromosome '{args.chr}'...")
+
+    # --- DEBUG Settings ---
+    debug_limit = 5
+    processed_debug_nodes_count = 0
+    # --- End DEBUG Settings ---
 
     # 1. Create output directories
     true_folder = os.path.join(args.output_folder, "true")
@@ -153,9 +157,7 @@ def main():
     print(f"Output folders created/ensured: '{true_folder}', '{false_folder}'")
 
     # 2. Query VCF for specified chromosome variants
-    # Corrected call using the function name from the previous version that accepted chromosome argument
     vcf_chromosome_variants = query_vcf_for_chromosome(args.vcf_file, args.chr)
-
     if vcf_chromosome_variants is None:
         print(f"Exiting due to VCF query failure for chromosome '{args.chr}'.", file=sys.stderr)
         sys.exit(1)
@@ -169,12 +171,19 @@ def main():
     if all_node_start_positions is None:
         print("Exiting due to failure in loading node positions.", file=sys.stderr)
         sys.exit(1)
+
+    if all_node_start_positions is not None:
+        print(
+            f"DEBUG: Loaded {len(all_node_start_positions)} node start positions. Example keys: {list(all_node_start_positions.keys())[:5]}")
+    else:
+        print("DEBUG: all_node_start_positions is None after loading attempt.")
+
     if not all_node_start_positions:
         print("Warning: No node start positions loaded. Cannot calculate genomic positions for .npy files.",
               file=sys.stderr)
 
     # 4. Iterate through tensor files, calculate positions, classify, and copy
-    classification_summary = []
+    classification_details = []
     total_tensor_files_processed_from_summaries = 0
     tensor_files_copied_true = 0
     tensor_files_copied_false = 0
@@ -184,50 +193,91 @@ def main():
     print(f"Processing .npy files from base folder: {args.tensor_folder_path}")
     for node_id_str in os.listdir(args.tensor_folder_path):
         node_dir_path = os.path.join(args.tensor_folder_path, node_id_str)
-        print(node_dir_path)
         if not os.path.isdir(node_dir_path):
+            if processed_debug_nodes_count < debug_limit:
+                print(f"DEBUG: Skipping non-directory item: {node_dir_path}")
             continue
 
         if node_id_str not in all_node_start_positions:
+            if processed_debug_nodes_count < debug_limit and len(
+                    all_node_start_positions) > 0:  # Only print if some positions were loaded
+                print(
+                    f"DEBUG: Node ID {node_id_str} not in loaded start positions ({len(all_node_start_positions)} total loaded). Skipping directory.")
             continue
 
         nodes_processed_for_report += 1
+        current_node_is_being_debugged = processed_debug_nodes_count < debug_limit
+
+        if current_node_is_being_debugged:
+            print(f"\nDEBUG: === Processing node directory: {node_dir_path} (Node ID: {node_id_str}) ===")
 
         node_grch38_start_pos = all_node_start_positions[node_id_str]
 
         summary_json_path = os.path.join(node_dir_path, "variant_summary.json")
         if not os.path.isfile(summary_json_path):
+            if current_node_is_being_debugged:
+                print(f"DEBUG: variant_summary.json NOT FOUND at {summary_json_path}")
             if nodes_processed_for_report > 0 and nodes_processed_for_report % 100 == 0:
                 print(f"\nProgress Report: After processing {nodes_processed_for_report} node directories.")
                 print(f"  Total .npy files considered (from summaries): {total_tensor_files_processed_from_summaries}")
                 print(f"  Total .npy files physically found & processed: {actual_tensor_files_found_and_considered}")
                 print(
                     f"  Copied to 'true': {tensor_files_copied_true}, Copied to 'false': {tensor_files_copied_false}\n")
+            if current_node_is_being_debugged: processed_debug_nodes_count += 1
             continue
 
+        if current_node_is_being_debugged:
+            print(f"DEBUG: Found variant_summary.json at {summary_json_path}")
+
+        node_summary_data = None
         try:
             with open(summary_json_path, 'r') as sjf:
                 node_summary_data = json.load(sjf)
+            if current_node_is_being_debugged:
+                print(f"DEBUG: Successfully parsed {summary_json_path}")
         except Exception as e:
             print(f"Warning: Could not read or parse {summary_json_path}: {e}. Skipping.", file=sys.stderr)
+            if current_node_is_being_debugged:
+                print(f"DEBUG: FAILED to parse {summary_json_path}: {e}")
             if nodes_processed_for_report > 0 and nodes_processed_for_report % 100 == 0:
                 print(f"\nProgress Report: After processing {nodes_processed_for_report} node directories.")
                 print(f"  Total .npy files considered (from summaries): {total_tensor_files_processed_from_summaries}")
                 print(f"  Total .npy files physically found & processed: {actual_tensor_files_found_and_considered}")
                 print(
                     f"  Copied to 'true': {tensor_files_copied_true}, Copied to 'false': {tensor_files_copied_false}\n")
+            if current_node_is_being_debugged: processed_debug_nodes_count += 1
             continue
 
-        for variant_info in node_summary_data.get("variants", []):
+        # !!! THIS IS THE CORRECTED LINE !!!
+        variants_list = node_summary_data.get("variants_passing_af_filter", [])
+
+        if current_node_is_being_debugged:
+            print(
+                f"DEBUG: Node {node_id_str} - Attempting to get 'variants_passing_af_filter', got list of {len(variants_list)} entries.")
+            if not variants_list:
+                print(f"DEBUG: Node {node_id_str} - The 'variants_passing_af_filter' list is EMPTY or key is missing.")
+            elif len(variants_list) > 0:
+                print(f"DEBUG: Node {node_id_str} - First variant entry: {str(variants_list[0])[:250]}...")
+
+        for variant_info in variants_list:
+            if current_node_is_being_debugged and total_tensor_files_processed_from_summaries < (
+                    processed_debug_nodes_count + 1) * debug_limit:
+                print(f"DEBUG: Node {node_id_str} - Raw variant_info from summary: {str(variant_info)[:250]}...")
+
             total_tensor_files_processed_from_summaries += 1
             tensor_filename = variant_info.get("tensor_file")
             variant_key = variant_info.get("variant_key")
+
             if not tensor_filename or not variant_key:
+                if current_node_is_being_debugged: print(
+                    f"DEBUG: Node {node_id_str} - Missing 'tensor_file' or 'variant_key'. Skipping entry: {variant_info}")
                 print(f"Warning: Missing 'tensor_file' or 'variant_key' in {summary_json_path} for an entry. Skipping.",
                       file=sys.stderr)
                 continue
 
             if not tensor_filename.endswith(".npy"):
+                if current_node_is_being_debugged: print(
+                    f"DEBUG: Node {node_id_str} - Tensor file '{tensor_filename}' does not end with .npy. Skipping.")
                 print(
                     f"Warning: Expected .npy file in summary, but found '{tensor_filename}'. Skipping entry in {summary_json_path}.",
                     file=sys.stderr)
@@ -235,31 +285,38 @@ def main():
 
             tensor_file_full_path = os.path.join(node_dir_path, tensor_filename)
             if not os.path.isfile(tensor_file_full_path):
+                if current_node_is_being_debugged: print(
+                    f"DEBUG: Node {node_id_str} - Tensor file NOT FOUND at {tensor_file_full_path}")
                 print(
                     f"Warning: Tensor file not found: {tensor_file_full_path} (referenced in summary). Skipping this entry.",
                     file=sys.stderr)
                 continue
 
+            if current_node_is_being_debugged: print(
+                f"DEBUG: Node {node_id_str} - Found tensor file: {tensor_file_full_path}")
             actual_tensor_files_found_and_considered += 1
 
             try:
                 parts = variant_key.split('_')
-                variant_pos_on_node = int(parts[0])  # This is 0-based
+                variant_pos_on_node = int(parts[0])
                 variant_ref_on_node = parts[2].upper()
                 variant_alt_on_node = parts[3].upper()
             except (IndexError, ValueError) as e:
+                if current_node_is_being_debugged: print(
+                    f"DEBUG: Node {node_id_str} - Failed to parse variant_key '{variant_key}': {e}")
                 print(
                     f"Warning: Could not parse variant_key '{variant_key}' from {summary_json_path}: {e}. Skipping {tensor_filename}.",
                     file=sys.stderr)
                 continue
 
             allele_frequency = variant_info.get("alt_allele_frequency", "N/A")
-
-            # Use the corrected calculate_genomic_position
             genomic_variant_pos = calculate_genomic_position(node_grch38_start_pos, variant_pos_on_node)
 
             vcf_tuple_to_check = (genomic_variant_pos, variant_ref_on_node, variant_alt_on_node)
             is_true_variant = vcf_tuple_to_check in vcf_chromosome_variants
+            if current_node_is_being_debugged:
+                print(
+                    f"DEBUG: Node {node_id_str} - Variant '{variant_key}': Calculated GRCh38 Pos: {genomic_variant_pos}, REF: {variant_ref_on_node}, ALT: {variant_alt_on_node}. VCF Check Tuple: {vcf_tuple_to_check}. Found in VCF: {is_true_variant}")
 
             variant_summary_entry = {
                 "tensor_file": tensor_filename,
@@ -274,7 +331,7 @@ def main():
                 "vcf_match_key": str(vcf_tuple_to_check),
                 "found_in_vcf_for_queried_chromosome": is_true_variant
             }
-            classification_summary.append(variant_summary_entry)
+            classification_details.append(variant_summary_entry)
 
             destination_filename = f"{node_id_str}_{tensor_filename}"
 
@@ -285,6 +342,10 @@ def main():
                 shutil.copy2(tensor_file_full_path, os.path.join(false_folder, destination_filename))
                 tensor_files_copied_false += 1
 
+        if current_node_is_being_debugged:
+            processed_debug_nodes_count += 1
+            print(f"DEBUG: === Finished processing variants for node {node_id_str} ===")
+
         if nodes_processed_for_report > 0 and nodes_processed_for_report % 100 == 0:
             print(f"\nProgress Report: After processing {nodes_processed_for_report} node directories.")
             print(f"  Total .npy files considered (from summaries): {total_tensor_files_processed_from_summaries}")
@@ -294,7 +355,7 @@ def main():
     # 5. Write the overall classification summary JSON
     final_summary_output = {
         "queried_chromosome": args.chr,
-        "classification_details": classification_summary
+        "classification_details": classification_details
     }
     summary_output_path = os.path.join(args.output_folder, "classification_summary.json")
     try:
@@ -310,7 +371,7 @@ def main():
     print(f"Total .npy files found and considered for copying: {actual_tensor_files_found_and_considered}")
     print(f"Copied to 'true' folder: {tensor_files_copied_true}")
     print(f"Copied to 'false' folder: {tensor_files_copied_false}")
-    print(f"Total node directories processed for reporting: {nodes_processed_for_report}")
+    print(f"Total node directories matching positional data and attempted for processing: {nodes_processed_for_report}")
     print("Classification finished.")
 
 
