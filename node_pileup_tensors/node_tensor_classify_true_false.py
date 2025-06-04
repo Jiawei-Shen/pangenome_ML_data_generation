@@ -184,6 +184,7 @@ def main():
     print(f"Processing .npy files from base folder: {args.tensor_folder_path}")
     for node_id_str in os.listdir(args.tensor_folder_path):
         node_dir_path = os.path.join(args.tensor_folder_path, node_id_str)
+        print(node_dir_path)
         if not os.path.isdir(node_dir_path):
             continue
 
@@ -217,7 +218,6 @@ def main():
                     f"  Copied to 'true': {tensor_files_copied_true}, Copied to 'false': {tensor_files_copied_false}\n")
             continue
 
-        print('hi', node_summary_data.get("variants", []))
         for variant_info in node_summary_data.get("variants", []):
             total_tensor_files_processed_from_summaries += 1
             tensor_filename = variant_info.get("tensor_file")
