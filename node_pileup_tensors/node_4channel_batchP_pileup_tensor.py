@@ -15,20 +15,37 @@ import torch
 # Constants
 RECORD_STRUCT = struct.Struct("<h150s150s20shc")
 RECORD_SIZE = RECORD_STRUCT.size
-BASE_TO_INDEX = {'A': 0, 'C': 1, 'G': 2, 'T': 3, 'N': 4, '*': 5, ' ': 6, '-': 6}
-INDEX_TO_BASE_FOR_VIEW = {0: 'A', 1: 'C', 2: 'G', 3: 'T', 4: 'N', 5: '*', 6: ' '}
+
+# New Base to Index Mapping as per your request
+BASE_TO_INDEX = {
+    'A': 2, 'C': 3, 'G': 5, 'T': 7, # Standard bases
+    'N': 1,                         # Unknown or ambiguous base
+    '*': 9,                         # Deletion character from CIGAR or gap
+    '_PADDING_': 0                  # Representing padding, mapped to index 0
+    # Note: The key '' for 0 is problematic in some contexts, so using a placeholder.
+    # The important part is that PADDING_BASE_INDEX becomes 0.
+}
+PADDING_BASE_INDEX = 0 # Explicitly set padding index to 0
+
+# Updated Index to Base Mapping for console visualization (--view)
+INDEX_TO_BASE_FOR_VIEW = {
+    2: 'A', 3: 'C', 5: 'G', 7: 'T',
+    1: 'N',
+    9: '*',
+    0: ' '  # Padding index 0 will be visualized as a space
+    # Ensure all used indices in BASE_TO_INDEX have a reverse mapping here for viewing
+}
+
 TENSOR_WINDOW_SIZE = 100
-TENSOR_MAX_READ_ROWS = 200  # Max reads per tensor (excluding reference row)
-PADDING_BASE_INDEX = BASE_TO_INDEX[' ']
+TENSOR_MAX_READ_ROWS = 200 # Max reads per tensor (excluding reference row)
 DEFAULT_QUALITY_PADDING = 0
-DEFAULT_MAPPING_QUALITY_PADDING = 0  # Use 0 for padding mapq, as -1 might be an issue for uint types later
+DEFAULT_MAPPING_QUALITY_PADDING = -1 # Padding for mapping quality channel (ref row / empty read rows) (from your script)
 MISMATCH_CHANNEL_REF_ROW_VALUE = 0
-MISMATCH_COMPARISON_PADDING_VALUE = 0  # Use 0 for padding in mismatch, as -1 is not typical for binary channel
+MISMATCH_COMPARISON_PADDING_VALUE = -1 # Padding for mismatch channel (from your script)
 
 # Globals for worker process state
 worker_dat_file = None
 worker_base_output_dir = None
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper Functions
