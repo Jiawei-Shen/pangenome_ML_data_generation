@@ -193,10 +193,10 @@ def main():
         nodes_processed_for_report += 1
 
         node_grch38_start_pos = all_node_start_positions[node_id_str]
-        print(node_grch38_start_pos)
 
         summary_json_path = os.path.join(node_dir_path, "variant_summary.json")
         if not os.path.isfile(summary_json_path):
+            print(os.path.isfile(summary_json_path))
             if nodes_processed_for_report > 0 and nodes_processed_for_report % 100 == 0:
                 print(f"\nProgress Report: After processing {nodes_processed_for_report} node directories.")
                 print(f"  Total .npy files considered (from summaries): {total_tensor_files_processed_from_summaries}")
