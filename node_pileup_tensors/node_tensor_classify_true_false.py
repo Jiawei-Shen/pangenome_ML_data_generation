@@ -153,14 +153,6 @@ def main():
     print(f"Output folders created/ensured: '{true_folder}', '{false_folder}'")
 
     # 2. Query VCF for specified chromosome variants
-    vcf_chromosome_variants = query_vcf_chr1(
-        args.vcf_file)  # Original function name was query_vcf_chr1, ensure it uses args.chr
-    # Let's rename query_vcf_chr1 to query_vcf_for_chromosome and pass args.chr
-    # Assuming query_vcf_chr1 was already updated to query_vcf_for_chromosome(args.vcf_file, args.chr) in the actual script used.
-    # For this revision, I will use the correct function call if the function name was updated.
-    # If the function is still named query_vcf_chr1 and hardcodes "chr1", then args.chr is not used by it.
-    # Based on the previous turn, query_vcf_chr1 was indeed changed to query_vcf_for_chromosome(vcf_file_path, chromosome)
-
     # Corrected call using the function name from the previous version that accepted chromosome argument
     vcf_chromosome_variants = query_vcf_for_chromosome(args.vcf_file, args.chr)
 
