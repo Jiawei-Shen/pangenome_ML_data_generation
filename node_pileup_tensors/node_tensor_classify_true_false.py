@@ -17,8 +17,7 @@ def query_vcf_chr1(vcf_file_path):
     """
     print(f"Querying VCF file '{vcf_file_path}' for chr1 variants using 'bcftools' from PATH...")
     chr1_variants = set()
-    cmd = ['bcftools', 'view', '-r', 'chr1', vcf_file_path]
-    print(cmd)
+    cmd = ['bcftools', 'view', '-r', 'chr1', vcf_file_path]Z
     try:
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, stderr=subprocess.PIPE)
         stdout, stderr = process.communicate()
@@ -178,6 +177,7 @@ def main():
     print(f"Processing .npy files from base folder: {args.tensor_folder_path}")
     for node_id_str in os.listdir(args.tensor_folder_path):
         node_dir_path = os.path.join(args.tensor_folder_path, node_id_str)
+        print(node_dir_path)
         if not os.path.isdir(node_dir_path):
             continue
 
