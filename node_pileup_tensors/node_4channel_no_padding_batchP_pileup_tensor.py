@@ -457,22 +457,35 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
 
         variant_key_string = f"{v_pos}_{v_type}_{v_ref_from_cigar}_{v_alt_from_cigar}"
 
-        adaptive_tensor_width = min(TENSOR_WINDOW_SIZE, node_len)
-        half_adaptive_width = adaptive_tensor_width // 2
+        # ───────────────────────────────────────────────────────────────────────
+        # REVISION: Adaptive, Centered Window Calculation
+        # The window is now perfectly centered on the variant. Its size is
+        # determined by the shorter distance to either end of the node's sequence,
+        # ensuring the window never goes out of bounds and requires no padding.
+        # ───────────────────────────────────────────────────────────────────────
+        max_radius = TENSOR_WINDOW_SIZE // 2
 
-        window_center_pos = v_pos + 1 if v_type == 'I' else v_pos
+        # For insertions, the variant position is the base *before* the insertion.
+        center_pos = v_pos + 1 if v_type == 'I' else v_pos
 
-        window_start_pos = window_center_pos - half_adaptive_width
-        window_start_pos = max(0, window_start_pos)
-        window_start_pos = min(window_start_pos, node_len - adaptive_tensor_width)
+        dist_to_start = center_pos
+        dist_to_end = node_len - 1 - center_pos
 
+        # The actual radius is limited by the shortest side, or the max window size.
+        actual_radius = min(dist_to_start, dist_to_end, max_radius)
+
+        adaptive_tensor_width = 2 * actual_radius + 1
+        window_start_pos = center_pos - actual_radius
+
+        # Prepare data for visualization using the new adaptive window
         pileup_data_for_view_json = []
         for read_segment_idx, seg_data in enumerate(aligned_read_segments):
             if read_segment_idx >= TENSOR_MAX_READ_ROWS + 50: break
-            view_window_start = max(0, (v_pos + 1 if v_type == 'I' else v_pos) - TENSOR_WINDOW_SIZE // 2)
+
             row_chars_for_view = get_read_representation_in_window_for_view(
                 seg_data["cigar_ops"], seg_data["offset_on_node"], seg_data["read_sequence"],
-                view_window_start, TENSOR_WINDOW_SIZE, node_len)
+                window_start_pos, adaptive_tensor_width, node_len)
+
             if any(char_in_row != ' ' for char_in_row in row_chars_for_view):
                 pileup_data_for_view_json.append({
                     "bases": [BASE_TO_INDEX.get(char.upper(), BASE_TO_INDEX['N']) for char in row_chars_for_view],
@@ -480,90 +493,82 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
                     "strand": seg_data["strand"],
                     "cigar": seg_data["original_cigar_str"]
                 })
+
+        # Store window parameters along with view data
         view_oriented_variant_data[variant_key_string] = {
+            "window_start": window_start_pos,
+            "window_width": adaptive_tensor_width,
             "pileup_reads_data": pileup_data_for_view_json[:TENSOR_MAX_READ_ROWS],
             "alt_allele_count": alt_allele_count, "ref_allele_count_at_locus": ref_allele_count,
             "other_allele_count_at_locus": other_allele_count, "coverage_at_locus": locus_coverage,
             "alt_allele_frequency": round(current_alt_freq, 4)
         }
 
-        ch1_base_indices_list, ch2_quality_scores_list = [], []
-        ch3_mismatch_flags_list, ch4_mapping_qualities_list = [], []
+        # Tensor Data Preparation
+        ch1, ch2, ch3, ch4 = [], [], [], []
 
-        ref_base_indices_row = [PADDING_BASE_INDEX] * adaptive_tensor_width
+        ref_row = [PADDING_BASE_INDEX] * adaptive_tensor_width
         for i in range(adaptive_tensor_width):
-            absolute_node_pos = window_start_pos + i
-            if 0 <= absolute_node_pos < node_len:
-                ref_base_indices_row[i] = BASE_TO_INDEX.get(node_sequence[absolute_node_pos].upper(),
-                                                            BASE_TO_INDEX['N'])
+            abs_pos = window_start_pos + i
+            ref_row[i] = BASE_TO_INDEX.get(node_sequence[abs_pos].upper(), BASE_TO_INDEX['N'])
 
-        ch1_base_indices_list.append(ref_base_indices_row)
-        ch2_quality_scores_list.append([DEFAULT_QUALITY_PADDING] * adaptive_tensor_width)
-        ch3_mismatch_flags_list.append([MISMATCH_CHANNEL_REF_ROW_VALUE] * adaptive_tensor_width)
-        ch4_mapping_qualities_list.append([DEFAULT_MAPPING_QUALITY_PADDING] * adaptive_tensor_width)
+        ch1.append(ref_row)
+        ch2.append([DEFAULT_QUALITY_PADDING] * adaptive_tensor_width)
+        ch3.append([MISMATCH_CHANNEL_REF_ROW_VALUE] * adaptive_tensor_width)
+        ch4.append([DEFAULT_MAPPING_QUALITY_PADDING] * adaptive_tensor_width)
 
-        reads_added_to_tensor = 0
-        for seg_data in aligned_read_segments:
-            if reads_added_to_tensor >= TENSOR_MAX_READ_ROWS: break
+        reads_added = 0
+        for seg in aligned_read_segments:
+            if reads_added >= TENSOR_MAX_READ_ROWS: break
+            base_row, qual_row = get_read_tensor_rows_in_window(
+                seg["cigar_ops"], seg["offset_on_node"], seg["read_sequence"],
+                seg["processed_quality_str"], window_start_pos, adaptive_tensor_width, node_len)
 
-            base_idx_row, quality_score_row = get_read_tensor_rows_in_window(
-                seg_data["cigar_ops"], seg_data["offset_on_node"],
-                seg_data["read_sequence"], seg_data["processed_quality_str"],
-                window_start_pos, adaptive_tensor_width, node_len)
+            if any(b != PADDING_BASE_INDEX for b in base_row):
+                ch1.append(base_row)
+                ch2.append(qual_row)
 
-            if any(b != PADDING_BASE_INDEX for b in base_idx_row):
-                ch1_base_indices_list.append(base_idx_row)
-                ch2_quality_scores_list.append(quality_score_row)
-
-                mismatch_flags_row = [MISMATCH_COMPARISON_PADDING_VALUE] * adaptive_tensor_width
+                mismatch_row = [MISMATCH_COMPARISON_PADDING_VALUE] * adaptive_tensor_width
                 for i in range(adaptive_tensor_width):
-                    if base_idx_row[i] == PADDING_BASE_INDEX or ref_base_indices_row[i] == PADDING_BASE_INDEX:
-                        continue
-                    mismatch_flags_row[i] = 0 if base_idx_row[i] == ref_base_indices_row[i] else 1
-                ch3_mismatch_flags_list.append(mismatch_flags_row)
+                    if base_row[i] != PADDING_BASE_INDEX and ref_row[i] != PADDING_BASE_INDEX:
+                        mismatch_row[i] = 0 if base_row[i] == ref_row[i] else 1
+                ch3.append(mismatch_row)
 
-                mapq_val_clamped = max(0, min(int(seg_data["mapping_quality"]), 127))
-                ch4_mapping_qualities_list.append([mapq_val_clamped] * adaptive_tensor_width)
-                reads_added_to_tensor += 1
+                mapq = max(0, min(int(seg["mapping_quality"]), 127))
+                ch4.append([mapq] * adaptive_tensor_width)
+                reads_added += 1
 
-        for _ in range(TENSOR_MAX_READ_ROWS - reads_added_to_tensor):
-            ch1_base_indices_list.append([PADDING_BASE_INDEX] * adaptive_tensor_width)
-            ch2_quality_scores_list.append([DEFAULT_QUALITY_PADDING] * adaptive_tensor_width)
-            ch3_mismatch_flags_list.append([MISMATCH_COMPARISON_PADDING_VALUE] * adaptive_tensor_width)
-            ch4_mapping_qualities_list.append([DEFAULT_MAPPING_QUALITY_PADDING] * adaptive_tensor_width)
+        for _ in range(TENSOR_MAX_READ_ROWS - reads_added):
+            ch1.append([PADDING_BASE_INDEX] * adaptive_tensor_width)
+            ch2.append([DEFAULT_QUALITY_PADDING] * adaptive_tensor_width)
+            ch3.append([MISMATCH_COMPARISON_PADDING_VALUE] * adaptive_tensor_width)
+            ch4.append([DEFAULT_MAPPING_QUALITY_PADDING] * adaptive_tensor_width)
 
         try:
-            tensor_chw = torch.tensor([ch1_base_indices_list, ch2_quality_scores_list,
-                                       ch3_mismatch_flags_list, ch4_mapping_qualities_list],
-                                      dtype=torch.int8)
-            tensor_hwc = tensor_chw.permute(1, 2, 0)
-            numpy_array_to_save = tensor_hwc.numpy()
-            tensor_filename_npy = f"{variant_key_string}.npy"
-            tensor_filepath_npy = os.path.join(node_specific_output_dir, tensor_filename_npy)
-            np.save(tensor_filepath_npy, numpy_array_to_save)
+            tensor = torch.tensor([ch1, ch2, ch3, ch4], dtype=torch.int8).permute(1, 2, 0)
+            np.save(os.path.join(node_specific_output_dir, f"{variant_key_string}.npy"), tensor.numpy())
 
             variant_headers_for_summary.append({
-                "variant_key": variant_key_string, "tensor_file": tensor_filename_npy,
+                "variant_key": variant_key_string, "tensor_file": f"{variant_key_string}.npy",
                 "alt_allele_count": alt_allele_count, "ref_allele_count_at_locus": ref_allele_count,
                 "other_allele_count_at_locus": other_allele_count, "coverage_at_locus": locus_coverage,
                 "alt_allele_frequency": round(current_alt_freq, 4)
             })
             tensor_files_generated_for_node += 1
         except Exception as e:
-            sys.stderr.write(
-                f"Error [Worker Node {node_id}]: Failed to create/save tensor for {variant_key_string}: {e}\n")
+            sys.stderr.write(f"Error creating tensor for {variant_key_string}: {e}\n")
 
     if variant_headers_for_summary:
-        summary_json_path = os.path.join(node_specific_output_dir, "variant_summary.json")
+        summary_path = os.path.join(node_specific_output_dir, "variant_summary.json")
         try:
-            with open(summary_json_path, 'w') as sjf:
+            with open(summary_path, 'w') as f:
                 json.dump({
                     "node_id": node_id, "node_length": node_len,
                     "node_sequence_preview": node_sequence[:100] + ("..." if node_len > 100 else ""),
                     "variants_passing_af_filter": variant_headers_for_summary
-                }, sjf, indent=2)
+                }, f, indent=2)
         except Exception as e:
-            sys.stderr.write(f"Error [Worker Node {node_id}]: Failed to write summary JSON: {e}\n")
+            sys.stderr.write(f"Error writing summary for Node {node_id}: {e}\n")
 
     return node_id, view_oriented_variant_data, tensor_files_generated_for_node
 
@@ -576,9 +581,6 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
     if max_variants_to_display == 0:
         return
     if not node_data_for_display_view:
-        print(
-            f"Info: No pileup data to display for node {node_id_str_for_display} (e.g. no variants met AF or other criteria).",
-            file=sys.stdout)
         return
 
     print(f"\n=== Displaying Pileups for Node ID: {node_id_str_for_display} (Length: {len(full_node_sequence)}) ===")
@@ -587,67 +589,60 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
     sorted_variant_keys = sorted(node_data_for_display_view.keys(),
                                  key=lambda x: (int(x.split('_')[0]), x.split('_')[1]))
 
-    display_window_size = TENSOR_WINDOW_SIZE
-    half_display_window = TENSOR_WINDOW_SIZE // 2
-
     for variant_key in sorted_variant_keys:
         if variants_displayed_count >= max_variants_to_display:
-            print(
-                f"\n  ... (and {len(node_data_for_display_view) - variants_displayed_count} more variants for node {node_id_str_for_display} not shown due to --view limit)")
+            print(f"\n  ... (and {len(node_data_for_display_view) - variants_displayed_count} more variants not shown)")
             break
 
         variant_data = node_data_for_display_view[variant_key]
         v_pos_str, v_type = variant_key.split('_')[:2]
-        try:
-            v_pos = int(v_pos_str)
-        except ValueError:
-            sys.stderr.write(f"Warning: Could not parse variant position from key: {variant_key} for display.\n")
-            continue
+        v_pos = int(v_pos_str)
 
-        window_center_pos = v_pos + 1 if v_type == 'I' else v_pos
-        window_start_pos = max(0, window_center_pos - half_display_window)
+        # REVISION: Read window parameters directly from the data
+        window_start_pos = variant_data.get('window_start', 0)
+        display_window_size = variant_data.get('window_width', 0)
+        if display_window_size == 0: continue
+
+        center_pos = v_pos + 1 if v_type == 'I' else v_pos
 
         print(f"\n--- Variant: {variant_key} (Node Pos: {v_pos}, Type: {v_type}) ---")
         print(
             f"  Display Window (0-based node coords): {window_start_pos}-{window_start_pos + display_window_size - 1}")
+        alt_freq = variant_data.get('alt_allele_frequency', 0.0)
         print(f"  Alt Count: {variant_data.get('alt_allele_count', 'N/A')} | "
               f"Ref Count: {variant_data.get('ref_allele_count_at_locus', 'N/A')} | "
-              f"Other Count: {variant_data.get('other_allele_count_at_locus', 'N/A')} | "
-              f"Coverage: {variant_data.get('coverage_at_locus', 'N/A')}")
-        alt_freq = variant_data.get('alt_allele_frequency', 'N/A')
-        print(f"  Alt Freq: {alt_freq:.4f}" if isinstance(alt_freq, float) else f"Alt Freq: {alt_freq}")
+              f"Coverage: {variant_data.get('coverage_at_locus', 'N/A')} | "
+              f"Alt Freq: {alt_freq:.4f}")
 
         ref_display_chars = [' '] * display_window_size
         marker_line_chars = [' '] * display_window_size
-        variant_pos_in_window = v_pos - window_start_pos
+
+        # The variant position relative to the start of our new window
+        variant_pos_in_window = center_pos - window_start_pos
 
         for i in range(display_window_size):
             absolute_node_pos = window_start_pos + i
             if 0 <= absolute_node_pos < len(full_node_sequence):
                 ref_display_chars[i] = full_node_sequence[absolute_node_pos]
 
-            if i == variant_pos_in_window:
-                marker_line_chars[i] = "I" if v_type == 'I' else "^"
-                if v_type == 'I':
-                    if i + 1 < display_window_size:
-                        marker_line_chars[i + 1] = "^"
-                    elif i == display_window_size - 1:
-                        marker_line_chars[i] = ">"
+        if 0 <= variant_pos_in_window < display_window_size:
+            marker_line_chars[variant_pos_in_window] = "I" if v_type == 'I' else "^"
+            if v_type == 'I':
+                if variant_pos_in_window + 1 < display_window_size:
+                    marker_line_chars[variant_pos_in_window + 1] = "^"
 
         print(f"  Node Ref: {''.join(ref_display_chars)}")
         print(f"  Marker  : {''.join(marker_line_chars)}")
 
         pileup_reads_for_variant = variant_data.get("pileup_reads_data", [])
         if not pileup_reads_for_variant:
-            print("  (No reads in window for display in this variant's JSON summary)")
+            print("  (No reads in window for display)")
         else:
             for i, read_entry in enumerate(pileup_reads_for_variant):
                 if i >= max_reads_to_display_per_variant:
-                    print(
-                        f"  ... ({len(pileup_reads_for_variant) - i} more reads not shown due to --max_view_reads limit)")
+                    print(f"  ... ({len(pileup_reads_for_variant) - i} more reads not shown)")
                     break
-                base_indices_for_read = read_entry["bases"]
-                bases_str_for_read = "".join([INDEX_TO_BASE_FOR_VIEW.get(idx, '?') for idx in base_indices_for_read])
+                bases_str_for_read = "".join([INDEX_TO_BASE_FOR_VIEW.get(idx, '?') for idx in read_entry["bases"]])
                 print(
                     f"  Read {i + 1:3d}: {bases_str_for_read}  (Off:{read_entry['offset']},Str:{read_entry['strand']},CIG:{read_entry.get('cigar', 'N/A')})")
         variants_displayed_count += 1
@@ -659,12 +654,12 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate variant-centered 4-channel .npy tensors (bases, base_quals, mismatches, map_quals) and JSON summaries from .dat alignment files.",
+        description="Generate variant-centered 4-channel .npy tensors from .dat alignment files.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("dat", help=".dat file path (read alignment data)")
-    parser.add_argument("idx", help=".idx file path (index for .dat file)")
-    parser.add_argument("output", help="Base output directory for node-specific folders and tensors.")
-
+    parser.add_argument("dat", help=".dat file path")
+    parser.add_argument("idx", help=".idx file path")
+    parser.add_argument("output", help="Base output directory")
+    # ... (rest of main function is unchanged)
     input_node_group = parser.add_mutually_exclusive_group(required=True)
     input_node_group.add_argument("--node_id", type=int, help="The specific node ID to process.")
     input_node_group.add_argument("--node_id_file",
@@ -824,11 +819,6 @@ def main():
                     if tensor_files_count_for_node > 0 or os.path.exists(summary_file_path):
                         nodes_with_actual_output += 1
 
-                    # ───────────────────────────────────────────────────────────
-                    # REVISION: Display results as they are completed.
-                    # This block now calls the display function immediately
-                    # instead of storing results for later.
-                    # ───────────────────────────────────────────────────────────
                     if args.view is not None and args.view != 0 and view_data_dict:
                         node_seq_for_view = node_sequences_map_str_keys.get(str(returned_node_id))
                         if node_seq_for_view:
@@ -852,11 +842,6 @@ def main():
                     batch_start_time = time.time()
                     nodes_in_batch_count = 0
                     tensors_in_batch_count = 0
-
-    # ───────────────────────────────────────────────────────────────────────────
-    # REVISION: The final display loop has been removed as results are now
-    # displayed inside the `as_completed` loop above.
-    # ───────────────────────────────────────────────────────────────────────────
 
     print("\n══════════ PROCESSING COMPLETE ══════════")
     if args.save_cache and node_sequences_map_str_keys:
