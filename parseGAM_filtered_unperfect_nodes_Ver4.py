@@ -227,7 +227,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
     print(f"Output file created: {dat_path}")
 
-    BUFFER_SEGMENTS = 300_000_000  # it takes about 180GB memory
+    BUFFER_SEGMENTS = 400_000_000  # it takes about 240GB memory
 
     next_milestone = milestone_step
     total_reads = 0
