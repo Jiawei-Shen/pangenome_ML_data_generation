@@ -457,27 +457,18 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
 
         variant_key_string = f"{v_pos}_{v_type}_{v_ref_from_cigar}_{v_alt_from_cigar}"
 
-        # ───────────────────────────────────────────────────────────────────────
-        # REVISION: Adaptive Width Calculation
-        # The tensor width is now adaptive. It's set to the node's length,
-        # but capped at the maximum window size (TENSOR_WINDOW_SIZE).
-        # This prevents creating tensors wider than necessary for short nodes.
         adaptive_tensor_width = min(TENSOR_WINDOW_SIZE, node_len)
         half_adaptive_width = adaptive_tensor_width // 2
-        # ───────────────────────────────────────────────────────────────────────
 
         window_center_pos = v_pos + 1 if v_type == 'I' else v_pos
 
-        # Center the window on the variant, but clamp it to the node boundaries.
         window_start_pos = window_center_pos - half_adaptive_width
         window_start_pos = max(0, window_start_pos)
         window_start_pos = min(window_start_pos, node_len - adaptive_tensor_width)
 
-        # Data for --view output (JSON part)
         pileup_data_for_view_json = []
         for read_segment_idx, seg_data in enumerate(aligned_read_segments):
             if read_segment_idx >= TENSOR_MAX_READ_ROWS + 50: break
-            # Note: The view still uses the fixed TENSOR_WINDOW_SIZE for consistent display
             view_window_start = max(0, (v_pos + 1 if v_type == 'I' else v_pos) - TENSOR_WINDOW_SIZE // 2)
             row_chars_for_view = get_read_representation_in_window_for_view(
                 seg_data["cigar_ops"], seg_data["offset_on_node"], seg_data["read_sequence"],
@@ -496,11 +487,9 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
             "alt_allele_frequency": round(current_alt_freq, 4)
         }
 
-        # Tensor Data Preparation (4 channels)
         ch1_base_indices_list, ch2_quality_scores_list = [], []
         ch3_mismatch_flags_list, ch4_mapping_qualities_list = [], []
 
-        # Reference Row - Use adaptive_tensor_width
         ref_base_indices_row = [PADDING_BASE_INDEX] * adaptive_tensor_width
         for i in range(adaptive_tensor_width):
             absolute_node_pos = window_start_pos + i
@@ -517,7 +506,6 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
         for seg_data in aligned_read_segments:
             if reads_added_to_tensor >= TENSOR_MAX_READ_ROWS: break
 
-            # Get tensor rows using the adaptive_tensor_width
             base_idx_row, quality_score_row = get_read_tensor_rows_in_window(
                 seg_data["cigar_ops"], seg_data["offset_on_node"],
                 seg_data["read_sequence"], seg_data["processed_quality_str"],
@@ -538,7 +526,6 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
                 ch4_mapping_qualities_list.append([mapq_val_clamped] * adaptive_tensor_width)
                 reads_added_to_tensor += 1
 
-        # Pad with empty ROWS to keep the tensor HEIGHT fixed. This is unchanged.
         for _ in range(TENSOR_MAX_READ_ROWS - reads_added_to_tensor):
             ch1_base_indices_list.append([PADDING_BASE_INDEX] * adaptive_tensor_width)
             ch2_quality_scores_list.append([DEFAULT_QUALITY_PADDING] * adaptive_tensor_width)
@@ -546,16 +533,11 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
             ch4_mapping_qualities_list.append([DEFAULT_MAPPING_QUALITY_PADDING] * adaptive_tensor_width)
 
         try:
-            # Create tensor. Shape will be (C, H, W) = (4, 201, adaptive_tensor_width)
             tensor_chw = torch.tensor([ch1_base_indices_list, ch2_quality_scores_list,
                                        ch3_mismatch_flags_list, ch4_mapping_qualities_list],
                                       dtype=torch.int8)
-
-            # Permute dimensions to get (H, W, C) = (201, adaptive_tensor_width, 4)
             tensor_hwc = tensor_chw.permute(1, 2, 0)
-
             numpy_array_to_save = tensor_hwc.numpy()
-
             tensor_filename_npy = f"{variant_key_string}.npy"
             tensor_filepath_npy = os.path.join(node_specific_output_dir, tensor_filename_npy)
             np.save(tensor_filepath_npy, numpy_array_to_save)
@@ -813,8 +795,6 @@ def main():
     nodes_completed_by_worker = 0
     nodes_with_actual_output = 0
 
-    results_for_console_view = {}
-
     batch_start_time = time.time()
     nodes_in_batch_count = 0
     tensors_in_batch_count = 0
@@ -844,10 +824,17 @@ def main():
                     if tensor_files_count_for_node > 0 or os.path.exists(summary_file_path):
                         nodes_with_actual_output += 1
 
+                    # ───────────────────────────────────────────────────────────
+                    # REVISION: Display results as they are completed.
+                    # This block now calls the display function immediately
+                    # instead of storing results for later.
+                    # ───────────────────────────────────────────────────────────
                     if args.view is not None and args.view != 0 and view_data_dict:
                         node_seq_for_view = node_sequences_map_str_keys.get(str(returned_node_id))
                         if node_seq_for_view:
-                            results_for_console_view[returned_node_id] = (view_data_dict, node_seq_for_view)
+                            max_variants_for_this_node = float('inf') if args.view == -1 else args.view
+                            display_pileup_data(view_data_dict, str(returned_node_id), node_seq_for_view,
+                                                args.max_view_reads, max_variants_for_this_node)
             except Exception as exc:
                 nodes_completed_by_worker += 1
                 sys.stderr.write(
@@ -866,20 +853,10 @@ def main():
                     nodes_in_batch_count = 0
                     tensors_in_batch_count = 0
 
-    if args.view is not None and args.view != 0:
-        if results_for_console_view:
-            print("\n══════════ Preparing Pileup Views ══════════")
-            for node_id_to_view in sorted(results_for_console_view.keys()):
-                view_data, node_sequence_to_view = results_for_console_view[node_id_to_view]
-                max_variants_for_this_node = float('inf') if args.view == -1 else args.view
-
-                if max_variants_for_this_node > 0 or max_variants_for_this_node == float('inf'):
-                    display_pileup_data(view_data, str(node_id_to_view), node_sequence_to_view,
-                                        args.max_view_reads, max_variants_for_this_node)
-        else:
-            print(f"Info: --view specified, but no pileup data was generated or collected for display.")
-    elif args.view == 0:
-        print(f"Info: --view 0 specified: Pileup display explicitly disabled.")
+    # ───────────────────────────────────────────────────────────────────────────
+    # REVISION: The final display loop has been removed as results are now
+    # displayed inside the `as_completed` loop above.
+    # ───────────────────────────────────────────────────────────────────────────
 
     print("\n══════════ PROCESSING COMPLETE ══════════")
     if args.save_cache and node_sequences_map_str_keys:
