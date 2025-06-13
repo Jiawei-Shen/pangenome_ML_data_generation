@@ -22,6 +22,31 @@ def format_time(seconds):
     return f"{hours:02}:{minutes:02}:{seconds:02}"
 
 
+def get_variant_count(vcf_file_path, chromosome):
+    """
+    Efficiently counts the number of unique variants for a chromosome from a VCF file
+    without storing them in memory. This is for display purposes only.
+    """
+    print(f"Counting variants in {os.path.basename(vcf_file_path)} for {chromosome}...")
+    count = 0
+    cmd = ['bcftools', 'view', '-r', chromosome, vcf_file_path]
+    try:
+        with subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, bufsize=1) as proc:
+            for line in proc.stdout:
+                if line.startswith("#"):
+                    continue
+                fields = line.strip().split('\t')
+                if len(fields) >= 5:
+                    # Add the number of alternate alleles. e.g., A->G,T counts as 2.
+                    count += len(fields[4].split(','))
+        return count
+    except FileNotFoundError:
+        print(f"Error: 'bcftools' not found. Please ensure it's installed and in your PATH.", file=sys.stderr)
+        sys.exit(1)
+    except Exception:
+        return -1  # Return an error indicator
+
+
 def query_vcf_for_chromosome(vcf_file_path, chromosome):
     """Queries a VCF file and returns a set of variants. Runs silently in workers."""
     local_variants = set()
@@ -39,12 +64,9 @@ def query_vcf_for_chromosome(vcf_file_path, chromosome):
                         local_variants.add((pos, ref, alt))
         return local_variants
     except FileNotFoundError:
-        # This error is critical and should be raised.
         print(f"FATAL ERROR in worker: 'bcftools' not found.", file=sys.stderr)
-        # Exit the worker process with an error code.
         sys.exit(1)
     except Exception:
-        # Other exceptions can be ignored, returning an empty set.
         return set()
 
 
@@ -156,6 +178,14 @@ def main():
     os.makedirs(true_dir, exist_ok=True)
     os.makedirs(false_dir, exist_ok=True)
 
+    # --- Pre-computation and Display ---
+    # Call the new counting function from the main process
+    total_variants = get_variant_count(args.vcf_file, args.chr)
+    if total_variants >= 0:
+        print(f"Found a total of {total_variants:,} unique variants to be used as ground truth.\n")
+    else:
+        print("Could not count variants due to an error.\n")
+
     node_dirs = [d.path for d in os.scandir(args.tensor_folder_path) if d.is_dir()]
     total_nodes = len(node_dirs)
     if total_nodes == 0:
@@ -163,7 +193,7 @@ def main():
         return
 
     # --- Parallel Processing ---
-    print(f"Found {total_nodes} nodes. Initializing {args.workers} worker processes and loading data...")
+    print(f"Found {total_nodes} nodes. Initializing {args.workers} worker processes...")
     print("(This may take a moment before the progress bar appears...)\n")
 
     worker_func = partial(
