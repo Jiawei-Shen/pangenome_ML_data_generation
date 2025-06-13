@@ -10,7 +10,6 @@ from multiprocessing import Pool, cpu_count
 from functools import partial
 
 # --- Global variables for worker processes ---
-# These will be populated by the init_worker function in each process
 vcf_variants = set()
 node_positions = {}
 
@@ -24,8 +23,7 @@ def format_time(seconds):
 
 
 def query_vcf_for_chromosome(vcf_file_path, chromosome):
-    """Queries a VCF file and returns a set of variants."""
-    print(f"[{os.getpid()}] Querying VCF for {chromosome}...")
+    """Queries a VCF file and returns a set of variants. Runs silently in workers."""
     local_variants = set()
     cmd = ['bcftools', 'view', '-r', chromosome, vcf_file_path]
     try:
@@ -39,58 +37,46 @@ def query_vcf_for_chromosome(vcf_file_path, chromosome):
                     ref = fields[3].upper()
                     for alt in fields[4].upper().split(','):
                         local_variants.add((pos, ref, alt))
-        print(f"[{os.getpid()}] Loaded {len(local_variants)} variants from VCF.")
         return local_variants
     except FileNotFoundError:
-        print(f"Error: 'bcftools' not found. Please ensure it's installed and in your PATH.", file=sys.stderr)
+        # This error is critical and should be raised.
+        print(f"FATAL ERROR in worker: 'bcftools' not found.", file=sys.stderr)
+        # Exit the worker process with an error code.
         sys.exit(1)
-    except Exception as e:
-        print(f"Error running bcftools in process {os.getpid()}: {e}", file=sys.stderr)
+    except Exception:
+        # Other exceptions can be ignored, returning an empty set.
         return set()
 
 
 def load_node_positions(json_path):
-    """Loads node position data from a JSON file."""
-    print(f"[{os.getpid()}] Loading node position data...")
+    """Loads node position data from a JSON file. Runs silently in workers."""
     try:
         with open(json_path) as f:
             data = json.load(f)
-        local_node_dict = {
+        return {
             str(node.get("node_id")): node.get("grch38_position_start")
             for node in data.get("nodes", [])
             if node.get("node_id") and isinstance(node.get("grch38_position_start"), int)
         }
-        print(f"[{os.getpid()}] Loaded {len(local_node_dict)} node positions.")
-        return local_node_dict
-    except Exception as e:
-        print(f"Error loading node positions in process {os.getpid()}: {e}", file=sys.stderr)
-        sys.exit(1)
+    except Exception:
+        return {}
 
 
 def init_worker(vcf_path, vcf_chrom, node_pos_path):
-    """
-    Initializer for each worker process. Loads read-only data into globals.
-    This function runs ONCE per worker process.
-    """
+    """Initializer for each worker process. Loads read-only data into globals silently."""
     global vcf_variants, node_positions
-    print(f"Initializing worker {os.getpid()}...")
     vcf_variants = query_vcf_for_chromosome(vcf_path, vcf_chrom)
     node_positions = load_node_positions(node_pos_path)
 
 
 def process_node_directory(node_dir, true_dir, false_dir, use_symlinks):
-    """
-    Processes a single node directory.
-    NOTE: It now uses the global 'vcf_variants' and 'node_positions'
-    instead of receiving them as arguments.
-    """
+    """Processes a single node directory using the globally loaded data."""
     node_id = os.path.basename(node_dir)
     summary_path = os.path.join(node_dir, "variant_summary.json")
 
     if not os.path.isfile(summary_path):
         return [], 0, 0
 
-    # Each worker has its own copy of this data now.
     start_pos = node_positions.get(node_id)
     if start_pos is None:
         return [], 0, 0
@@ -103,7 +89,7 @@ def process_node_directory(node_dir, true_dir, false_dir, use_symlinks):
         with open(summary_path) as f:
             summary = json.load(f)
     except (IOError, json.JSONDecodeError):
-        return [], 0, 0  # Silently fail for a single bad file
+        return [], 0, 0
 
     for variant in summary.get("variants_passing_af_filter", []):
         tensor_file = variant.get("tensor_file")
@@ -137,10 +123,8 @@ def process_node_directory(node_dir, true_dir, false_dir, use_symlinks):
                 os.symlink(os.path.abspath(tensor_path), destination_path)
             else:
                 shutil.copyfile(tensor_path, destination_path)
-        except FileExistsError:
+        except (FileExistsError, OSError):
             pass
-        except OSError:
-            pass  # Silently ignore file creation errors
 
         summary_records.append({
             "node_id": node_id, "tensor_file": tensor_file,
@@ -155,7 +139,6 @@ def process_node_directory(node_dir, true_dir, false_dir, use_symlinks):
 def main():
     parser = argparse.ArgumentParser(
         description="Classify variant tensors against a VCF file (Robust Parallel Version).")
-    # ... (rest of the argument parser setup is identical)
     parser.add_argument("tensor_folder_path", help="Path to the parent folder containing node tensor directories.")
     parser.add_argument("vcf_file", help="Path to the VCF file for ground truth variants.")
     parser.add_argument("node_pos_json", help="Path to the JSON file with node positions.")
@@ -180,7 +163,8 @@ def main():
         return
 
     # --- Parallel Processing ---
-    print(f"\nStarting classification of {total_nodes} nodes using {args.workers} workers...")
+    print(f"Found {total_nodes} nodes. Initializing {args.workers} worker processes and loading data...")
+    print("(This may take a moment before the progress bar appears...)\n")
 
     worker_func = partial(
         process_node_directory,
@@ -194,12 +178,8 @@ def main():
     total_false = 0
     start_time = time.monotonic()
 
-    # This is the key change!
-    # We pass the initializer function and its arguments.
-    # Each worker will run init_worker before starting its tasks.
     init_args = (args.vcf_file, args.chr, args.node_pos_json)
     with Pool(processes=args.workers, initializer=init_worker, initargs=init_args) as pool:
-        # imap_unordered is memory-efficient and provides results as they complete
         results = pool.imap_unordered(worker_func, node_dirs)
 
         for i, (records, true_c, false_c) in enumerate(results):
@@ -213,7 +193,7 @@ def main():
             rate = processed_count / elapsed_time if elapsed_time > 0 else 0
 
             eta_str = "..."
-            if processed_count > 5 and rate > 0:
+            if rate > 0:
                 eta_seconds = (total_nodes - processed_count) / rate
                 eta_str = format_time(eta_seconds)
 
@@ -242,5 +222,4 @@ def main():
 if __name__ == "__main__":
     if sys.version_info < (3, 6):
         sys.exit("This script requires Python 3.6+.")
-    # The if __name__ == "__main__" guard is CRITICAL for multiprocessing on Windows/macOS
     main()
