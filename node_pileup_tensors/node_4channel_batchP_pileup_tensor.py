@@ -359,8 +359,8 @@ def init_worker(dat_file_path_for_worker, base_output_dir_for_worker):
         sys.exit(1)
 
 
-def process_single_node_for_pileup(task_args_with_af_thresh):
-    node_id, dat_file_offset, n_records, node_sequence, min_af_threshold = task_args_with_af_thresh
+def process_single_node_for_pileup(task_args):
+    node_id, dat_file_offset, n_records, node_sequence, min_af_threshold, min_variants_threshold = task_args
     global worker_dat_file, worker_base_output_dir
 
     tensor_files_generated_for_node = 0
@@ -487,8 +487,15 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
                 else:
                     other_allele_count += 1
 
+        # *** NEW FILTER: Minimum number of variant reads ***
+        # Filters out variants where the alternate allele count is not strictly greater than the threshold.
+        # e.g., with default threshold of 2, counts of 0, 1, and 2 are skipped.
+        if alt_allele_count <= min_variants_threshold:
+            continue
+
         current_alt_freq = alt_allele_count / locus_coverage if locus_coverage > 0 else 0.0
-        if current_alt_freq < min_af_threshold: continue
+        if current_alt_freq < min_af_threshold:
+            continue
 
         variant_key_string = f"{v_pos}_{v_type}_{v_ref_from_cigar}_{v_alt_from_cigar}"
         window_center_pos = v_pos + 1 if v_type == 'I' else v_pos
@@ -731,6 +738,8 @@ def main():
                         help="Maximum number of reads to display per pileup in console view.")
     parser.add_argument("--min_af", type=float, default=0.1,
                         help="Minimum allele frequency for a variant to be processed for tensor generation and JSON summary.")
+    parser.add_argument("--min_variants", type=int, default=2,
+                        help="The number of reads supporting the alternate allele must be strictly greater than this value for a variant to be processed.")
     args = parser.parse_args()
 
     # --- Argument Validation ---
@@ -746,6 +755,8 @@ def main():
         sys.exit(f"Error: GFA file not found: {args.gfa}")
     if not (0.0 <= args.min_af <= 1.0):
         sys.exit("Error: --min_af must be between 0.0 and 1.0.")
+    if args.min_variants < 0:
+        sys.exit("Error: --min_variants must be a non-negative integer.")
 
     # --- Setup ---
     effective_num_workers = args.num_workers if args.num_workers and args.num_workers > 0 else (os.cpu_count() or 1)
@@ -836,7 +847,7 @@ def main():
             skipped_nodes_count_pre_submit += 1
             continue
         tasks_for_submission.append(
-            (node_id_val_int, node_dat_info_tuple[0], node_dat_info_tuple[1], node_sequence_val, args.min_af))
+            (node_id_val_int, node_dat_info_tuple[0], node_dat_info_tuple[1], node_sequence_val, args.min_af, args.min_variants))
 
     print(f"Task preparation completed in {time.time() - task_prep_s_time:.2f}s.")
     if skipped_nodes_count_pre_submit > 0:
