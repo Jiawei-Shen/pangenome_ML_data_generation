@@ -77,7 +77,6 @@ def main():
             continue
 
         node_count += 1
-        print(f"Processing node {node_id} ({node_count})...")
 
         try:
             with open(summary_path) as f:
@@ -89,6 +88,9 @@ def main():
         variants = summary.get("variants_passing_af_filter", [])
         for variant in variants:
             total += 1
+            if total % 1000 == 0:
+                print(f"Processed {total} tensor files so far...")
+
             tensor_file = variant.get("tensor_file")
             variant_key = variant.get("variant_key")
 
