@@ -7,55 +7,43 @@ import shutil
 import sys
 
 def query_vcf_for_chromosome(vcf_file_path, chromosome):
-    print(f"Querying VCF file '{vcf_file_path}' for '{chromosome}' variants using 'bcftools'...")
-    chromosome_variants = set()
+    print(f"Querying VCF for {chromosome} using bcftools...")
+    variants = set()
     cmd = ['bcftools', 'view', '-r', chromosome, vcf_file_path]
-    try:
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, stderr=subprocess.PIPE)
-        stdout, stderr = process.communicate()
-        if process.returncode != 0:
-            print(f"Error: bcftools failed for chromosome '{chromosome}'", file=sys.stderr)
-            if stderr:
-                print(f"bcftools stderr:\n{stderr.strip()}", file=sys.stderr)
-            return None
-        for line in stdout.splitlines():
-            if not line.startswith('#'):
-                fields = line.strip().split('\t')
-                if len(fields) >= 5:
-                    try:
-                        pos = int(fields[1])
-                        ref = fields[3].upper()
-                        alt_alleles = fields[4].upper().split(',')
-                        for alt in alt_alleles:
-                            chromosome_variants.add((pos, ref, alt))
-                    except ValueError:
-                        print(f"Warning: Could not parse VCF line: {line.strip()}", file=sys.stderr)
-        print(f"Found {len(chromosome_variants)} variants on '{chromosome}' in VCF.")
-        return chromosome_variants
-    except FileNotFoundError:
-        print(f"Error: 'bcftools' not found.", file=sys.stderr)
-        return None
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return None
 
-def load_node_positions(json_file_path):
-    print(f"Loading node positions from '{json_file_path}'...")
     try:
-        with open(json_file_path, 'r') as f:
-            data = json.load(f)
-        nodes = data.get("nodes", [])
-        return {
-            str(entry["node_id"]): int(entry["grch38_position_start"])
-            for entry in nodes
-            if "node_id" in entry and "grch38_position_start" in entry
-        }
-    except Exception as e:
-        print(f"Error loading node positions: {e}", file=sys.stderr)
-        return {}
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        for line in proc.stdout.splitlines():
+            if line.startswith("#"):
+                continue
+            fields = line.strip().split('\t')
+            if len(fields) >= 5:
+                pos = int(fields[1])
+                ref = fields[3].upper()
+                for alt in fields[4].upper().split(','):
+                    variants.add((pos, ref, alt))
+        print(f"Loaded {len(variants)} variants from VCF")
+        return variants
+    except subprocess.CalledProcessError as e:
+        print(f"Error running bcftools: {e.stderr}", file=sys.stderr)
+        return set()
 
-def calculate_genomic_position(start_pos, offset):
-    return start_pos + offset + 1
+def load_node_positions(json_path):
+    print(f"Loading node position data from {json_path}...")
+    with open(json_path) as f:
+        data = json.load(f)
+
+    node_dict = {}
+    for node in data.get("nodes", []):
+        node_id = str(node.get("node_id"))
+        pos = node.get("grch38_position_start")
+        if node_id and isinstance(pos, int):
+            node_dict[node_id] = pos
+    print(f"Loaded {len(node_dict)} node positions")
+    return node_dict
+
+def calculate_genomic_position(start, offset):
+    return start + offset + 1
 
 def main():
     parser = argparse.ArgumentParser()
@@ -66,16 +54,19 @@ def main():
     parser.add_argument("--chr", default="chr1")
     args = parser.parse_args()
 
-    os.makedirs(os.path.join(args.output_folder, "true"), exist_ok=True)
-    os.makedirs(os.path.join(args.output_folder, "false"), exist_ok=True)
+    os.makedirs(args.output_folder, exist_ok=True)
+    true_dir = os.path.join(args.output_folder, "true")
+    false_dir = os.path.join(args.output_folder, "false")
+    os.makedirs(true_dir, exist_ok=True)
+    os.makedirs(false_dir, exist_ok=True)
 
     vcf_variants = query_vcf_for_chromosome(args.vcf_file, args.chr)
-    if vcf_variants is None:
-        sys.exit(1)
-
     node_positions = load_node_positions(args.node_pos_json)
 
-    summary = []
+    total = true_count = false_count = 0
+    node_count = 0
+    summary_records = []
+
     for node_id in os.listdir(args.tensor_folder_path):
         node_dir = os.path.join(args.tensor_folder_path, node_id)
         if not os.path.isdir(node_dir):
@@ -85,52 +76,73 @@ def main():
         if not os.path.isfile(summary_path):
             continue
 
+        node_count += 1
+        print(f"Processing node {node_id} ({node_count})...")
+
         try:
-            with open(summary_path, 'r') as f:
-                summary_json = json.load(f)
+            with open(summary_path) as f:
+                summary = json.load(f)
         except Exception as e:
-            print(f"Warning: Failed to load {summary_path}: {e}", file=sys.stderr)
+            print(f"Could not load {summary_path}: {e}", file=sys.stderr)
             continue
 
-        start_pos = node_positions.get(node_id)
-        for variant in summary_json.get("variants_passing_af_filter", []):
+        variants = summary.get("variants_passing_af_filter", [])
+        for variant in variants:
+            total += 1
             tensor_file = variant.get("tensor_file")
             variant_key = variant.get("variant_key")
+
             if not tensor_file or not variant_key or not tensor_file.endswith(".npy"):
                 continue
+
             tensor_path = os.path.join(node_dir, tensor_file)
             if not os.path.isfile(tensor_path):
                 continue
 
             try:
-                parts = variant_key.split('_')
-                pos = int(parts[0])
+                parts = variant_key.split("_")
+                offset = int(parts[0])
                 ref = parts[2].upper()
                 alt = parts[3].upper()
             except Exception:
                 continue
 
+            start_pos = node_positions.get(node_id)
             if start_pos is None:
                 continue
-            gpos = calculate_genomic_position(start_pos, pos)
-            match = (gpos, ref, alt) in vcf_variants
-            dest = os.path.join(args.output_folder, "true" if match else "false", f"{node_id}_{tensor_file}")
-            shutil.copy2(tensor_path, dest)
 
-            summary.append({
+            grch38_pos = calculate_genomic_position(start_pos, offset)
+            match = (grch38_pos, ref, alt) in vcf_variants
+
+            dest_dir = true_dir if match else false_dir
+            shutil.copy2(tensor_path, os.path.join(dest_dir, f"{node_id}_{tensor_file}"))
+            if match:
+                true_count += 1
+            else:
+                false_count += 1
+
+            summary_records.append({
                 "node_id": node_id,
                 "tensor_file": tensor_file,
                 "variant_key": variant_key,
-                "genomic_position": gpos,
+                "genomic_position": grch38_pos,
                 "ref": ref,
                 "alt": alt,
                 "classification": "true" if match else "false"
             })
 
-    with open(os.path.join(args.output_folder, "classification_summary.json"), 'w') as f:
-        json.dump({"chromosome": args.chr, "results": summary}, f, indent=2)
+    summary_json_path = os.path.join(args.output_folder, "classification_summary.json")
+    with open(summary_json_path, 'w') as f:
+        json.dump({"chromosome": args.chr, "results": summary_records}, f, indent=2)
+    print(f"Classification summary written to {summary_json_path}")
 
-    print(f"Classification complete. Summary written to {args.output_folder}/classification_summary.json")
+    print("\n--- Classification Summary ---")
+    print(f"Total nodes processed: {node_count}")
+    print(f"Total tensors processed: {total}")
+    print(f"True: {true_count}")
+    print(f"False: {false_count}")
 
 if __name__ == "__main__":
+    if sys.version_info < (3, 6):
+        sys.exit("Requires Python 3.6+")
     main()
