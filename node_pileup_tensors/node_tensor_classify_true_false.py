@@ -5,8 +5,17 @@ import os
 import subprocess
 import shutil
 import sys
+import time
 from multiprocessing import Pool, cpu_count
 from functools import partial
+
+
+def format_time(seconds):
+    """Formats a duration in seconds into HH:MM:SS format."""
+    seconds = int(seconds)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02}:{minutes:02}:{seconds:02}"
 
 
 def query_vcf_for_chromosome(vcf_file_path, chromosome):
@@ -77,7 +86,7 @@ def process_node_directory(node_dir, vcf_variants, node_positions, true_dir, fal
         with open(summary_path) as f:
             summary = json.load(f)
     except (IOError, json.JSONDecodeError) as e:
-        print(f"Warning: Could not read or parse {summary_path}: {e}", file=sys.stderr)
+        print(f"\nWarning: Could not read or parse {summary_path}: {e}", file=sys.stderr)
         return [], 0, 0
 
     start_pos = node_positions.get(node_id)
@@ -122,10 +131,9 @@ def process_node_directory(node_dir, vcf_variants, node_positions, true_dir, fal
             else:
                 shutil.copyfile(tensor_path, destination_path)
         except FileExistsError:
-            # Skip if file already exists from a previous run
-            pass
+            pass  # Skip if file already exists from a previous run
         except OSError as e:
-            print(f"Warning: Could not create link/copy for {tensor_path}: {e}", file=sys.stderr)
+            print(f"\nWarning: Could not create link/copy for {tensor_path}: {e}", file=sys.stderr)
 
         summary_records.append({
             "node_id": node_id,
@@ -164,10 +172,13 @@ def main():
     node_positions = load_node_positions(args.node_pos_json)
 
     node_dirs = [d.path for d in os.scandir(args.tensor_folder_path) if d.is_dir()]
+    total_nodes = len(node_dirs)
+    if total_nodes == 0:
+        print("No node directories found to process. Exiting.")
+        return
 
     # --- Parallel Processing ---
-    print(f"\nStarting classification of {len(node_dirs)} nodes using {args.workers} workers...")
-    # Use a partial function to pass fixed arguments to the worker
+    print(f"\nStarting classification of {total_nodes} nodes using {args.workers} workers...")
     worker_func = partial(
         process_node_directory,
         vcf_variants=vcf_variants,
@@ -180,19 +191,37 @@ def main():
     all_summary_records = []
     total_true = 0
     total_false = 0
+    start_time = time.monotonic()
 
     with Pool(processes=args.workers) as pool:
-        # imap_unordered is memory-efficient and provides results as they complete
         results = pool.imap_unordered(worker_func, node_dirs)
 
         for i, (records, true_c, false_c) in enumerate(results):
+            processed_count = i + 1
             all_summary_records.extend(records)
             total_true += true_c
             total_false += false_c
 
-            # Update progress on the same line
-            progress = (i + 1) / len(node_dirs) * 100
-            print(f"\rProcessed {i + 1}/{len(node_dirs)} nodes ({progress:.1f}%)", end="")
+            elapsed_time = time.monotonic() - start_time
+
+            # --- Progress and ETA Calculation ---
+            progress = processed_count / total_nodes
+            rate = processed_count / elapsed_time if elapsed_time > 0 else 0
+
+            eta_str = "..."
+            # Display ETA only after a few results for a more stable estimate
+            if processed_count > 5 and rate > 0:
+                remaining_items = total_nodes - processed_count
+                eta_seconds = remaining_items / rate
+                eta_str = format_time(eta_seconds)
+
+            elapsed_str = format_time(elapsed_time)
+            print(
+                f"\rProgress: {processed_count}/{total_nodes} ({progress:.1%}) | "
+                f"Elapsed: {elapsed_str} | ETA: {eta_str} | Rate: {rate:.2f} nodes/s  ",
+                end=""
+            )
+
     print("\nProcessing complete.")
 
     # --- Finalization ---
@@ -202,7 +231,7 @@ def main():
         json.dump({"chromosome": args.chr, "results": all_summary_records}, f, indent=2)
 
     print("\n--- Classification Summary ---")
-    print(f"Total nodes processed: {len(node_dirs)}")
+    print(f"Total nodes processed: {total_nodes}")
     print(f"Total tensors classified: {total_true + total_false}")
     print(f"True (matches in VCF): {total_true}")
     print(f"False (not in VCF): {total_false}")
