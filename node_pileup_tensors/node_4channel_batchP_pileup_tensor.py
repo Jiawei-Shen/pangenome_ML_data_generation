@@ -442,6 +442,7 @@ def process_single_node_for_pileup(task_args):
             continue
 
         current_alt_freq = alt_allele_count / locus_coverage if locus_coverage > 0 else 0.0
+        print(current_alt_freq)
         if current_alt_freq < min_af_threshold:
             continue
 
