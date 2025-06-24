@@ -146,7 +146,6 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_qu
 
                 if read_idx < len(read_sequence):
                     allele = read_sequence[read_idx].upper()
-                    # *** BUG FIX ***: Ensure calculated quality is never negative.
                     quality = max(0, ord(read_quality_str[read_idx]) - 33) if read_idx < len(read_quality_str) else 0
 
                     if expected_var_type in ('I', 'D'):
@@ -159,10 +158,9 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_qu
         elif op == 'I':
             if expected_var_type == 'I' and (current_node_pos - 1) == target_node_pos:
                 if current_read_pos + length <= len(read_sequence):
-                    # This part was already correct, ensuring only non-negative qualities are used.
                     qualities = [ord(q) - 33 for q in read_quality_str[current_read_pos: current_read_pos + length] if
                                  (ord(q) - 33) >= 0]
-                    mean_quality = sum(qualities) / len(qualities) if qualities else 0
+                    mean_quality = sum(qualities) / len(qualities) if qualities else 0.0
                     return read_sequence[current_read_pos: current_read_pos + length].upper(), mean_quality
                 return None, None
             current_read_pos += length
@@ -283,7 +281,6 @@ def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
                     bases[win_idx] = BASE_TO_INDEX.get(base_char, BASE_TO_INDEX['N'])
                     if r_aln < qual_str_len:
                         try:
-                            # Use max(0,...) to prevent negative quality scores
                             quals[win_idx] = max(0, ord(segment_quality_str[r_aln]) - 33)
                         except (TypeError, ValueError):
                             quals[win_idx] = DEFAULT_QUALITY_PADDING
@@ -627,7 +624,6 @@ def main():
 
     parser.add_argument("--min_af", type=float, default=0.1, help="Minimum allele frequency to process a variant")
     parser.add_argument("--min_variants", type=int, default=2, help="Alternate allele count must be > this value")
-    # Add the new argument for the base quality filter
     parser.add_argument("--min_allele_bq", type=float, default=15.0,
                         help="Minimum mean base quality of allele-supporting bases")
 
@@ -671,7 +667,6 @@ def main():
     for node_id in target_node_ids:
         if str(node_id) in node_sequences and node_id in full_idx_data:
             offset, n_records = full_idx_data[node_id]
-            # Add the new argument to the task tuple
             tasks.append((node_id, offset, n_records, node_sequences[str(node_id)], args.min_af, args.min_variants,
                           args.min_allele_bq))
 
@@ -680,22 +675,39 @@ def main():
 
     print(f"\nSubmitting {len(tasks)} tasks to {args.num_workers} workers...")
     total_tensors = 0
+    nodes_processed_since_last_report = 0
+    tensors_since_last_report = 0
+    batch_start_time = time.time()
+
     with ProcessPoolExecutor(max_workers=args.num_workers, initializer=init_worker,
                              initargs=(args.dat, args.output)) as executor:
         future_to_node = {executor.submit(process_single_node_for_pileup, task): task[0] for task in tasks}
 
         for i, future in enumerate(as_completed(future_to_node)):
             node_id = future_to_node[future]
+            nodes_processed_since_last_report += 1
             try:
                 _, view_data, tensor_count = future.result()
                 total_tensors += tensor_count
+                tensors_since_last_report += tensor_count
+
                 if args.view is not None:
                     display_pileup_data(view_data, str(node_id), node_sequences[str(node_id)], args.max_view_reads,
                                         args.view if args.view != -1 else float('inf'))
-                print(
-                    f"Processed node {node_id} ({i + 1}/{len(tasks)}). Tensors created: {tensor_count}. Total: {total_tensors}.")
             except Exception as e:
                 print(f"Error processing node {node_id}: {e}", file=sys.stderr)
+
+            # New progress reporting logic
+            if nodes_processed_since_last_report >= 1000 or (i + 1) == len(tasks):
+                elapsed_time = time.time() - batch_start_time
+                rate = nodes_processed_since_last_report / elapsed_time if elapsed_time > 0 else 0
+                print(
+                    f"  Processed batch of {nodes_processed_since_last_report} nodes (total: {i + 1}/{len(tasks)}) in {elapsed_time:.2f}s "
+                    f"({rate:.1f} nodes/sec). Tensors in batch: {tensors_since_last_report}. Total tensors: {total_tensors}.")
+                # Reset batch counters
+                nodes_processed_since_last_report = 0
+                tensors_since_last_report = 0
+                batch_start_time = time.time()
 
     print(f"\nProcessing complete. Total tensors generated: {total_tensors}.")
 
