@@ -362,7 +362,7 @@ def process_single_node_for_pileup(task_args):
                 # current_decoded_cigar_ops = list(reversed(original_decoded_cigar_ops))
 
                 current_read_sequence = reverse_complement(seq)
-                current_quality_str = qual_values[::-1]
+                current_quality_values = qual_values[::-1]
                 current_decoded_cigar_ops = [op for op in
                                              reversed(original_decoded_cigar_ops)] if original_decoded_cigar_ops else []
 
