@@ -113,7 +113,7 @@ def process_node_directory(node_dir, true_dir, false_dir, use_symlinks):
     except (IOError, json.JSONDecodeError):
         return [], 0, 0
 
-    for variant in summary.get("variants_passing_af_filter", []):
+    for variant in summary.get("variants_passing_af_filters", []):
         tensor_file = variant.get("tensor_file")
         variant_key = variant.get("variant_key")
 
