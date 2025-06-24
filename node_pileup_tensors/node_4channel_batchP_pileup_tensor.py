@@ -328,7 +328,6 @@ def process_single_node_for_pileup(task_args):
     os.makedirs(node_specific_output_dir, exist_ok=True)
 
     node_len = len(node_sequence)
-    view_oriented_variant_data = {}
     aligned_read_segments = []
     try:
         worker_dat_file.seek(dat_file_offset + 10)
@@ -385,6 +384,7 @@ def process_single_node_for_pileup(task_args):
             candidate_variants[(v_pos, v_type, v_ref, v_alt)] += 1
 
     variant_headers_for_summary = []
+    view_oriented_variant_data = {}
     half_window = TENSOR_WINDOW_SIZE // 2
 
     for (v_pos, v_type, v_ref_from_cigar, v_alt_from_cigar), _ in candidate_variants.items():
