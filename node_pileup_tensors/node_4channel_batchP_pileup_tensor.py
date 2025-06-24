@@ -18,10 +18,10 @@ RECORD_SIZE = RECORD_STRUCT.size
 
 # Base to Index Mapping
 BASE_TO_INDEX = {
-    'A': 2, 'C': 3, 'G': 5, 'T': 7,
-    'N': 1,
-    '*': 9,
-    '_PADDING_': 0
+    'A': 2, 'C': 3, 'G': 5, 'T': 7,  # Standard bases
+    'N': 1,  # Unknown or ambiguous base
+    '*': 9,  # Deletion character from CIGAR or gap
+    '_PADDING_': 0  # Representing padding, mapped to index 0
 }
 PADDING_BASE_INDEX = 0
 
@@ -132,6 +132,7 @@ def decode_cigar_to_int_ops(cigar_string):
         return []
 
 
+# This function is now modified to return the allele and its specific base quality
 def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_quality_str, read_cigar_ops_decoded,
                                      target_node_pos, node_sequence,
                                      expected_var_type=None, expected_ref_allele_for_indel=None):
@@ -140,6 +141,7 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_qu
 
     for length, op in read_cigar_ops_decoded:
         if op in ('M', '=', 'X'):
+            # Check if the target position is within this CIGAR operation block
             if current_node_pos <= target_node_pos < current_node_pos + length:
                 offset_in_block = target_node_pos - current_node_pos
                 read_idx = current_read_pos + offset_in_block
@@ -151,13 +153,14 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_qu
                     if expected_var_type in ('I', 'D'):
                         return "REF_STATE_FOR_INDEL", quality
                     return allele, quality
-                return None, None
+                return None, None  # Read sequence ended unexpectedly
             current_node_pos += length
             current_read_pos += length
 
-        elif op == 'I':
+        elif op == 'I':  # Insertion
             if expected_var_type == 'I' and (current_node_pos - 1) == target_node_pos:
                 if current_read_pos + length <= len(read_sequence):
+                    # Calculate mean quality of the inserted bases
                     qualities = [ord(q) - 33 for q in read_quality_str[current_read_pos: current_read_pos + length] if
                                  (ord(q) - 33) >= 0]
                     mean_quality = sum(qualities) / len(qualities) if qualities else 0
@@ -165,23 +168,23 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_qu
                 return None, None
             current_read_pos += length
 
-        elif op == 'D':
+        elif op == 'D':  # Deletion
             if current_node_pos <= target_node_pos < current_node_pos + length:
                 if expected_var_type == 'I': return "OTHER_FOR_INDEL", None
                 if expected_var_type == 'D':
                     if 0 <= current_node_pos < len(node_sequence) and current_node_pos + length <= len(node_sequence):
                         deleted_seq_in_ref_context = node_sequence[current_node_pos: current_node_pos + length]
                         if deleted_seq_in_ref_context == expected_ref_allele_for_indel:
-                            return "*", None
+                            return "*", None  # Quality is not applicable for a deletion
                         else:
                             return "OTHER_FOR_INDEL", None
                     return "OTHER_FOR_INDEL", None
                 return "*", None
             current_node_pos += length
 
-        elif op == 'S':
+        elif op == 'S':  # Soft clip
             current_read_pos += length
-        elif op == 'N':
+        elif op == 'N':  # Skipped region
             current_node_pos += length
 
         if current_node_pos > target_node_pos + 1 and not (
@@ -319,6 +322,7 @@ def init_worker(dat_file_path_for_worker, base_output_dir_for_worker):
 
 
 def process_single_node_for_pileup(task_args):
+    # Unpack the new argument for this worker
     node_id, dat_file_offset, n_records, node_sequence, min_af_threshold, min_variants_threshold, min_allele_bq_threshold = task_args
     global worker_dat_file, worker_base_output_dir
 
@@ -356,8 +360,7 @@ def process_single_node_for_pileup(task_args):
             original_decoded_cigar_ops = decode_cigar_to_int_ops(cigar_str_original)
             if not original_decoded_cigar_ops and cigar_str_original != '*': continue
 
-            # *** CRITICAL BUG FIX AREA ***
-            # Use temporary variables for reverse strand modifications to avoid affecting other reads.
+            # Correctly handle reverse strand reads by using temporary variables
             current_read_sequence = seq
             current_quality_str = qual_str
             current_decoded_cigar_ops = original_decoded_cigar_ops
@@ -367,13 +370,14 @@ def process_single_node_for_pileup(task_args):
                 current_read_sequence = reverse_complement(seq)
                 current_quality_str = qual_str[::-1]
                 current_decoded_cigar_ops = list(reversed(original_decoded_cigar_ops))
-
-                # Correct offset calculation for reverse strand reads
+                # This offset calculation for reverse strand reads might need adjustment based on the specific alignment logic.
+                # Assuming offset is from the start of the node for both strands.
+                # A more robust approach would be needed if offset semantics differ for reverse strand.
                 alignment_span_on_node = sum(l for l, op in current_decoded_cigar_ops if op in 'MDN=X')
                 current_offset_on_node = node_len - off_from_file - alignment_span_on_node
 
             aligned_read_segments.append({
-                "offset_on_node": current_offset_on_node,  # Use the corrected offset
+                "offset_on_node": current_offset_on_node,
                 "read_sequence": current_read_sequence,
                 "processed_quality_str": current_quality_str,
                 "cigar_ops": current_decoded_cigar_ops,
@@ -417,6 +421,7 @@ def process_single_node_for_pileup(task_args):
             ref_allele_for_indel_context = expected_ref_for_af
 
         for seg in aligned_read_segments:
+            # Pass the quality string to the helper function
             allele_observed, bq = get_allele_from_read_at_node_pos(
                 seg["offset_on_node"], seg["read_sequence"], seg["processed_quality_str"], seg["cigar_ops"],
                 v_pos, node_sequence, v_type, ref_allele_for_indel_context)
@@ -425,7 +430,7 @@ def process_single_node_for_pileup(task_args):
                 locus_coverage += 1
                 if allele_observed == expected_alt_for_af:
                     alt_allele_count += 1
-                    if bq is not None:
+                    if bq is not None:  # Collect base quality if available
                         alt_allele_base_qualities.append(bq)
                 elif allele_observed == expected_ref_for_af or \
                         (v_type in ('I', 'D') and allele_observed == "REF_STATE_FOR_INDEL"):
@@ -440,6 +445,7 @@ def process_single_node_for_pileup(task_args):
         if current_alt_freq < min_af_threshold:
             continue
 
+        # New Filter: Apply the mean base quality threshold for the alternate allele
         mean_alt_bq = sum(alt_allele_base_qualities) / len(
             alt_allele_base_qualities) if alt_allele_base_qualities else 0.0
         if mean_alt_bq < min_allele_bq_threshold:
@@ -627,6 +633,7 @@ def main():
 
     parser.add_argument("--min_af", type=float, default=0.1, help="Minimum allele frequency to process a variant")
     parser.add_argument("--min_variants", type=int, default=2, help="Alternate allele count must be > this value")
+    # Add the new argument for the base quality filter
     parser.add_argument("--min_allele_bq", type=float, default=15.0,
                         help="Minimum mean base quality of allele-supporting bases")
 
@@ -670,6 +677,7 @@ def main():
     for node_id in target_node_ids:
         if str(node_id) in node_sequences and node_id in full_idx_data:
             offset, n_records = full_idx_data[node_id]
+            # Add the new argument to the task tuple
             tasks.append((node_id, offset, n_records, node_sequences[str(node_id)], args.min_af, args.min_variants,
                           args.min_allele_bq))
 
