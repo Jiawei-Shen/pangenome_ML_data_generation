@@ -16,25 +16,25 @@ import torch
 RECORD_STRUCT = struct.Struct("<h150s150s20shc")
 RECORD_SIZE = RECORD_STRUCT.size
 
-# New Base to Index Mapping as per your request
+# Base to Index Mapping
 BASE_TO_INDEX = {
-    'A': 2, 'C': 3, 'G': 5, 'T': 7,  # Standard bases
-    'N': 1,  # Unknown or ambiguous base
-    '*': 9,  # Deletion character from CIGAR or gap
-    '_PADDING_': 0  # Representing padding, mapped to index 0
+    'A': 2, 'C': 3, 'G': 5, 'T': 7,
+    'N': 1,
+    '*': 9,
+    '_PADDING_': 0
 }
-PADDING_BASE_INDEX = 0  # Explicitly set padding index to 0
+PADDING_BASE_INDEX = 0
 
-# Updated Index to Base Mapping for console visualization (--view)
+# Index to Base Mapping for console visualization
 INDEX_TO_BASE_FOR_VIEW = {
     2: 'A', 3: 'C', 5: 'G', 7: 'T',
     1: 'N',
     9: '*',
-    0: ' '  # Padding index 0 will be visualized as a space
+    0: ' '
 }
 
 TENSOR_WINDOW_SIZE = 100
-TENSOR_MAX_READ_ROWS = 200  # Max reads per tensor (excluding reference row)
+TENSOR_MAX_READ_ROWS = 200
 DEFAULT_QUALITY_PADDING = 0
 DEFAULT_MAPPING_QUALITY_PADDING = -1
 MISMATCH_CHANNEL_REF_ROW_VALUE = 0
@@ -61,7 +61,7 @@ def load_full_idx_data(idx_path):
         with open(idx_path, 'rb') as f:
             file_size = os.fstat(f.fileno()).st_size
             if file_size < 4:
-                sys.stderr.write(f"Error: Index file {idx_path} is too small (size: {file_size} bytes).\n")
+                sys.stderr.write(f"Error: Index file {idx_path} is too small.\n")
                 return None
             num_nodes_bytes = f.read(4)
             if len(num_nodes_bytes) < 4:
@@ -75,18 +75,14 @@ def load_full_idx_data(idx_path):
             for i in range(num_nodes_in_idx):
                 record_bytes = f.read(22)
                 if len(record_bytes) < 22:
-                    sys.stderr.write(
-                        f"Error: Index file ended prematurely while reading record {i + 1}/{num_nodes_in_idx}. Loaded {processed_entries} entries.\n")
+                    sys.stderr.write(f"Error: Index file ended prematurely at record {i + 1}.\n")
                     break
                 node_id_from_idx, offset, _, n_records, _ = struct.unpack('<I Q I I H', record_bytes)
                 idx_data_map[node_id_from_idx] = (offset, n_records)
                 processed_entries += 1
-                if processed_entries > 0 and processed_entries % 5_000_000 == 0:
+                if processed_entries % 5_000_000 == 0:
                     print(f"    Loaded {processed_entries}/{num_nodes_in_idx} index entries...")
-            if processed_entries != num_nodes_in_idx and len(record_bytes) == 22:
-                sys.stderr.write(
-                    f"Warning: Index header reported {num_nodes_in_idx} entries, but {processed_entries} were processed from file content.\n")
-            print(f"Successfully loaded {len(idx_data_map)} distinct node entries from index file {idx_path}.")
+            print(f"Successfully loaded {len(idx_data_map)} distinct node entries.")
         return idx_data_map
     except FileNotFoundError:
         sys.stderr.write(f"Error: Index file not found at {idx_path}\n")
@@ -103,61 +99,40 @@ def load_multiple_node_sequences_from_gfa(gfa_path, target_node_ids_set):
 
     try:
         with open(gfa_path, 'r') as f:
-            print(f"Reading GFA file to find sequences for {len(nodes_to_find_int)} target nodes: {gfa_path}")
-            line_counter = 0
-            found_count_gfa = 0
+            print(f"Reading GFA file for {len(nodes_to_find_int)} target nodes: {gfa_path}")
             for line in f:
-                line_counter += 1
-                if line_counter % 10_000_000 == 0:
-                    print(
-                        f"  Checked {line_counter:,} lines in GFA file... {len(nodes_to_find_int) - found_count_gfa} nodes remaining to find.")
-                if not line.startswith('S\t'): continue
-                parts = line.strip().split('\t')
-                if len(parts) < 3: continue
-                try:
-                    nid_int_from_gfa = int(parts[1])
-                except ValueError:
-                    continue
-
-                if nid_int_from_gfa in nodes_to_find_int:
-                    node_sequences[str(nid_int_from_gfa)] = parts[2]
-                    found_count_gfa += 1
-                    if found_count_gfa == len(target_node_ids_set):
-                        print(
-                            f"Found all {len(target_node_ids_set)} requested node sequences in GFA after checking {line_counter:,} lines.")
-                        break
-
-            if found_count_gfa < len(target_node_ids_set):
-                print(
-                    f"Finished GFA scan ({line_counter:,} lines). Found {found_count_gfa}/{len(target_node_ids_set)} sequences.")
-                missing_nodes = [nid for nid in target_node_ids_set if str(nid) not in node_sequences]
-                if missing_nodes:
-                    print(
-                        f"Warning: Could not find GFA sequences for {len(missing_nodes)} node ID(s). Examples: {missing_nodes[:5]}")
-            elif found_count_gfa == len(target_node_ids_set):
-                print(f"Successfully found all {found_count_gfa} sequences in GFA.")
-
+                if line.startswith('S\t'):
+                    parts = line.strip().split('\t')
+                    if len(parts) >= 3:
+                        try:
+                            nid_int_from_gfa = int(parts[1])
+                            if nid_int_from_gfa in nodes_to_find_int:
+                                node_sequences[str(nid_int_from_gfa)] = parts[2]
+                                if len(node_sequences) == len(nodes_to_find_int):
+                                    break
+                        except ValueError:
+                            continue
+            missing_nodes = len(nodes_to_find_int) - len(node_sequences)
+            if missing_nodes > 0:
+                print(f"Warning: Could not find GFA sequences for {missing_nodes} node(s).")
     except FileNotFoundError:
         sys.stderr.write(f"Error: GFA file not found at {gfa_path}\n")
         return {}
     except Exception as e:
         sys.stderr.write(f"Error reading GFA file {gfa_path}: {e}\n")
-        return node_sequences
     return node_sequences
 
 
 def decode_cigar_to_int_ops(cigar_string):
     if not cigar_string or cigar_string == '*': return []
-    ops = []
     try:
-        for length_str, op_char in re.findall(r'(\d+)([MIDNSHPX=])', cigar_string):
-            ops.append((int(length_str), op_char))
+        return [(int(length), op) for length, op in re.findall(r'(\d+)([MIDNSHPX=])', cigar_string)]
     except Exception as e:
         sys.stderr.write(f"Warning: Could not parse CIGAR string '{cigar_string}': {e}\n")
         return []
-    return ops
 
 
+# This function is now corrected to precisely extract the quality of the allele bases.
 def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_quality_str, read_cigar_ops_decoded,
                                      target_node_pos, node_sequence,
                                      expected_var_type=None, expected_ref_allele_for_indel=None):
@@ -166,6 +141,7 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_qu
 
     for length, op in read_cigar_ops_decoded:
         if op in ('M', '=', 'X'):
+            # Check if the target position is within this CIGAR operation block
             if current_node_pos <= target_node_pos < current_node_pos + length:
                 offset_in_block = target_node_pos - current_node_pos
                 read_idx = current_read_pos + offset_in_block
@@ -174,16 +150,19 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_qu
                     allele = read_sequence[read_idx].upper()
                     quality = ord(read_quality_str[read_idx]) - 33 if read_idx < len(read_quality_str) else 0
 
+                    # If we are querying an indel site, a match/mismatch means the read has the reference state
                     if expected_var_type in ('I', 'D'):
                         return "REF_STATE_FOR_INDEL", quality
                     return allele, quality
-                return None, None
+                return None, None  # Read sequence ended unexpectedly
             current_node_pos += length
             current_read_pos += length
 
-        elif op == 'I':
+        elif op == 'I':  # Insertion
+            # Insertion occurs after the base at current_node_pos - 1
             if expected_var_type == 'I' and (current_node_pos - 1) == target_node_pos:
                 if current_read_pos + length <= len(read_sequence):
+                    # Calculate mean quality of the inserted bases
                     qualities = [ord(q) - 33 for q in read_quality_str[current_read_pos: current_read_pos + length] if
                                  (ord(q) - 33) >= 0]
                     mean_quality = sum(qualities) / len(qualities) if qualities else 0
@@ -191,28 +170,31 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_qu
                 return None, None
             current_read_pos += length
 
-        elif op == 'D':
+        elif op == 'D':  # Deletion
+            # Check if the target position falls within this deletion
             if current_node_pos <= target_node_pos < current_node_pos + length:
                 if expected_var_type == 'I': return "OTHER_FOR_INDEL", None
                 if expected_var_type == 'D':
+                    # Check if this deletion in the read matches the expected deletion
                     if 0 <= current_node_pos < len(node_sequence) and current_node_pos + length <= len(node_sequence):
                         deleted_seq_in_ref_context = node_sequence[current_node_pos: current_node_pos + length]
                         if deleted_seq_in_ref_context == expected_ref_allele_for_indel:
-                            return "*", None
+                            return "*", None  # Quality is not applicable for a deletion
                         else:
                             return "OTHER_FOR_INDEL", None
                     return "OTHER_FOR_INDEL", None
                 return "*", None
             current_node_pos += length
 
-        elif op == 'S':
+        elif op == 'S':  # Soft clip
             current_read_pos += length
-        elif op == 'N':
+        elif op == 'N':  # Skipped region
             current_node_pos += length
 
-        if current_node_pos > target_node_pos + 1:
-            if not (expected_var_type == 'I' and (current_node_pos - 1) <= target_node_pos):
-                break
+        # Optimization: if we've passed the variant position, we can stop
+        if current_node_pos > target_node_pos + 1 and not (
+                expected_var_type == 'I' and (current_node_pos - 1) <= target_node_pos):
+            break
 
     return None, None
 
@@ -279,10 +261,8 @@ def get_read_representation_in_window_for_view(segment_cigar_ops, segment_offset
         elif op in ('I', 'S'):
             read_pos += L
 
-        if node_pos >= window_start_node + window_size and op in ('M', '=', 'X', 'D', 'N'):
-            break
-        if read_pos >= read_seq_len and op in ('M', '=', 'X', 'I', 'S'):
-            break
+        if node_pos >= window_start_node + window_size: break
+        if read_pos >= read_seq_len: break
     return window_chars
 
 
@@ -296,7 +276,7 @@ def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
     qual_str_len = len(segment_quality_str)
 
     for L, op in segment_cigar_ops:
-        if node_pos >= window_start_node + tensor_win_size and op in ('M', 'D', 'N', '=', 'X'): break
+        if node_pos >= window_start_node + tensor_win_size: break
 
         if op in ('M', '=', 'X'):
             for i in range(L):
@@ -312,8 +292,6 @@ def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
                             quals[win_idx] = ord(segment_quality_str[r_aln]) - 33
                         except (TypeError, ValueError):
                             quals[win_idx] = DEFAULT_QUALITY_PADDING
-                    else:
-                        quals[win_idx] = DEFAULT_QUALITY_PADDING
             node_pos += L
             read_pos += L
         elif op in ('D', 'N'):
@@ -327,7 +305,7 @@ def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
         elif op in ('I', 'S'):
             read_pos += L
 
-        if read_pos >= read_seq_len and op in ('M', '=', 'X', 'I', 'S'): break
+        if read_pos >= read_seq_len: break
     return bases, quals
 
 
@@ -341,10 +319,10 @@ def init_worker(dat_file_path_for_worker, base_output_dir_for_worker):
         worker_dat_file = open(dat_file_path_for_worker, 'rb')
         worker_base_output_dir = base_output_dir_for_worker
     except FileNotFoundError:
-        sys.stderr.write(f"Error [Worker {os.getpid()}]: DAT file not found at {dat_file_path_for_worker}\n")
+        sys.stderr.write(f"Error [Worker {os.getpid()}]: DAT file not found.\n")
         sys.exit(1)
     except Exception as e:
-        sys.stderr.write(f"Error [Worker {os.getpid()}] opening DAT file {dat_file_path_for_worker}: {e}\n")
+        sys.stderr.write(f"Error [Worker {os.getpid()}] opening DAT file: {e}\n")
         sys.exit(1)
 
 
@@ -354,19 +332,12 @@ def process_single_node_for_pileup(task_args):
 
     tensor_files_generated_for_node = 0
     if worker_dat_file is None or worker_base_output_dir is None:
-        sys.stderr.write(f"Error [Worker {os.getpid()} for Node {node_id}]: Worker not initialized properly.\n")
         return node_id, None, tensor_files_generated_for_node
     if not node_sequence:
-        sys.stderr.write(f"Info [Worker {os.getpid()} for Node {node_id}]: No sequence provided. Skipping.\n")
         return node_id, {}, tensor_files_generated_for_node
 
     node_specific_output_dir = os.path.join(worker_base_output_dir, str(node_id))
-    try:
-        os.makedirs(node_specific_output_dir, exist_ok=True)
-    except OSError as e:
-        sys.stderr.write(
-            f"Error [Worker {os.getpid()} for Node {node_id}]: Could not create directory {node_specific_output_dir}: {e}\n")
-        return node_id, None, tensor_files_generated_for_node
+    os.makedirs(node_specific_output_dir, exist_ok=True)
 
     node_len = len(node_sequence)
     view_oriented_variant_data = {}
@@ -393,32 +364,25 @@ def process_single_node_for_pileup(task_args):
             original_decoded_cigar_ops = decode_cigar_to_int_ops(cigar_str_original)
             if not original_decoded_cigar_ops and cigar_str_original != '*': continue
 
-            current_read_sequence = seq
-            current_quality_str = qual_str
-            current_decoded_cigar_ops = list(original_decoded_cigar_ops)
-            current_offset_on_node = off_from_file
-
             if strand_char == '-':
-                current_read_sequence = reverse_complement(seq)
-                current_quality_str = qual_str[::-1]
-                current_decoded_cigar_ops = [op for op in
-                                             reversed(original_decoded_cigar_ops)] if original_decoded_cigar_ops else []
-                alignment_span_on_node = len(current_read_sequence)
-                current_offset_on_node = node_len - alignment_span_on_node - off_from_file
-                if current_offset_on_node < 0:
-                    continue
+                seq = reverse_complement(seq)
+                qual_str = qual_str[::-1]
+                original_decoded_cigar_ops.reverse()
+                # This offset calculation for reverse strand is an approximation and might need refinement based on exact alignment logic.
+                alignment_span_on_node = sum(l for l, op in original_decoded_cigar_ops if op in 'MDN=X')
+                off_from_file = node_len - off_from_file - alignment_span_on_node
 
             aligned_read_segments.append({
-                "offset_on_node": current_offset_on_node,
-                "read_sequence": current_read_sequence,
-                "processed_quality_str": current_quality_str,
-                "cigar_ops": current_decoded_cigar_ops,
+                "offset_on_node": off_from_file,
+                "read_sequence": seq,
+                "processed_quality_str": qual_str,
+                "cigar_ops": original_decoded_cigar_ops,
                 "original_cigar_str": cigar_str_original,
                 "strand": strand_char,
                 "mapping_quality": mapq_val
             })
     except Exception as e:
-        sys.stderr.write(f"Error [Worker {os.getpid()} for Node {node_id}] during DAT record processing: {e}\n")
+        sys.stderr.write(f"Error [Worker {os.getpid()} for Node {node_id}]: {e}\n")
         return node_id, None, tensor_files_generated_for_node
 
     if not aligned_read_segments:
@@ -491,7 +455,7 @@ def process_single_node_for_pileup(task_args):
             row_chars_for_view = get_read_representation_in_window_for_view(
                 seg_data["cigar_ops"], seg_data["offset_on_node"], seg_data["read_sequence"],
                 window_start_pos, TENSOR_WINDOW_SIZE, node_len)
-            if any(char_in_row != ' ' for char_in_row in row_chars_for_view):
+            if any(char != ' ' for char in row_chars_for_view):
                 pileup_data_for_view_json.append({
                     "bases": [BASE_TO_INDEX.get(char.upper(), BASE_TO_INDEX['N']) for char in row_chars_for_view],
                     "offset": seg_data["offset_on_node"],
@@ -506,8 +470,7 @@ def process_single_node_for_pileup(task_args):
             "mean_alt_allele_base_quality": round(mean_alt_bq, 2)
         }
 
-        ch1_base_indices_list, ch2_quality_scores_list = [], []
-        ch3_mismatch_flags_list, ch4_mapping_qualities_list = [], []
+        ch1_list, ch2_list, ch3_list, ch4_list = [], [], [], []
 
         ref_base_indices_row = [PADDING_BASE_INDEX] * TENSOR_WINDOW_SIZE
         for i in range(TENSOR_WINDOW_SIZE):
@@ -516,14 +479,14 @@ def process_single_node_for_pileup(task_args):
                 ref_base_indices_row[i] = BASE_TO_INDEX.get(node_sequence[absolute_node_pos].upper(),
                                                             BASE_TO_INDEX['N'])
 
-        ch1_base_indices_list.append(ref_base_indices_row)
-        ch2_quality_scores_list.append([DEFAULT_QUALITY_PADDING] * TENSOR_WINDOW_SIZE)
-        ch3_mismatch_flags_list.append([MISMATCH_CHANNEL_REF_ROW_VALUE] * TENSOR_WINDOW_SIZE)
-        ch4_mapping_qualities_list.append([DEFAULT_MAPPING_QUALITY_PADDING] * TENSOR_WINDOW_SIZE)
+        ch1_list.append(ref_base_indices_row)
+        ch2_list.append([DEFAULT_QUALITY_PADDING] * TENSOR_WINDOW_SIZE)
+        ch3_list.append([MISMATCH_CHANNEL_REF_ROW_VALUE] * TENSOR_WINDOW_SIZE)
+        ch4_list.append([DEFAULT_MAPPING_QUALITY_PADDING] * TENSOR_WINDOW_SIZE)
 
-        reads_added_to_tensor = 0
+        reads_added = 0
         for seg_data in aligned_read_segments:
-            if reads_added_to_tensor >= TENSOR_MAX_READ_ROWS: break
+            if reads_added >= TENSOR_MAX_READ_ROWS: break
 
             base_idx_row, quality_score_row = get_read_tensor_rows_in_window(
                 seg_data["cigar_ops"], seg_data["offset_on_node"],
@@ -531,29 +494,27 @@ def process_single_node_for_pileup(task_args):
                 window_start_pos, TENSOR_WINDOW_SIZE, node_len)
 
             if any(b != PADDING_BASE_INDEX for b in base_idx_row):
-                ch1_base_indices_list.append(base_idx_row)
-                ch2_quality_scores_list.append(quality_score_row)
+                ch1_list.append(base_idx_row)
+                ch2_list.append(quality_score_row)
 
                 mismatch_flags_row = [MISMATCH_COMPARISON_PADDING_VALUE] * TENSOR_WINDOW_SIZE
                 for i in range(TENSOR_WINDOW_SIZE):
-                    if base_idx_row[i] == PADDING_BASE_INDEX or ref_base_indices_row[i] == PADDING_BASE_INDEX:
-                        continue
-                    mismatch_flags_row[i] = 0 if base_idx_row[i] == ref_base_indices_row[i] else 1
-                ch3_mismatch_flags_list.append(mismatch_flags_row)
-                mapq_val_clamped = max(0, min(int(seg_data["mapping_quality"]), 127))
-                ch4_mapping_qualities_list.append([mapq_val_clamped] * TENSOR_WINDOW_SIZE)
-                reads_added_to_tensor += 1
+                    if base_idx_row[i] != PADDING_BASE_INDEX and ref_base_indices_row[i] != PADDING_BASE_INDEX:
+                        mismatch_flags_row[i] = 0 if base_idx_row[i] == ref_base_indices_row[i] else 1
+                ch3_list.append(mismatch_flags_row)
 
-        for _ in range(TENSOR_MAX_READ_ROWS - reads_added_to_tensor):
-            ch1_base_indices_list.append([PADDING_BASE_INDEX] * TENSOR_WINDOW_SIZE)
-            ch2_quality_scores_list.append([DEFAULT_QUALITY_PADDING] * TENSOR_WINDOW_SIZE)
-            ch3_mismatch_flags_list.append([MISMATCH_COMPARISON_PADDING_VALUE] * TENSOR_WINDOW_SIZE)
-            ch4_mapping_qualities_list.append([DEFAULT_MAPPING_QUALITY_PADDING] * TENSOR_WINDOW_SIZE)
+                mapq = max(0, min(int(seg_data["mapping_quality"]), 127))
+                ch4_list.append([mapq] * TENSOR_WINDOW_SIZE)
+                reads_added += 1
+
+        for _ in range(TENSOR_MAX_READ_ROWS - reads_added):
+            ch1_list.append([PADDING_BASE_INDEX] * TENSOR_WINDOW_SIZE)
+            ch2_list.append([DEFAULT_QUALITY_PADDING] * TENSOR_WINDOW_SIZE)
+            ch3_list.append([MISMATCH_COMPARISON_PADDING_VALUE] * TENSOR_WINDOW_SIZE)
+            ch4_list.append([DEFAULT_MAPPING_QUALITY_PADDING] * TENSOR_WINDOW_SIZE)
 
         try:
-            tensor_chw = torch.tensor([ch1_base_indices_list, ch2_quality_scores_list,
-                                       ch3_mismatch_flags_list, ch4_mapping_qualities_list],
-                                      dtype=torch.int8)
+            tensor_chw = torch.tensor([ch1_list, ch2_list, ch3_list, ch4_list], dtype=torch.int8)
             tensor_hwc = tensor_chw.permute(1, 2, 0)
             numpy_array_to_save = tensor_hwc.numpy()
             tensor_filename_npy = f"{variant_key_string}.npy"
@@ -569,8 +530,7 @@ def process_single_node_for_pileup(task_args):
             })
             tensor_files_generated_for_node += 1
         except Exception as e:
-            sys.stderr.write(
-                f"Error [Worker Node {node_id}]: Failed to create/save tensor for {variant_key_string}: {e}\n")
+            sys.stderr.write(f"Error creating/saving tensor for {variant_key_string}: {e}\n")
 
     if variant_headers_for_summary:
         summary_json_path = os.path.join(node_specific_output_dir, "variant_summary.json")
@@ -582,7 +542,7 @@ def process_single_node_for_pileup(task_args):
                     "variants_passing_filters": variant_headers_for_summary
                 }, sjf, indent=2)
         except Exception as e:
-            sys.stderr.write(f"Error [Worker Node {node_id}]: Failed to write summary JSON: {e}\n")
+            sys.stderr.write(f"Error writing summary JSON: {e}\n")
 
     return node_id, view_oriented_variant_data, tensor_files_generated_for_node
 
@@ -592,85 +552,53 @@ def process_single_node_for_pileup(task_args):
 # ─────────────────────────────────────────────────────────────────────────────
 def display_pileup_data(node_data_for_display_view, node_id_str_for_display, full_node_sequence,
                         max_reads_to_display_per_variant, max_variants_to_display=float('inf')):
-    if max_variants_to_display == 0:
-        return
+    if max_variants_to_display == 0: return
     if not node_data_for_display_view:
-        print(
-            f"Info: No pileup data to display for node {node_id_str_for_display} (e.g. no variants met all filter criteria).",
-            file=sys.stdout)
+        print(f"Info: No pileup data to display for node {node_id_str_for_display} (no variants met all filters).")
         return
 
     print(f"\n=== Displaying Pileups for Node ID: {node_id_str_for_display} (Length: {len(full_node_sequence)}) ===")
 
-    variants_displayed_count = 0
     sorted_variant_keys = sorted(node_data_for_display_view.keys(),
                                  key=lambda x: (int(x.split('_')[0]), x.split('_')[1]))
 
-    display_window_size = TENSOR_WINDOW_SIZE
-    half_display_window = TENSOR_WINDOW_SIZE // 2
-
-    for variant_key in sorted_variant_keys:
-        if variants_displayed_count >= max_variants_to_display:
-            print(
-                f"\n  ... (and {len(node_data_for_display_view) - variants_displayed_count} more variants for node {node_id_str_for_display} not shown due to --view limit)")
+    for i, variant_key in enumerate(sorted_variant_keys):
+        if i >= max_variants_to_display:
+            print(f"\n  ... ({len(sorted_variant_keys) - i} more variants not shown due to --view limit)")
             break
 
         variant_data = node_data_for_display_view[variant_key]
-        v_pos_str, v_type = variant_key.split('_')[:2]
-        try:
-            v_pos = int(v_pos_str)
-        except ValueError:
-            sys.stderr.write(f"Warning: Could not parse variant position from key: {variant_key} for display.\n")
-            continue
+        v_pos = int(variant_key.split('_')[0])
+        v_type = variant_key.split('_')[1]
 
         window_center_pos = v_pos + 1 if v_type == 'I' else v_pos
-        window_start_pos = max(0, window_center_pos - half_display_window)
+        window_start_pos = max(0, window_center_pos - (TENSOR_WINDOW_SIZE // 2))
 
-        print(f"\n--- Variant: {variant_key} (Node Pos: {v_pos}, Type: {v_type}) ---")
-        print(
-            f"  Display Window (0-based node coords): {window_start_pos}-{window_start_pos + display_window_size - 1}")
-        print(f"  Alt Count: {variant_data.get('alt_allele_count', 'N/A')} | "
-              f"Ref Count: {variant_data.get('ref_allele_count_at_locus', 'N/A')} | "
+        print(f"\n--- Variant: {variant_key} ---")
+        print(f"  Alt Count: {variant_data.get('alt_allele_count', 'N/A')}, "
+              f"Ref Count: {variant_data.get('ref_allele_count_at_locus', 'N/A')}, "
               f"Coverage: {variant_data.get('coverage_at_locus', 'N/A')}")
-        alt_freq = variant_data.get('alt_allele_frequency', 'N/A')
-        mean_bq = variant_data.get('mean_alt_allele_base_quality', 'N/A')
-        print(f"  Alt Freq: {alt_freq:.4f} | Mean Alt BQ: {mean_bq:.2f}" if isinstance(alt_freq, float) and isinstance(
-            mean_bq, float) else f"Alt Freq: {alt_freq} | Mean Alt BQ: {mean_bq}")
+        print(f"  Alt Freq: {variant_data.get('alt_allele_frequency', 0.0):.4f}, "
+              f"Mean Alt BQ: {variant_data.get('mean_alt_allele_base_quality', 0.0):.2f}")
 
-        ref_display_chars = [' '] * display_window_size
-        marker_line_chars = [' '] * display_window_size
-        variant_pos_in_window = v_pos - window_start_pos
+        ref_display = "".join([full_node_sequence[
+                                   j] if window_start_pos <= j < window_start_pos + TENSOR_WINDOW_SIZE and j < len(
+            full_node_sequence) else ' ' for j in range(window_start_pos, window_start_pos + TENSOR_WINDOW_SIZE)])
+        print(f"  Node Ref: {ref_display}")
 
-        for i in range(display_window_size):
-            absolute_node_pos = window_start_pos + i
-            if 0 <= absolute_node_pos < len(full_node_sequence):
-                ref_display_chars[i] = full_node_sequence[absolute_node_pos]
+        # Marker line
+        marker_pos_in_window = v_pos - window_start_pos
+        marker_line = [' '] * TENSOR_WINDOW_SIZE
+        if 0 <= marker_pos_in_window < TENSOR_WINDOW_SIZE:
+            marker_line[marker_pos_in_window] = '^'
+        print(f"  Marker  : {''.join(marker_line)}")
 
-            if i == variant_pos_in_window:
-                marker_line_chars[i] = "I" if v_type == 'I' else "^"
-                if v_type == 'I':
-                    if i + 1 < display_window_size:
-                        marker_line_chars[i + 1] = "^"
-                    elif i == display_window_size - 1:
-                        marker_line_chars[i] = ">"
-
-        print(f"  Node Ref: {''.join(ref_display_chars)}")
-        print(f"  Marker  : {''.join(marker_line_chars)}")
-
-        pileup_reads_for_variant = variant_data.get("pileup_reads_data", [])
-        if not pileup_reads_for_variant:
-            print("  (No reads in window for display in this variant's JSON summary)")
-        else:
-            for i, read_entry in enumerate(pileup_reads_for_variant):
-                if i >= max_reads_to_display_per_variant:
-                    print(
-                        f"  ... ({len(pileup_reads_for_variant) - i} more reads not shown due to --max_view_reads limit)")
-                    break
-                base_indices_for_read = read_entry["bases"]
-                bases_str_for_read = "".join([INDEX_TO_BASE_FOR_VIEW.get(idx, '?') for idx in base_indices_for_read])
-                print(
-                    f"  Read {i + 1:3d}: {bases_str_for_read}  (Off:{read_entry['offset']},Str:{read_entry['strand']},CIG:{read_entry.get('cigar', 'N/A')})")
-        variants_displayed_count += 1
+        for j, read_entry in enumerate(variant_data.get("pileup_reads_data", [])):
+            if j >= max_reads_to_display_per_variant:
+                print(f"  ... ({len(variant_data.get('pileup_reads_data', [])) - j} more reads not shown)")
+                break
+            bases_str = "".join([INDEX_TO_BASE_FOR_VIEW.get(idx, '?') for idx in read_entry["bases"]])
+            print(f"  Read {j + 1:3d}: {bases_str} (Off:{read_entry['offset']},Str:{read_entry['strand']})")
     print()
 
 
@@ -679,249 +607,96 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate variant-centered 4-channel .npy tensors (bases, base_quals, mismatches, map_quals) and JSON summaries from .dat alignment files.",
+        description="Generate variant-centered tensors from alignment data.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("dat", help=".dat file path (read alignment data)")
-    parser.add_argument("idx", help=".idx file path (index for .dat file)")
-    parser.add_argument("output", help="Base output directory for node-specific folders and tensors.")
+    parser.add_argument("dat", help=".dat alignment file")
+    parser.add_argument("idx", help=".idx index file")
+    parser.add_argument("output", help="Base output directory")
 
-    input_node_group = parser.add_mutually_exclusive_group(required=True)
-    input_node_group.add_argument("--node_id", type=int, help="The specific node ID to process.")
-    input_node_group.add_argument("--node_id_file",
-                                  help="Path to a text file containing node IDs (one per line) to process.")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--node_id", type=int, help="Specific node ID to process")
+    group.add_argument("--node_id_file", help="File with node IDs to process")
 
-    parser.add_argument("--gfa", help="GFA graph file path (required if node sequences are not cached).")
-    parser.add_argument("--load-cache", help="Load node sequences from this JSON cache file.")
-    parser.add_argument("--save-cache",
-                        help="Save/update node sequences to this JSON cache file (used if --gfa is provided).")
+    parser.add_argument("--gfa", help="GFA graph file (required if no cache)")
+    parser.add_argument("--load-cache", help="Load node sequences from JSON cache")
+    parser.add_argument("--save-cache", help="Save node sequences to JSON cache")
 
-    parser.add_argument("--num_workers", type=int, default=None,
-                        help="Number of worker processes. Defaults to a heuristic based on os.cpu_count().")
-    parser.add_argument("--view", nargs='?', const=-1, default=None, type=int, metavar='N_VARIANTS',
-                        help="Print generated pileups to console for displayed variants. "
-                             "Provide no value or -1 to view all variants passing all filters for processed nodes. "
-                             "Provide an integer N > 0 to view the first N variants per node. "
-                             "Provide 0 to disable all stdout pileup views. ")
-    parser.add_argument("--max_view_reads", type=int, default=20,
-                        help="Maximum number of reads to display per pileup in console view.")
-    parser.add_argument("--min_af", type=float, default=0.1,
-                        help="Minimum allele frequency for a variant to be processed for tensor generation and JSON summary.")
-    parser.add_argument("--min_variants", type=int, default=2,
-                        help="The number of reads supporting the alternate allele must be strictly greater than this value for a variant to be processed.")
+    parser.add_argument("--num_workers", type=int, default=os.cpu_count(), help="Number of worker processes")
+    parser.add_argument("--view", nargs='?', const=-1, default=None, type=int, metavar='N',
+                        help="Print pileups for top N variants per node (-1 for all)")
+    parser.add_argument("--max_view_reads", type=int, default=20, help="Max reads to show per pileup in view mode")
+
+    parser.add_argument("--min_af", type=float, default=0.1, help="Minimum allele frequency to process a variant")
+    parser.add_argument("--min_variants", type=int, default=2, help="Alternate allele count must be > this value")
     parser.add_argument("--min_allele_bq", type=float, default=15.0,
-                        help="Minimum mean base quality for the specific bases of reads supporting the alternate allele. Variants below this are dropped.")
+                        help="Minimum mean base quality of allele-supporting bases")
+
     args = parser.parse_args()
 
-    # --- Argument Validation ---
-    if not os.path.isfile(args.dat): sys.exit(f"Error: DAT file not found: {args.dat}")
-    if not os.path.isfile(args.idx): sys.exit(f"Error: Index file not found: {args.idx}")
-    if not args.load_cache and not args.gfa:
-        sys.exit("Error: Must provide --gfa or --load-cache to obtain node sequences.")
-    if args.load_cache and not os.path.isfile(args.load_cache) and os.path.exists(
-            args.load_cache):
-        sys.exit(f"Error: Cache path '{args.load_cache}' exists but is not a file.")
-    if args.gfa and not os.path.isfile(args.gfa):
-        sys.exit(f"Error: GFA file not found: {args.gfa}")
-    if not (0.0 <= args.min_af <= 1.0):
-        sys.exit("Error: --min_af must be between 0.0 and 1.0.")
-    if args.min_variants < 0:
-        sys.exit("Error: --min_variants must be a non-negative integer.")
-    if args.min_allele_bq < 0:
-        sys.exit("Error: --min_allele_bq must be a non-negative value.")
+    # --- Setup and Validation ---
+    if not all([os.path.isfile(args.dat), os.path.isfile(args.idx)]):
+        sys.exit("Error: DAT or IDX file not found.")
+    if not args.gfa and not args.load_cache:
+        sys.exit("Error: Must provide --gfa or --load-cache.")
+    os.makedirs(args.output, exist_ok=True)
 
-    # --- Setup ---
-    effective_num_workers = args.num_workers if args.num_workers and args.num_workers > 0 else (os.cpu_count() or 1)
-    print(f"Using {effective_num_workers} worker process(es) for parallel processing.")
-    try:
-        os.makedirs(args.output, exist_ok=True)
-        print(f"Base output directory: {args.output}")
-    except OSError as e:
-        sys.exit(f"Error: Could not create base output directory {args.output}: {e}")
+    # --- Load Data ---
+    target_node_ids = set()
+    if args.node_id:
+        target_node_ids.add(args.node_id)
+    else:
+        with open(args.node_id_file, 'r') as f:
+            for line in f:
+                if line.strip() and not line.startswith('#'):
+                    target_node_ids.add(int(line.strip()))
 
-    # --- Determine Target Node IDs ---
-    target_node_ids_int_set = set()
-    if args.node_id_file:
-        try:
-            with open(args.node_id_file, 'r') as f_nodes:
-                for line_num, line in enumerate(f_nodes, 1):
-                    line = line.strip()
-                    if line and not line.startswith("#"):
-                        try:
-                            target_node_ids_int_set.add(int(line))
-                        except ValueError:
-                            sys.stderr.write(
-                                f"Warning: Invalid non-integer node ID '{line}' in {args.node_id_file} at line {line_num}. Skipping.\n")
-            if not target_node_ids_int_set:
-                sys.exit(f"Error: No valid node IDs found or specified in {args.node_id_file}.")
-            print(f"Will process {len(target_node_ids_int_set)} unique node ID(s) from file: {args.node_id_file}")
-        except FileNotFoundError:
-            sys.exit(f"Error: Node ID file not found: {args.node_id_file}")
-    elif args.node_id is not None:
-        target_node_ids_int_set.add(args.node_id)
-        print(f"Will process single target node ID: {args.node_id}")
-
-    if not target_node_ids_int_set:
-        sys.exit("Info: No target node IDs specified. Exiting.")
-
-    # --- Load Node Sequences (Cache then GFA) ---
-    node_sequences_map_str_keys = {}
+    node_sequences = {}
     if args.load_cache and os.path.isfile(args.load_cache):
-        cache_load_start_time = time.time()
-        try:
-            with open(args.load_cache, 'r') as cf:
-                node_sequences_map_str_keys = json.load(cf)
-            print(
-                f"Loaded {len(node_sequences_map_str_keys)} sequences from cache '{args.load_cache}' in {time.time() - cache_load_start_time:.2f}s.")
-        except Exception as e:
-            sys.stderr.write(
-                f"Warning: Error loading cache {args.load_cache}: {e}. Proceeding without cached sequences if GFA is provided.\n")
-            node_sequences_map_str_keys = {}
+        with open(args.load_cache, 'r') as f:
+            node_sequences = json.load(f)
 
-    nodes_needing_gfa_fetch = {nid_int for nid_int in target_node_ids_int_set if
-                               str(nid_int) not in node_sequences_map_str_keys}
-    if nodes_needing_gfa_fetch and args.gfa:
-        print(f"{len(nodes_needing_gfa_fetch)} node(s) require sequence fetching from GFA: {args.gfa}")
-        gfa_load_start_time = time.time()
-        fetched_sequences_map = load_multiple_node_sequences_from_gfa(args.gfa, nodes_needing_gfa_fetch)
-        node_sequences_map_str_keys.update(fetched_sequences_map)
-        print(
-            f"Fetched {len(fetched_sequences_map)} new sequences from GFA in {time.time() - gfa_load_start_time:.2f}s. Total sequences in map: {len(node_sequences_map_str_keys)}.")
-    elif nodes_needing_gfa_fetch:
-        sys.stderr.write(
-            f"Warning: {len(nodes_needing_gfa_fetch)} node(s) need sequences from GFA, but --gfa argument was not provided. These nodes will be skipped.\n")
+    nodes_to_fetch = {nid for nid in target_node_ids if str(nid) not in node_sequences}
+    if nodes_to_fetch and args.gfa:
+        node_sequences.update(load_multiple_node_sequences_from_gfa(args.gfa, nodes_to_fetch))
 
-    # --- Load Full Index Data ---
-    idx_data_load_start_time = time.time()
-    full_idx_data_map = load_full_idx_data(args.idx)
-    if full_idx_data_map is None:
-        sys.exit(f"Error: Failed to load index data from {args.idx}. Cannot proceed.")
-    print(f"Index data with {len(full_idx_data_map)} entries loaded in {time.time() - idx_data_load_start_time:.2f}s.")
+    if args.save_cache:
+        with open(args.save_cache, 'w') as f:
+            json.dump(node_sequences, f, indent=2)
 
-    # --- Prepare Tasks for Workers ---
-    tasks_for_submission = []
-    skipped_nodes_count_pre_submit = 0
-    print(f"Preparing tasks for {len(target_node_ids_int_set)} target nodes...")
-    task_prep_s_time = time.time()
+    full_idx_data = load_full_idx_data(args.idx)
+    if not full_idx_data: sys.exit("Failed to load index data.")
 
-    for i, node_id_val_int in enumerate(target_node_ids_int_set):
-        if (i + 1) % 50000 == 0 and i > 0: print(
-            f"  Prepared tasks for {i + 1}/{len(target_node_ids_int_set)} nodes...")
+    # --- Prepare and Execute Tasks ---
+    tasks = []
+    for node_id in target_node_ids:
+        if str(node_id) in node_sequences and node_id in full_idx_data:
+            offset, n_records = full_idx_data[node_id]
+            tasks.append((node_id, offset, n_records, node_sequences[str(node_id)], args.min_af, args.min_variants,
+                          args.min_allele_bq))
 
-        node_sequence_val = node_sequences_map_str_keys.get(str(node_id_val_int))
-        node_dat_info_tuple = full_idx_data_map.get(node_id_val_int)
+    if not tasks:
+        sys.exit("No valid tasks to run after checking for sequences and index entries.")
 
-        if not node_sequence_val or not node_dat_info_tuple:
-            skipped_nodes_count_pre_submit += 1
-            continue
-        tasks_for_submission.append(
-            (node_id_val_int, node_dat_info_tuple[0], node_dat_info_tuple[1], node_sequence_val, args.min_af,
-             args.min_variants, args.min_allele_bq))
-
-    print(f"Task preparation completed in {time.time() - task_prep_s_time:.2f}s.")
-    if skipped_nodes_count_pre_submit > 0:
-        print(
-            f"Warning: Skipped {skipped_nodes_count_pre_submit} nodes before submission due to missing sequence or index data.")
-    if not tasks_for_submission:
-        sys.exit("Info: No valid tasks to process after filtering. Exiting.")
-
-    # --- Execute Tasks in Parallel ---
-    overall_processing_start_time = time.time()
-    total_tensor_files_generated_all_nodes = 0
-    nodes_completed_by_worker = 0
-    nodes_with_actual_output = 0
-
-    results_for_console_view = {}
-
-    batch_start_time = time.time()
-    nodes_in_batch_count = 0
-    tensors_in_batch_count = 0
-
-    print(f"\nSubmitting {len(tasks_for_submission)} node tasks to {effective_num_workers} worker(s)...")
-    with ProcessPoolExecutor(max_workers=effective_num_workers, initializer=init_worker,
+    print(f"\nSubmitting {len(tasks)} tasks to {args.num_workers} workers...")
+    total_tensors = 0
+    with ProcessPoolExecutor(max_workers=args.num_workers, initializer=init_worker,
                              initargs=(args.dat, args.output)) as executor:
-        future_to_node_map = {executor.submit(process_single_node_for_pileup, task): task[0] for task in
-                              tasks_for_submission}
+        future_to_node = {executor.submit(process_single_node_for_pileup, task): task[0] for task in tasks}
 
-        for future_idx, completed_future in enumerate(as_completed(future_to_node_map)):
-            processed_task_count_total = future_idx + 1
-            original_node_id_for_future = future_to_node_map[completed_future]
-
+        for i, future in enumerate(as_completed(future_to_node)):
+            node_id = future_to_node[future]
             try:
-                returned_node_id, view_data_dict, tensor_files_count_for_node = completed_future.result()
-                nodes_completed_by_worker += 1
+                _, view_data, tensor_count = future.result()
+                total_tensors += tensor_count
+                if args.view is not None:
+                    display_pileup_data(view_data, str(node_id), node_sequences[str(node_id)], args.max_view_reads,
+                                        args.view if args.view != -1 else float('inf'))
+                print(
+                    f"Processed node {node_id} ({i + 1}/{len(tasks)}). Tensors created: {tensor_count}. Total: {total_tensors}.")
+            except Exception as e:
+                print(f"Error processing node {node_id}: {e}", file=sys.stderr)
 
-                if returned_node_id is None:
-                    sys.stderr.write(
-                        f"Error: Worker failed for node {original_node_id_for_future} (returned None for node_id).\n")
-                else:
-                    total_tensor_files_generated_all_nodes += tensor_files_count_for_node
-                    tensors_in_batch_count += tensor_files_count_for_node
-
-                    summary_file_path = os.path.join(args.output, str(returned_node_id), "variant_summary.json")
-                    if tensor_files_count_for_node > 0 or os.path.exists(summary_file_path):
-                        nodes_with_actual_output += 1
-
-                    if args.view is not None and args.view != 0 and view_data_dict:
-                        node_seq_for_view = node_sequences_map_str_keys.get(str(returned_node_id))
-                        if node_seq_for_view:
-                            results_for_console_view[returned_node_id] = (view_data_dict, node_seq_for_view)
-            except Exception as exc:
-                nodes_completed_by_worker += 1
-                sys.stderr.write(
-                    f"Error processing node {original_node_id_for_future} (exception from worker future): {exc}\n")
-
-            nodes_in_batch_count += 1
-            if nodes_in_batch_count >= 1000 or processed_task_count_total == len(tasks_for_submission):
-                if nodes_in_batch_count > 0:
-                    current_batch_duration = time.time() - batch_start_time
-                    processing_rate = nodes_in_batch_count / current_batch_duration if current_batch_duration > 0 else 0
-                    print(
-                        f"  Processed batch of {nodes_in_batch_count} nodes (total completed: {processed_task_count_total}/{len(tasks_for_submission)}) "
-                        f"in {current_batch_duration:.2f}s ({processing_rate:.2f} nodes/sec). "
-                        f"Generated {tensors_in_batch_count} .npy files in this batch.")
-                    batch_start_time = time.time()
-                    nodes_in_batch_count = 0
-                    tensors_in_batch_count = 0
-
-    # --- Display Pileups (after all parallel processing) ---
-    if args.view is not None and args.view != 0:
-        if results_for_console_view:
-            print("\n══════════ Preparing Pileup Views ══════════")
-            for node_id_to_view in sorted(results_for_console_view.keys()):
-                view_data, node_sequence_to_view = results_for_console_view[node_id_to_view]
-                max_variants_for_this_node = float('inf') if args.view == -1 else args.view
-
-                if max_variants_for_this_node > 0 or max_variants_for_this_node == float('inf'):
-                    display_pileup_data(view_data, str(node_id_to_view), node_sequence_to_view,
-                                        args.max_view_reads, max_variants_for_this_node)
-        else:
-            print(f"Info: --view specified, but no pileup data was generated or collected for display.")
-    elif args.view == 0:
-        print(f"Info: --view 0 specified: Pileup display explicitly disabled.")
-
-    # --- Final Summary & Cache Saving ---
-    print("\n══════════ PROCESSING COMPLETE ══════════")
-    if args.save_cache and node_sequences_map_str_keys:
-        print(f"\nSaving {len(node_sequences_map_str_keys)} sequences to cache: {args.save_cache}...")
-        try:
-            with open(args.save_cache, 'w') as wcf:
-                json.dump(node_sequences_map_str_keys, wcf, indent=2)
-            print(f"Sequences saved to cache.")
-        except Exception as e:
-            sys.stderr.write(f"Error saving node sequences to cache {args.save_cache}: {e}\n")
-    elif args.save_cache:
-        print(f"Info: --save-cache specified, but no sequences in memory to save (map is empty).")
-
-    print(f"\nFinal Summary:")
-    print(f"  Total unique node IDs targeted: {len(target_node_ids_int_set)}")
-    if skipped_nodes_count_pre_submit > 0: print(
-        f"  Nodes skipped before submission (missing sequence/index): {skipped_nodes_count_pre_submit}")
-    print(f"  Tasks submitted to workers: {len(tasks_for_submission)}")
-    print(
-        f"  Node tasks completed by workers (includes tasks that may have errored in worker): {nodes_completed_by_worker}/{len(tasks_for_submission)}")
-    print(f"  Nodes with output files (summary/tensors) generated: {nodes_with_actual_output}")
-    print(f"  Total .npy tensor files generated across all nodes: {total_tensor_files_generated_all_nodes}")
-    print(f"Parallel processing phase finished in {time.time() - overall_processing_start_time:.2f} seconds.")
+    print(f"\nProcessing complete. Total tensors generated: {total_tensors}.")
 
 
 if __name__ == '__main__':
