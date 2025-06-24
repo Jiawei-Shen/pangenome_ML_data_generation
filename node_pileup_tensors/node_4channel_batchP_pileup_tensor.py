@@ -441,6 +441,7 @@ def process_single_node_for_pileup(task_args):
 
         mean_alt_bq = sum(alt_allele_base_qualities) / len(
             alt_allele_base_qualities) if alt_allele_base_qualities else 0.0
+        print(mean_alt_bq, alt_allele_base_qualities)
         if mean_alt_bq < min_allele_bq_threshold:
             continue
 
