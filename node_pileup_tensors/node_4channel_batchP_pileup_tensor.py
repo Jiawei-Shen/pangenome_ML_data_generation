@@ -132,7 +132,7 @@ def decode_cigar_to_int_ops(cigar_string):
         return []
 
 
-def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_quality_str, read_cigar_ops_decoded,
+def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_quality_values, read_cigar_ops_decoded,
                                      target_node_pos, node_sequence,
                                      expected_var_type=None, expected_ref_allele_for_indel=None):
     current_node_pos = read_offset_on_node
@@ -146,7 +146,7 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_qu
 
                 if read_idx < len(read_sequence):
                     allele = read_sequence[read_idx].upper()
-                    quality = max(0, ord(read_quality_str[read_idx]) - 33) if read_idx < len(read_quality_str) else 0
+                    quality = read_quality_values[read_idx] if read_idx < len(read_quality_values) else 0
 
                     if expected_var_type in ('I', 'D'):
                         return "REF_STATE_FOR_INDEL", quality
@@ -158,8 +158,7 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_qu
         elif op == 'I':
             if expected_var_type == 'I' and (current_node_pos - 1) == target_node_pos:
                 if current_read_pos + length <= len(read_sequence):
-                    qualities = [ord(q) - 33 for q in read_quality_str[current_read_pos: current_read_pos + length] if
-                                 (ord(q) - 33) >= 0]
+                    qualities = read_quality_values[current_read_pos: current_read_pos + length]
                     mean_quality = sum(qualities) / len(qualities) if qualities else 0.0
                     return read_sequence[current_read_pos: current_read_pos + length].upper(), mean_quality
                 return None, None
@@ -259,13 +258,13 @@ def get_read_representation_in_window_for_view(segment_cigar_ops, segment_offset
 
 
 def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
-                                   segment_read_sequence, segment_quality_str,
+                                   segment_read_sequence, segment_quality_values,
                                    window_start_node, tensor_win_size, node_len):
     bases = [PADDING_BASE_INDEX] * tensor_win_size
     quals = [DEFAULT_QUALITY_PADDING] * tensor_win_size
     node_pos, read_pos = segment_offset_on_node, 0
     read_seq_len = len(segment_read_sequence)
-    qual_str_len = len(segment_quality_str)
+    qual_len = len(segment_quality_values)
 
     for L, op in segment_cigar_ops:
         if node_pos >= window_start_node + tensor_win_size: break
@@ -279,11 +278,8 @@ def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
                     win_idx = n_aln - window_start_node
                     base_char = segment_read_sequence[r_aln].upper()
                     bases[win_idx] = BASE_TO_INDEX.get(base_char, BASE_TO_INDEX['N'])
-                    if r_aln < qual_str_len:
-                        try:
-                            quals[win_idx] = max(0, ord(segment_quality_str[r_aln]) - 33)
-                        except (TypeError, ValueError):
-                            quals[win_idx] = DEFAULT_QUALITY_PADDING
+                    if r_aln < qual_len:
+                        quals[win_idx] = segment_quality_values[r_aln]
             node_pos += L
             read_pos += L
         elif op in ('D', 'N'):
@@ -345,25 +341,27 @@ def process_single_node_for_pileup(task_args):
 
             try:
                 seq = raw_seq.rstrip(b'\0').decode('ascii', 'replace')
-                qual_str = raw_qual.rstrip(b'\0').decode('ascii', 'replace')
+                # *** CORRECTED QUALITY PARSING ***
+                # Convert raw quality bytes directly to a list of integers (Phred scores)
+                qual_values = list(raw_qual.rstrip(b'\0'))
                 cigar_str_original = raw_cigar.rstrip(b'\0').decode('ascii', 'replace')
                 strand_char = strand_byte.decode('ascii')
             except UnicodeDecodeError:
                 continue
 
-            if not seq or len(seq) != len(qual_str): continue
+            if not seq or len(seq) != len(qual_values): continue
 
             original_decoded_cigar_ops = decode_cigar_to_int_ops(cigar_str_original)
             if not original_decoded_cigar_ops and cigar_str_original != '*': continue
 
             current_read_sequence = seq
-            current_quality_str = qual_str
+            current_quality_values = qual_values
             current_decoded_cigar_ops = original_decoded_cigar_ops
             current_offset_on_node = off_from_file
 
             if strand_char == '-':
                 current_read_sequence = reverse_complement(seq)
-                current_quality_str = qual_str[::-1]
+                current_quality_values = qual_values[::-1]
                 current_decoded_cigar_ops = list(reversed(original_decoded_cigar_ops))
                 alignment_span_on_node = sum(l for l, op in current_decoded_cigar_ops if op in 'MDN=X')
                 current_offset_on_node = node_len - off_from_file - alignment_span_on_node
@@ -371,7 +369,7 @@ def process_single_node_for_pileup(task_args):
             aligned_read_segments.append({
                 "offset_on_node": current_offset_on_node,
                 "read_sequence": current_read_sequence,
-                "processed_quality_str": current_quality_str,
+                "processed_quality_values": current_quality_values,  # Changed name for clarity
                 "cigar_ops": current_decoded_cigar_ops,
                 "original_cigar_str": cigar_str_original,
                 "strand": strand_char,
@@ -414,7 +412,7 @@ def process_single_node_for_pileup(task_args):
 
         for seg in aligned_read_segments:
             allele_observed, bq = get_allele_from_read_at_node_pos(
-                seg["offset_on_node"], seg["read_sequence"], seg["processed_quality_str"], seg["cigar_ops"],
+                seg["offset_on_node"], seg["read_sequence"], seg["processed_quality_values"], seg["cigar_ops"],
                 v_pos, node_sequence, v_type, ref_allele_for_indel_context)
 
             if allele_observed is not None:
@@ -487,7 +485,7 @@ def process_single_node_for_pileup(task_args):
 
             base_idx_row, quality_score_row = get_read_tensor_rows_in_window(
                 seg_data["cigar_ops"], seg_data["offset_on_node"],
-                seg_data["read_sequence"], seg_data["processed_quality_str"],
+                seg_data["read_sequence"], seg_data["processed_quality_values"],
                 window_start_pos, TENSOR_WINDOW_SIZE, node_len)
 
             if any(b != PADDING_BASE_INDEX for b in base_idx_row):
@@ -697,14 +695,12 @@ def main():
             except Exception as e:
                 print(f"Error processing node {node_id}: {e}", file=sys.stderr)
 
-            # New progress reporting logic
             if nodes_processed_since_last_report >= 1000 or (i + 1) == len(tasks):
                 elapsed_time = time.time() - batch_start_time
                 rate = nodes_processed_since_last_report / elapsed_time if elapsed_time > 0 else 0
                 print(
                     f"  Processed batch of {nodes_processed_since_last_report} nodes (total: {i + 1}/{len(tasks)}) in {elapsed_time:.2f}s "
                     f"({rate:.1f} nodes/sec). Tensors in batch: {tensors_since_last_report}. Total tensors: {total_tensors}.")
-                # Reset batch counters
                 nodes_processed_since_last_report = 0
                 tensors_since_last_report = 0
                 batch_start_time = time.time()
