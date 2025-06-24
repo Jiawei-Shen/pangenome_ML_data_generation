@@ -167,7 +167,7 @@ def decode_cigar_to_int_ops(cigar_string):
     return ops
 
 
-def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_cigar_ops_decoded,
+def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_quality_values, read_cigar_ops_decoded,
                                      target_node_pos, node_sequence,
                                      expected_var_type=None, expected_ref_allele_for_indel=None):
     current_node_pos = read_offset_on_node
@@ -298,13 +298,13 @@ def get_read_representation_in_window_for_view(segment_cigar_ops, segment_offset
 
 
 def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
-                                   segment_read_sequence, segment_quality_str,
+                                   segment_read_sequence, segment_quality_values,
                                    window_start_node, tensor_win_size, node_len):
     bases = [PADDING_BASE_INDEX] * tensor_win_size
     quals = [DEFAULT_QUALITY_PADDING] * tensor_win_size
     node_pos, read_pos = segment_offset_on_node, 0
     read_seq_len = len(segment_read_sequence)
-    qual_str_len = len(segment_quality_str)
+    qual_str_len = len(segment_quality_values)
 
     for L, op in segment_cigar_ops:
         if node_pos >= window_start_node + tensor_win_size and op in ('M', 'D', 'N', '=', 'X'): break
@@ -320,7 +320,7 @@ def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
                     bases[win_idx] = BASE_TO_INDEX.get(base_char, BASE_TO_INDEX['N'])
                     if r_aln < qual_str_len:
                         try:
-                            quals[win_idx] = ord(segment_quality_str[r_aln]) - 33
+                            quals[win_idx] = ord(segment_quality_values[r_aln]) - 33
                         except (TypeError, ValueError):  # Catch if qual is not char or other issue
                             quals[win_idx] = DEFAULT_QUALITY_PADDING
                     else:
@@ -359,8 +359,9 @@ def init_worker(dat_file_path_for_worker, base_output_dir_for_worker):
         sys.exit(1)
 
 
-def process_single_node_for_pileup(task_args_with_af_thresh):
-    node_id, dat_file_offset, n_records, node_sequence, min_af_threshold = task_args_with_af_thresh
+def process_single_node_for_pileup(task_args):
+    # Unpack the new argument
+    node_id, dat_file_offset, n_records, node_sequence, min_af_threshold, min_allele_bq_threshold = task_args
     global worker_dat_file, worker_base_output_dir
 
     tensor_files_generated_for_node = 0
@@ -393,14 +394,15 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
 
             try:
                 seq = raw_seq.rstrip(b'\0').decode('ascii', 'replace')
-                qual_str = raw_qual.rstrip(b'\0').decode('ascii', 'replace')
+                # Correctly parse quality bytes as a list of integers
+                qual_str = list(raw_qual.rstrip(b'\0'))
                 cigar_str_original = raw_cigar.rstrip(b'\0').decode('ascii', 'replace')
                 strand_char = strand_byte.decode('ascii')
             except UnicodeDecodeError:
                 # sys.stderr.write(f"Warning [Node {node_id}]: Unicode decode error in read. Skipping.\n")
                 continue
 
-            if not seq or len(seq) != len(qual_str): continue  # Basic validity check
+            if not seq or len(seq) != len(qual_str): continue
 
             original_decoded_cigar_ops = decode_cigar_to_int_ops(cigar_str_original)
             if not original_decoded_cigar_ops and cigar_str_original != '*': continue
@@ -441,6 +443,7 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
 
     candidate_variants = defaultdict(int)
     for seg in aligned_read_segments:
+        alt_allele_base_qualities = []
         # The offset_on_node in seg is now the effective start for the (potentially revcomp) read
         for v_pos, v_type, v_alt, v_ref in detect_variants_from_cigar(
                 seg["offset_on_node"], seg["cigar_ops"], seg["read_sequence"], node_sequence):
@@ -473,14 +476,16 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
         # For v_type 'X', expected_ref_for_af and expected_alt_for_af are already correct (node_base, read_base)
 
         for seg in aligned_read_segments:
-            allele_observed = get_allele_from_read_at_node_pos(
-                seg["offset_on_node"], seg["read_sequence"], seg["cigar_ops"],
+            allele_observed, bq = get_allele_from_read_at_node_pos(
+                seg["offset_on_node"], seg["read_sequence"], seg["processed_quality_values"], seg["cigar_ops"],
                 v_pos, node_sequence, v_type, ref_allele_for_indel_context)
 
             if allele_observed is not None:
                 locus_coverage += 1
                 if allele_observed == expected_alt_for_af:
                     alt_allele_count += 1
+                    if bq is not None:  # Add this check
+                        alt_allele_base_qualities.append(bq)  # Add this line
                 elif allele_observed == expected_ref_for_af or \
                         (v_type in ('I', 'D') and allele_observed == "REF_STATE_FOR_INDEL"):
                     ref_allele_count += 1
@@ -489,6 +494,10 @@ def process_single_node_for_pileup(task_args_with_af_thresh):
 
         current_alt_freq = alt_allele_count / locus_coverage if locus_coverage > 0 else 0.0
         if current_alt_freq < min_af_threshold: continue
+
+        mean_alt_bq = sum(alt_allele_base_qualities) / len(alt_allele_base_qualities) if alt_allele_base_qualities else 0.0
+        if mean_alt_bq < min_allele_bq_threshold:
+            continue
 
         variant_key_string = f"{v_pos}_{v_type}_{v_ref_from_cigar}_{v_alt_from_cigar}"
         window_center_pos = v_pos + 1 if v_type == 'I' else v_pos
@@ -731,6 +740,8 @@ def main():
                         help="Maximum number of reads to display per pileup in console view.")
     parser.add_argument("--min_af", type=float, default=0.1,
                         help="Minimum allele frequency for a variant to be processed for tensor generation and JSON summary.")
+    parser.add_argument("--min_allele_bq", type=float, default=15.0,
+                        help="Minimum mean base quality of allele-supporting bases. Variants below this are dropped.")
     args = parser.parse_args()
 
     # --- Argument Validation ---
@@ -836,7 +847,8 @@ def main():
             skipped_nodes_count_pre_submit += 1
             continue
         tasks_for_submission.append(
-            (node_id_val_int, node_dat_info_tuple[0], node_dat_info_tuple[1], node_sequence_val, args.min_af))
+            (node_id_val_int, node_dat_info_tuple[0], node_dat_info_tuple[1], node_sequence_val, args.min_af,
+             args.min_allele_bq))
 
     print(f"Task preparation completed in {time.time() - task_prep_s_time:.2f}s.")
     if skipped_nodes_count_pre_submit > 0:
