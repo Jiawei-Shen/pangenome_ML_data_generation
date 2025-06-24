@@ -357,10 +357,6 @@ def process_single_node_for_pileup(task_args):
             current_offset_on_node = off_from_file
 
             if strand_char == '-':
-                # current_read_sequence = reverse_complement(seq)
-                # current_quality_values = qual_values[::-1]
-                # current_decoded_cigar_ops = list(reversed(original_decoded_cigar_ops))
-
                 current_read_sequence = reverse_complement(seq)
                 current_quality_values = qual_values[::-1]
                 current_decoded_cigar_ops = [op for op in
@@ -709,7 +705,7 @@ def main():
             except Exception as e:
                 print(f"Error processing node {node_id}: {e}", file=sys.stderr)
 
-            if nodes_processed_since_last_report >= 10 or (i + 1) == len(tasks):
+            if nodes_processed_since_last_report >= 1000 or (i + 1) == len(tasks):
                 elapsed_time = time.time() - batch_start_time
                 rate = nodes_processed_since_last_report / elapsed_time if elapsed_time > 0 else 0
                 print(
