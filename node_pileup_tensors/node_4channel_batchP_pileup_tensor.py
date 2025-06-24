@@ -621,7 +621,7 @@ def main():
 
     parser.add_argument("--min_af", type=float, default=0.1, help="Minimum allele frequency to process a variant")
     parser.add_argument("--min_variants", type=int, default=2, help="Alternate allele count must be > this value")
-    parser.add_argument("--min_allele_bq", type=float, default=15.0,
+    parser.add_argument("--min_allele_bq", type=float, default=10.0,
                         help="Minimum mean base quality of allele-supporting bases")
 
     args = parser.parse_args()
