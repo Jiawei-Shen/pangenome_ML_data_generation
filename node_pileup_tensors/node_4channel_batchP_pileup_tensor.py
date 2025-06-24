@@ -315,7 +315,7 @@ def init_worker(dat_file_path_for_worker, base_output_dir_for_worker):
 
 
 def process_single_node_for_pileup(task_args):
-    # This function is now the efficient version that iterates through reads only once to gather statistics.
+    # This is the original, slower but correct logic.
     node_id, dat_file_offset, n_records, node_sequence, min_af_threshold, min_variants_threshold, min_allele_bq_threshold = task_args
     global worker_dat_file, worker_base_output_dir
 
@@ -351,17 +351,18 @@ def process_single_node_for_pileup(task_args):
             original_decoded_cigar_ops = decode_cigar_to_int_ops(cigar_str_original)
             if not original_decoded_cigar_ops and cigar_str_original != '*': continue
 
+            # *** BUG FIX AREA: REVERTED TO ORIGINAL, SIMPLER LOGIC ***
             current_read_sequence = seq
             current_quality_values = qual_values
             current_decoded_cigar_ops = original_decoded_cigar_ops
-            current_offset_on_node = off_from_file
+            current_offset_on_node = off_from_file  # Use the offset directly from file
 
             if strand_char == '-':
                 current_read_sequence = reverse_complement(seq)
                 current_quality_values = qual_values[::-1]
                 current_decoded_cigar_ops = list(reversed(original_decoded_cigar_ops))
-                alignment_span_on_node = sum(l for l, op in current_decoded_cigar_ops if op in 'MDN=X')
-                current_offset_on_node = node_len - off_from_file - alignment_span_on_node
+                # The complex offset calculation was the source of the bug and is removed.
+                # The CIGAR reversal handles the alignment path correctly with the original offset.
 
             aligned_read_segments.append({
                 "offset_on_node": current_offset_on_node,
@@ -379,79 +380,69 @@ def process_single_node_for_pileup(task_args):
     if not aligned_read_segments:
         return node_id, {}, 0
 
-    # --- Step 1: Discover all unique potential variants from all reads ---
-    candidate_variants = {}  # Use dict to store variant info
+    candidate_variants = defaultdict(int)
     for seg in aligned_read_segments:
-        variants_in_read = detect_variants_from_cigar(
-            seg["offset_on_node"], seg["cigar_ops"], seg["read_sequence"], node_sequence
-        )
-        for v_pos, v_type, v_alt, v_ref in variants_in_read:
-            variant_tuple = (v_pos, v_type, v_ref, v_alt)
-            if variant_tuple not in candidate_variants:
-                candidate_variants[variant_tuple] = {
-                    "alt_count": 0, "ref_count": 0, "other_count": 0, "coverage": 0,
-                    "alt_bqs": []
-                }
+        for v_pos, v_type, v_alt, v_ref in detect_variants_from_cigar(
+                seg["offset_on_node"], seg["cigar_ops"], seg["read_sequence"], node_sequence):
+            candidate_variants[(v_pos, v_type, v_ref, v_alt)] += 1
 
-    # --- Step 2: Gather evidence for all variants in a single pass over the reads ---
-    for seg in aligned_read_segments:
-        # Get all alleles this read supports at the locations of our candidate variants
-        # This requires a more complex function or an inline loop. For simplicity, let's do it inline.
-        read_variants = detect_variants_from_cigar(
-            seg["offset_on_node"], seg["cigar_ops"], seg["read_sequence"], node_sequence
-        )
-        read_variant_map = {(v_pos, v_type, v_ref, v_alt): (v_alt) for v_pos, v_type, v_alt, v_ref in read_variants}
-
-        for variant_tuple in candidate_variants:
-            v_pos, v_type, v_ref_from_cigar, v_alt_from_cigar = variant_tuple
-
-            expected_ref_for_af = v_ref_from_cigar
-            expected_alt_for_af = v_alt_from_cigar
-
-            allele_observed, bq = get_allele_from_read_at_node_pos(
-                seg["offset_on_node"], seg["read_sequence"], seg["processed_quality_values"], seg["cigar_ops"],
-                v_pos, node_sequence, v_type, v_ref_from_cigar if v_type == 'D' else expected_ref_for_af
-            )
-
-            if allele_observed is not None:
-                stats = candidate_variants[variant_tuple]
-                stats["coverage"] += 1
-                if allele_observed == expected_alt_for_af:
-                    stats["alt_count"] += 1
-                    if bq is not None:
-                        stats["alt_bqs"].append(bq)
-                elif allele_observed == expected_ref_for_af or (
-                        v_type in ('I', 'D') and allele_observed == "REF_STATE_FOR_INDEL"):
-                    stats["ref_count"] += 1
-                else:
-                    stats["other_count"] += 1
-
-    # --- Step 3: Filter variants and generate tensors for those that pass ---
     variant_headers_for_summary = []
     view_oriented_variant_data = {}
     tensor_files_generated_for_node = 0
     half_window = TENSOR_WINDOW_SIZE // 2
 
-    for variant_tuple, stats in candidate_variants.items():
-        v_pos, v_type, v_ref_from_cigar, v_alt_from_cigar = variant_tuple
+    for (v_pos, v_type, v_ref_from_cigar, v_alt_from_cigar), _ in candidate_variants.items():
+        alt_allele_count, ref_allele_count, other_allele_count, locus_coverage = 0, 0, 0, 0
+        alt_allele_base_qualities = []
 
-        if stats["alt_count"] <= min_variants_threshold:
+        expected_ref_for_af = v_ref_from_cigar
+        expected_alt_for_af = v_alt_from_cigar
+        ref_allele_for_indel_context = None
+
+        if v_type == 'D':
+            expected_alt_for_af = "*"
+            if 0 <= v_pos < node_len: expected_ref_for_af = node_sequence[v_pos]
+            ref_allele_for_indel_context = v_ref_from_cigar
+        elif v_type == 'I':
+            if 0 <= v_pos < node_len:
+                expected_ref_for_af = node_sequence[v_pos]
+            else:
+                expected_ref_for_af = "*"
+            ref_allele_for_indel_context = expected_ref_for_af
+
+        for seg in aligned_read_segments:
+            allele_observed, bq = get_allele_from_read_at_node_pos(
+                seg["offset_on_node"], seg["read_sequence"], seg["processed_quality_values"], seg["cigar_ops"],
+                v_pos, node_sequence, v_type, ref_allele_for_indel_context)
+
+            if allele_observed is not None:
+                locus_coverage += 1
+                if allele_observed == expected_alt_for_af:
+                    alt_allele_count += 1
+                    if bq is not None:
+                        alt_allele_base_qualities.append(bq)
+                elif allele_observed == expected_ref_for_af or (
+                        v_type in ('I', 'D') and allele_observed == "REF_STATE_FOR_INDEL"):
+                    ref_allele_count += 1
+                else:
+                    other_allele_count += 1
+
+        if alt_allele_count <= min_variants_threshold:
             continue
 
-        alt_freq = stats["alt_count"] / stats["coverage"] if stats["coverage"] > 0 else 0.0
-        if alt_freq < min_af_threshold:
+        current_alt_freq = alt_allele_count / locus_coverage if locus_coverage > 0 else 0.0
+        if current_alt_freq < min_af_threshold:
             continue
 
-        mean_alt_bq = sum(stats["alt_bqs"]) / len(stats["alt_bqs"]) if stats["alt_bqs"] else 0.0
+        mean_alt_bq = sum(alt_allele_base_qualities) / len(
+            alt_allele_base_qualities) if alt_allele_base_qualities else 0.0
         if mean_alt_bq < min_allele_bq_threshold:
             continue
 
-        # If all filters pass, proceed to generate tensor and view data
         variant_key_string = f"{v_pos}_{v_type}_{v_ref_from_cigar}_{v_alt_from_cigar}"
         window_center_pos = v_pos + 1 if v_type == 'I' else v_pos
         window_start_pos = max(0, window_center_pos - half_window)
 
-        # Generate view data
         pileup_data_for_view_json = []
         for read_idx, seg_data in enumerate(aligned_read_segments):
             if read_idx >= TENSOR_MAX_READ_ROWS: break
@@ -467,12 +458,11 @@ def process_single_node_for_pileup(task_args):
 
         view_oriented_variant_data[variant_key_string] = {
             "pileup_reads_data": pileup_data_for_view_json,
-            "alt_allele_count": stats["alt_count"], "ref_allele_count_at_locus": stats["ref_count"],
-            "other_allele_count_at_locus": stats["other_count"], "coverage_at_locus": stats["coverage"],
-            "alt_allele_frequency": round(alt_freq, 4), "mean_alt_allele_base_quality": round(mean_alt_bq, 2)
+            "alt_allele_count": alt_allele_count, "ref_allele_count_at_locus": ref_allele_count,
+            "other_allele_count_at_locus": other_allele_count, "coverage_at_locus": locus_coverage,
+            "alt_allele_frequency": round(current_alt_freq, 4), "mean_alt_allele_base_quality": round(mean_alt_bq, 2)
         }
 
-        # Generate tensor
         ch1, ch2, ch3, ch4 = [], [], [], []
         ref_row = [BASE_TO_INDEX.get(node_sequence[i].upper(), BASE_TO_INDEX[
             'N']) if window_start_pos <= i < window_start_pos + TENSOR_WINDOW_SIZE else PADDING_BASE_INDEX for i in
@@ -496,7 +486,6 @@ def process_single_node_for_pileup(task_args):
                 ch4.append([seg["mapping_quality"]] * TENSOR_WINDOW_SIZE)
                 reads_in_tensor += 1
 
-        # Pad tensor if needed
         padding_needed = TENSOR_MAX_READ_ROWS - reads_in_tensor
         for _ in range(padding_needed):
             ch1.append([PADDING_BASE_INDEX] * TENSOR_WINDOW_SIZE)
@@ -512,9 +501,10 @@ def process_single_node_for_pileup(task_args):
 
             variant_headers_for_summary.append({
                 "variant_key": variant_key_string, "tensor_file": tensor_filename,
-                "alt_allele_count": stats["alt_count"], "ref_allele_count_at_locus": stats["ref_count"],
-                "other_allele_count_at_locus": stats["other_count"], "coverage_at_locus": stats["coverage"],
-                "alt_allele_frequency": round(alt_freq, 4), "mean_alt_allele_base_quality": round(mean_alt_bq, 2)
+                "alt_allele_count": alt_allele_count, "ref_allele_count_at_locus": ref_allele_count,
+                "other_allele_count_at_locus": other_allele_count, "coverage_at_locus": locus_coverage,
+                "alt_allele_frequency": round(current_alt_freq, 4),
+                "mean_alt_allele_base_quality": round(mean_alt_bq, 2)
             })
             tensor_files_generated_for_node += 1
         except Exception as e:
