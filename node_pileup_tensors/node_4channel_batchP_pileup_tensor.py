@@ -686,7 +686,7 @@ def main():
             except Exception as e:
                 print(f"Error processing node {node_id}: {e}", file=sys.stderr)
 
-            if nodes_processed_since_last_report >= 1000 or (i + 1) == len(tasks):
+            if nodes_processed_since_last_report >= 10 or (i + 1) == len(tasks):
                 elapsed_time = time.time() - batch_start_time
                 rate = nodes_processed_since_last_report / elapsed_time if elapsed_time > 0 else 0
                 print(
