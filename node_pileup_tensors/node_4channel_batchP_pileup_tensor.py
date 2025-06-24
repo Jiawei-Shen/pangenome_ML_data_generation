@@ -357,9 +357,21 @@ def process_single_node_for_pileup(task_args):
             current_offset_on_node = off_from_file
 
             if strand_char == '-':
+                # current_read_sequence = reverse_complement(seq)
+                # current_quality_values = qual_values[::-1]
+                # current_decoded_cigar_ops = list(reversed(original_decoded_cigar_ops))
+
                 current_read_sequence = reverse_complement(seq)
-                current_quality_values = qual_values[::-1]
-                current_decoded_cigar_ops = list(reversed(original_decoded_cigar_ops))
+                current_quality_str = qual_values[::-1]
+                current_decoded_cigar_ops = [op for op in
+                                             reversed(original_decoded_cigar_ops)] if original_decoded_cigar_ops else []
+
+                # Applying user-confirmed offset logic for reverse strand
+                alignment_span_on_node = len(current_read_sequence)
+                current_offset_on_node = node_len - alignment_span_on_node - off_from_file
+                if current_offset_on_node < 0:
+                    # sys.stderr.write(f"Warning [Node {node_id}, read with off {off_from_file}]: Invalid neg offset {current_offset_on_node} for '-' strand. Skipping.\n")
+                    continue
 
             aligned_read_segments.append({
                 "offset_on_node": current_offset_on_node,
