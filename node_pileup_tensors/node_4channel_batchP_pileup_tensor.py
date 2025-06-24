@@ -448,7 +448,7 @@ def process_single_node_for_pileup(task_args):
         # New Filter: Apply the mean base quality threshold for the alternate allele
         mean_alt_bq = sum(alt_allele_base_qualities) / len(
             alt_allele_base_qualities) if alt_allele_base_qualities else 0.0
-        print(mean_alt_bq)
+        print(alt_allele_base_qualities)
         if mean_alt_bq < min_allele_bq_threshold:
             continue
 
