@@ -119,7 +119,7 @@ def process_node_directory(node_dir, true_dir, false_dir, use_symlinks):
 
         if not all([tensor_file, variant_key, tensor_file.endswith(".npy")]):
             continue
-
+        print(variant_key)
         tensor_path = os.path.join(node_dir, tensor_file)
         if not os.path.isfile(tensor_path):
             continue
@@ -132,7 +132,7 @@ def process_node_directory(node_dir, true_dir, false_dir, use_symlinks):
 
         grch38_pos = start_pos + offset + 1
         is_match = (grch38_pos, ref, alt) in vcf_variants
-        print((grch38_pos, ref, alt))
+
         dest_dir = true_dir if is_match else false_dir
         if is_match:
             local_true_count += 1
