@@ -442,13 +442,13 @@ def process_single_node_for_pileup(task_args):
             continue
 
         current_alt_freq = alt_allele_count / locus_coverage if locus_coverage > 0 else 0.0
-        print(current_alt_freq)
         if current_alt_freq < min_af_threshold:
             continue
 
         # New Filter: Apply the mean base quality threshold for the alternate allele
         mean_alt_bq = sum(alt_allele_base_qualities) / len(
             alt_allele_base_qualities) if alt_allele_base_qualities else 0.0
+        print(mean_alt_bq)
         if mean_alt_bq < min_allele_bq_threshold:
             continue
 
