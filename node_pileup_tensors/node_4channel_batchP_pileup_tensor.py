@@ -315,7 +315,7 @@ def init_worker(dat_file_path_for_worker, base_output_dir_for_worker):
 
 
 def process_single_node_for_pileup(task_args):
-    node_id, dat_file_offset, n_records, node_sequence, min_af_threshold, min_variants_threshold, min_allele_bq_threshold = task_args
+    node_id, dat_file_offset, n_records, node_sequence, min_af_threshold, min_variants_threshold, min_allele_bq_threshold, variant_type_to_process = task_args
     global worker_dat_file, worker_base_output_dir
 
     tensor_files_generated_for_node = 0
@@ -396,6 +396,13 @@ def process_single_node_for_pileup(task_args):
     half_window = TENSOR_WINDOW_SIZE // 2
 
     for (v_pos, v_type, v_ref_from_cigar, v_alt_from_cigar), _ in candidate_variants.items():
+        if variant_type_to_process == 'snp':
+            if v_type != 'X':
+                continue
+        elif variant_type_to_process == 'indel':
+            if v_type not in ('I', 'D'):
+                continue
+
         alt_allele_count, ref_allele_count, other_allele_count, locus_coverage = 0, 0, 0, 0
         alt_allele_base_qualities = []
 
@@ -621,8 +628,11 @@ def main():
 
     parser.add_argument("--min_af", type=float, default=0.1, help="Minimum allele frequency to process a variant")
     parser.add_argument("--min_variants", type=int, default=2, help="Alternate allele count must be > this value")
-    parser.add_argument("--min_allele_bq", type=float, default=10.0,
+    parser.add_argument("--min_allele_bq", type=float, default=5.0,
                         help="Minimum mean base quality of allele-supporting bases")
+
+    parser.add_argument("--variant_type", type=str, default='all', choices=['snp', 'indel', 'all'],
+                        help="Type of variants to output tensors for: 'snp', 'indel', or 'all'.")
 
     args = parser.parse_args()
 
@@ -665,7 +675,7 @@ def main():
         if str(node_id) in node_sequences and node_id in full_idx_data:
             offset, n_records = full_idx_data[node_id]
             tasks.append((node_id, offset, n_records, node_sequences[str(node_id)], args.min_af, args.min_variants,
-                          args.min_allele_bq))
+                          args.min_allele_bq, args.variant_type))
 
     if not tasks:
         sys.exit("No valid tasks to run after checking for sequences and index entries.")
