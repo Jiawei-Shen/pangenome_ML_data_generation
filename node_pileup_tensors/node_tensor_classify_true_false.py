@@ -2,12 +2,12 @@
 import argparse
 import json
 import os
-import subprocess
 import shutil
 import sys
 import time
 from multiprocessing import Pool, cpu_count
 from functools import partial
+import pysam  # Use pysam instead of subprocess
 
 # --- Global variables for worker processes ---
 vcf_variants = set()
@@ -24,48 +24,48 @@ def format_time(seconds):
 
 def get_variant_count(vcf_file_path, chromosome):
     """
-    Efficiently counts the number of unique variants for a chromosome from a VCF file
-    without storing them in memory. This is for display purposes only.
+    Efficiently counts variants for a chromosome from a VCF file using pysam.
+    Note: Requires a bgzipped VCF with a .tbi index.
     """
     print(f"Counting variants in {os.path.basename(vcf_file_path)} for {chromosome}...")
     count = 0
-    cmd = ['bcftools', 'view', '-r', chromosome, vcf_file_path]
     try:
-        with subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, bufsize=1) as proc:
-            for line in proc.stdout:
-                if line.startswith("#"):
-                    continue
-                fields = line.strip().split('\t')
-                if len(fields) >= 5:
-                    # Add the number of alternate alleles. e.g., A->G,T counts as 2.
-                    count += len(fields[4].split(','))
+        with pysam.VariantFile(vcf_file_path) as vcf_in:
+            for record in vcf_in.fetch(chromosome):
+                # Add the number of alternate alleles. e.g., A->G,T counts as 2.
+                if record.alts:
+                    count += len(record.alts)
         return count
-    except FileNotFoundError:
-        print(f"Error: 'bcftools' not found. Please ensure it's installed and in your PATH.", file=sys.stderr)
+    except ValueError as e:
+        print(f"Error: Could not read VCF file with pysam. Is it a valid bgzipped VCF with a .tbi index?", file=sys.stderr)
+        print(f"Pysam error: {e}", file=sys.stderr)
         sys.exit(1)
-    except Exception:
+    except Exception as e:
+        print(f"An unexpected error occurred while counting variants: {e}", file=sys.stderr)
         return -1  # Return an error indicator
 
 
 def query_vcf_for_chromosome(vcf_file_path, chromosome):
-    """Queries a VCF file and returns a set of variants. Runs silently in workers."""
+    """
+    Queries a VCF file using pysam and returns a set of variants for workers.
+    Note: Requires a bgzipped VCF with a .tbi index.
+    """
     local_variants = set()
-    cmd = ['bcftools', 'view', '-r', chromosome, vcf_file_path]
     try:
-        with subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, bufsize=1) as proc:
-            for line in proc.stdout:
-                if line.startswith("#"):
-                    continue
-                fields = line.strip().split('\t')
-                if len(fields) >= 5:
-                    pos = int(fields[1])
-                    ref = fields[3].upper()
-                    for alt in fields[4].upper().split(','):
-                        local_variants.add((pos, ref, alt))
+        with pysam.VariantFile(vcf_file_path) as vcf_in:
+            for record in vcf_in.fetch(chromosome):
+                # pysam is 0-based, VCF is 1-based. Convert to 1-based for consistency.
+                pos = record.pos + 1
+                ref = record.ref.upper()
+                if record.alts:
+                    for alt in record.alts:
+                        local_variants.add((pos, ref, alt.upper()))
         return local_variants
-    except FileNotFoundError:
-        print(f"FATAL ERROR in worker: 'bcftools' not found.", file=sys.stderr)
-        sys.exit(1)
+    except ValueError as e:
+        print(f"FATAL ERROR in worker: Pysam could not read VCF file.", file=sys.stderr)
+        print(f"Please ensure '{vcf_file_path}' is a bgzipped VCF with a .tbi index.", file=sys.stderr)
+        print(f"Pysam error: {e}", file=sys.stderr)
+        sys.exit(1) # Exit worker process on fatal error
     except Exception:
         return set()
 
@@ -160,9 +160,9 @@ def process_node_directory(node_dir, true_dir, false_dir, use_symlinks):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Classify variant tensors against a VCF file (Robust Parallel Version).")
+        description="Classify variant tensors against a VCF file using pysam (Robust Parallel Version).")
     parser.add_argument("tensor_folder_path", help="Path to the parent folder containing node tensor directories.")
-    parser.add_argument("vcf_file", help="Path to the VCF file for ground truth variants.")
+    parser.add_argument("vcf_file", help="Path to the bgzipped VCF file (.vcf.gz) for ground truth variants.")
     parser.add_argument("node_pos_json", help="Path to the JSON file with node positions.")
     parser.add_argument("--output_folder", default="./classification_results", help="Folder to save results.")
     parser.add_argument("--chr", default="chr1", help="Chromosome to process.")
@@ -179,7 +179,6 @@ def main():
     os.makedirs(false_dir, exist_ok=True)
 
     # --- Pre-computation and Display ---
-    # Call the new counting function from the main process
     total_variants = get_variant_count(args.vcf_file, args.chr)
     if total_variants >= 0:
         print(f"Found a total of {total_variants:,} unique variants to be used as ground truth.\n")
@@ -210,6 +209,7 @@ def main():
 
     init_args = (args.vcf_file, args.chr, args.node_pos_json)
     with Pool(processes=args.workers, initializer=init_worker, initargs=init_args) as pool:
+        # Use imap_unordered for better progress reporting as nodes finish
         results = pool.imap_unordered(worker_func, node_dirs)
 
         for i, (records, true_c, false_c) in enumerate(results):
