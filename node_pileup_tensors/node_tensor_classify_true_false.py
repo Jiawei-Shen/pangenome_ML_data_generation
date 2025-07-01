@@ -55,7 +55,7 @@ def query_vcf_for_chromosome(vcf_file_path, chromosome):
         with pysam.VariantFile(vcf_file_path) as vcf_in:
             for record in vcf_in.fetch(chromosome):
                 # pysam is 0-based, VCF is 1-based. Convert to 1-based for consistency.
-                pos = record.pos + 1
+                pos = record.pos
                 ref = record.ref.upper()
                 if record.alts:
                     for alt in record.alts:
