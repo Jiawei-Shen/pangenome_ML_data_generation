@@ -6,6 +6,7 @@ import sys
 import time
 import copy
 import re
+import os
 import pysam  # Replaces subprocess and shutil for VCF operations
 
 
