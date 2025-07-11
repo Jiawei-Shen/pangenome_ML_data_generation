@@ -406,11 +406,11 @@ def process_single_node_for_pileup(task_args):
         return node_id, {}, tensor_files_generated_for_node
 
     candidate_variants = defaultdict(int)
+    print(aligned_read_segments)
     for seg in aligned_read_segments:
         for v_pos, v_type, v_alt, v_ref in detect_variants_from_cigar(
                 seg["offset_on_node"], seg["cigar_ops"], seg["read_sequence"], node_sequence):
             candidate_variants[(v_pos, v_type, v_ref, v_alt)] += 1
-    print(candidate_variants)
     variant_headers_for_summary = []
     view_oriented_variant_data = {}
 
