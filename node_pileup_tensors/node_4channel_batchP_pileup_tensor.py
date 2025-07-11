@@ -49,29 +49,13 @@ worker_base_output_dir = None
 # Helper Functions
 # ─────────────────────────────────────────────────────────────────────────────
 
-def calculate_window_start(node_len, variant_pos, window_size):
+def calculate_window_start(variant_pos, window_size):
     """
-    Calculates the start position for a window along a node sequence.
-    - If the node is shorter than the window, it centers the node within the window.
-      The returned start position will be negative, indicating left-padding.
-    - If the node is longer, it centers the window on the variant position,
-      clamping it to the node's boundaries.
+    Calculates the window's start position to place a variant at the center.
+    The returned start_pos can be negative, indicating left-side padding is needed.
     """
-    half_window = window_size // 2
-
-    if node_len < window_size:
-        # Center the entire node in the window.
-        return -((window_size - node_len) // 2)
-    else:
-        # Center the window on the variant, then clamp.
-        start_pos = variant_pos - half_window
-
-        if start_pos < 0:
-            start_pos = 0
-        elif start_pos + window_size > node_len:
-            start_pos = node_len - window_size
-
-        return start_pos
+    center_index = window_size // 2
+    return variant_pos - center_index
 
 
 def reverse_complement(sequence):
@@ -278,7 +262,6 @@ def get_read_representation_in_window_for_view(segment_cigar_ops, segment_offset
         elif op in ('I', 'S'):
             read_pos += L
 
-        # Optimization: check if we've passed the window entirely
         if node_pos >= window_start_node + window_size and read_pos > 0: break
         if read_pos >= read_seq_len: break
     return window_chars
@@ -467,8 +450,9 @@ def process_single_node_for_pileup(task_args):
         if mean_alt_bq < min_allele_bq_threshold: continue
 
         variant_key_string = f"{v_pos}_{v_type}_{v_ref_from_cigar}_{v_alt_from_cigar}"
+        # Changed: Use simplified windowing logic for strict centering
         window_center_pos = v_pos + 1 if v_type == 'I' else v_pos
-        window_start_pos = calculate_window_start(node_len, window_center_pos, TENSOR_WINDOW_SIZE)
+        window_start_pos = calculate_window_start(window_center_pos, TENSOR_WINDOW_SIZE)
 
         pileup_data_for_view_json = []
         for read_segment_idx, seg_data in enumerate(aligned_read_segments):
@@ -583,8 +567,9 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
         variant_data = node_data_for_display_view[variant_key]
         v_pos, v_type = int(variant_key.split('_')[0]), variant_key.split('_')[1]
 
+        # Changed: Use simplified windowing logic for strict centering
         window_center_pos = v_pos + 1 if v_type == 'I' else v_pos
-        window_start_pos = calculate_window_start(len(full_node_sequence), window_center_pos, TENSOR_WINDOW_SIZE)
+        window_start_pos = calculate_window_start(window_center_pos, TENSOR_WINDOW_SIZE)
 
         print(f"\n--- Variant: {variant_key} ---")
         print(
@@ -592,12 +577,16 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
         print(
             f"  Alt Freq: {variant_data.get('alt_allele_frequency', 0.0):.4f}, Mean Alt BQ: {variant_data.get('mean_alt_allele_base_quality', 0.0):.2f}")
 
-        ref_chars = ['0'] * TENSOR_WINDOW_SIZE
-        for j, node_pos_in_window in enumerate(range(window_start_pos, window_start_pos + TENSOR_WINDOW_SIZE)):
-            if 0 <= node_pos_in_window < len(full_node_sequence):
-                ref_chars[j] = full_node_sequence[node_pos_in_window]
+        # Changed: More robust reference display that handles negative start positions for padding
+        ref_chars = []
+        for j in range(window_start_pos, window_start_pos + TENSOR_WINDOW_SIZE):
+            if 0 <= j < len(full_node_sequence):
+                ref_chars.append(full_node_sequence[j])
+            else:
+                ref_chars.append('0')
         print(f"  Node Ref: {''.join(ref_chars)}")
 
+        # This logic correctly centers the marker now
         marker_pos_in_window = v_pos - window_start_pos
         marker_line = [' '] * TENSOR_WINDOW_SIZE
         if 0 <= marker_pos_in_window < TENSOR_WINDOW_SIZE:
