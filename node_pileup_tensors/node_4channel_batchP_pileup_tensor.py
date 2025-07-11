@@ -383,8 +383,9 @@ def process_single_node_for_pileup(task_args):
                 current_decoded_cigar_ops = [op for op in
                                              reversed(original_decoded_cigar_ops)] if original_decoded_cigar_ops else []
 
-                alignment_span_on_node = sum(l for l, op in current_decoded_cigar_ops if op in 'MDN=X')
-                current_offset_on_node = node_len - off_from_file - alignment_span_on_node
+                # Applying user-confirmed offset logic for reverse strand
+                alignment_span_on_node = len(current_read_sequence)
+                current_offset_on_node = node_len - alignment_span_on_node - off_from_file
                 if current_offset_on_node < -TENSOR_WINDOW_SIZE:
                     continue
 
