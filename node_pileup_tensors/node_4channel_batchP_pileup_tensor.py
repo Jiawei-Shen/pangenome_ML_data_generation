@@ -383,11 +383,19 @@ def process_single_node_for_pileup(task_args):
                 current_decoded_cigar_ops = [op for op in
                                              reversed(original_decoded_cigar_ops)] if original_decoded_cigar_ops else []
 
-                # Applying user-confirmed offset logic for reverse strand
-                alignment_span_on_node = len(current_read_sequence)
-                current_offset_on_node = node_len - alignment_span_on_node - off_from_file
-                if current_offset_on_node < -TENSOR_WINDOW_SIZE:
+                # --- Bug Fix Start ---
+                # CORRECTED: Calculate span based on CIGAR ops that consume the reference, not read length.
+                alignment_span_on_node = sum(
+                    length for length, op in current_decoded_cigar_ops if op in ('M', 'D', 'N', '=', 'X'))
+
+                # This offset calculation assumes 'off_from_file' for a '-' strand read is the
+                # distance from the node start to the alignment's end on the node.
+                current_offset_on_node = node_len - off_from_file - alignment_span_on_node
+
+                # A read's starting position on the node cannot be negative.
+                if current_offset_on_node < 0:
                     continue
+                # --- Bug Fix End ---
 
             aligned_read_segments.append({
                 "offset_on_node": current_offset_on_node,
