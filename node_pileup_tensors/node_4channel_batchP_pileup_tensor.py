@@ -30,7 +30,7 @@ INDEX_TO_BASE_FOR_VIEW = {
     2: 'A', 3: 'C', 5: 'G', 7: 'T',
     1: 'N',
     9: '*',
-    0: ' '
+    0: '0'  # Changed: Padding is now represented by '0' instead of a space
 }
 
 TENSOR_WINDOW_SIZE = 100
@@ -461,8 +461,16 @@ def process_single_node_for_pileup(task_args):
                 seg_data["cigar_ops"], seg_data["offset_on_node"], seg_data["read_sequence"],
                 window_start_pos, TENSOR_WINDOW_SIZE, node_len)
             if any(char != ' ' for char in row_chars_for_view):
+                # Changed: Explicitly handle padding character to map to PADDING_BASE_INDEX
+                bases_for_view = []
+                for char in row_chars_for_view:
+                    if char == ' ':
+                        bases_for_view.append(PADDING_BASE_INDEX)
+                    else:
+                        bases_for_view.append(BASE_TO_INDEX.get(char.upper(), BASE_TO_INDEX['N']))
+
                 pileup_data_for_view_json.append({
-                    "bases": [BASE_TO_INDEX.get(char.upper(), BASE_TO_INDEX['N']) for char in row_chars_for_view],
+                    "bases": bases_for_view,
                     "offset": seg_data["offset_on_node"],
                     "strand": seg_data["strand"],
                     "cigar": seg_data["original_cigar_str"]
@@ -582,9 +590,10 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
         print(f"  Alt Freq: {variant_data.get('alt_allele_frequency', 0.0):.4f}, "
               f"Mean Alt BQ: {variant_data.get('mean_alt_allele_base_quality', 0.0):.2f}")
 
+        # Changed: Use '0' for padding the reference sequence display
         ref_display = "".join([full_node_sequence[
                                    j] if window_start_pos <= j < window_start_pos + TENSOR_WINDOW_SIZE and j < len(
-            full_node_sequence) else ' ' for j in range(window_start_pos, window_start_pos + TENSOR_WINDOW_SIZE)])
+            full_node_sequence) else '0' for j in range(window_start_pos, window_start_pos + TENSOR_WINDOW_SIZE)])
         print(f"  Node Ref: {ref_display}")
 
         marker_pos_in_window = v_pos - window_start_pos
