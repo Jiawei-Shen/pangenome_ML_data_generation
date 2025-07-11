@@ -25,6 +25,13 @@ BASE_TO_INDEX = {
 }
 PADDING_BASE_INDEX = 0
 
+# CIGAR Operation to Index Mapping
+CIGAR_OP_TO_INDEX = {
+    'M': 1, 'I': 2, 'D': 3, 'N': 4, 'S': 5, 'H': 6, 'P': 7, '=': 8, 'X': 9,
+    '_PADDING_': 0
+}
+CIGAR_PADDING_INDEX = 0
+
 # Index to Base Mapping for console visualization
 INDEX_TO_BASE_FOR_VIEW = {
     2: 'A', 3: 'C', 5: 'G', 7: 'T',
@@ -272,24 +279,27 @@ def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
                                    window_start_node, tensor_win_size, node_len):
     bases = [PADDING_BASE_INDEX] * tensor_win_size
     quals = [DEFAULT_QUALITY_PADDING] * tensor_win_size
+    cigar_ops_indices = [CIGAR_PADDING_INDEX] * tensor_win_size
+
     node_pos, read_pos = segment_offset_on_node, 0
     read_seq_len = len(segment_read_sequence)
     qual_len = len(segment_quality_values)
 
     for L, op in segment_cigar_ops:
+        op_idx = CIGAR_OP_TO_INDEX.get(op, CIGAR_PADDING_INDEX)
         if node_pos >= window_start_node + tensor_win_size and read_pos > 0: break
 
         if op in ('M', '=', 'X'):
             for i in range(L):
                 n_aln, r_aln = node_pos + i, read_pos + i
-                if r_aln >= read_seq_len: break
-
                 win_idx = n_aln - window_start_node
                 if 0 <= win_idx < tensor_win_size:
-                    base_char = segment_read_sequence[r_aln].upper()
-                    bases[win_idx] = BASE_TO_INDEX.get(base_char, BASE_TO_INDEX['N'])
-                    if r_aln < qual_len:
-                        quals[win_idx] = segment_quality_values[r_aln]
+                    cigar_ops_indices[win_idx] = op_idx
+                    if r_aln < read_seq_len:
+                        base_char = segment_read_sequence[r_aln].upper()
+                        bases[win_idx] = BASE_TO_INDEX.get(base_char, BASE_TO_INDEX['N'])
+                        if r_aln < qual_len:
+                            quals[win_idx] = segment_quality_values[r_aln]
             node_pos += L
             read_pos += L
         elif op in ('D', 'N'):
@@ -297,6 +307,7 @@ def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
                 n_aln = node_pos + i
                 win_idx = n_aln - window_start_node
                 if 0 <= win_idx < tensor_win_size:
+                    cigar_ops_indices[win_idx] = op_idx
                     bases[win_idx] = BASE_TO_INDEX['*']
                     quals[win_idx] = DEFAULT_QUALITY_PADDING
             node_pos += L
@@ -304,7 +315,7 @@ def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
             read_pos += L
 
         if read_pos >= read_seq_len: break
-    return bases, quals
+    return bases, quals, cigar_ops_indices
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -477,7 +488,7 @@ def process_single_node_for_pileup(task_args):
             "mean_alt_allele_base_quality": round(mean_alt_bq, 2)
         }
 
-        ch1_list, ch2_list, ch3_list, ch4_list = [], [], [], []
+        ch1_list, ch2_list, ch3_list, ch4_list, ch5_list = [], [], [], [], []
 
         ref_base_indices_row = [PADDING_BASE_INDEX] * TENSOR_WINDOW_SIZE
         for i, node_pos_in_window in enumerate(range(window_start_pos, window_start_pos + TENSOR_WINDOW_SIZE)):
@@ -489,11 +500,13 @@ def process_single_node_for_pileup(task_args):
         ch2_list.append([DEFAULT_QUALITY_PADDING] * TENSOR_WINDOW_SIZE)
         ch3_list.append([MISMATCH_CHANNEL_REF_ROW_VALUE] * TENSOR_WINDOW_SIZE)
         ch4_list.append([DEFAULT_MAPPING_QUALITY_PADDING] * TENSOR_WINDOW_SIZE)
+        ch5_list.append([CIGAR_PADDING_INDEX] * TENSOR_WINDOW_SIZE)
 
         reads_added = 0
         for seg_data in aligned_read_segments:
             if reads_added >= TENSOR_MAX_READ_ROWS: break
-            base_idx_row, quality_score_row = get_read_tensor_rows_in_window(
+
+            base_idx_row, quality_score_row, cigar_op_row = get_read_tensor_rows_in_window(
                 seg_data["cigar_ops"], seg_data["offset_on_node"],
                 seg_data["read_sequence"], seg_data["processed_quality_values"],
                 window_start_pos, TENSOR_WINDOW_SIZE, node_len)
@@ -507,16 +520,18 @@ def process_single_node_for_pileup(task_args):
                 ch3_list.append(mismatch_flags_row)
                 mapq = max(0, min(int(seg_data["mapping_quality"]), 127))
                 ch4_list.append([mapq] * TENSOR_WINDOW_SIZE)
+                ch5_list.append(cigar_op_row)
                 reads_added += 1
 
-        for _ in range(TENSOR_MAX_READ_ROWS + 1 - len(ch1_list)):
+        for _ in range(TENSOR_MAX_READ_ROWS - reads_added):
             ch1_list.append([PADDING_BASE_INDEX] * TENSOR_WINDOW_SIZE)
             ch2_list.append([DEFAULT_QUALITY_PADDING] * TENSOR_WINDOW_SIZE)
             ch3_list.append([MISMATCH_COMPARISON_PADDING_VALUE] * TENSOR_WINDOW_SIZE)
             ch4_list.append([DEFAULT_MAPPING_QUALITY_PADDING] * TENSOR_WINDOW_SIZE)
+            ch5_list.append([CIGAR_PADDING_INDEX] * TENSOR_WINDOW_SIZE)
 
         try:
-            tensor_chw = torch.tensor([ch1_list, ch2_list, ch3_list, ch4_list], dtype=torch.int8)
+            tensor_chw = torch.tensor([ch1_list, ch2_list, ch3_list, ch4_list, ch5_list], dtype=torch.int8)
             tensor_hwc = tensor_chw.permute(1, 2, 0)
             numpy_array_to_save = tensor_hwc.numpy()
             tensor_filename_npy = f"{variant_key_string}.npy"
@@ -594,7 +609,6 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
                 print(f"  ... ({len(variant_data.get('pileup_reads_data', [])) - j} more reads not shown)")
                 break
             bases_str = "".join([INDEX_TO_BASE_FOR_VIEW.get(idx, '?') for idx in read_entry["bases"]])
-            # Changed: Display CIGAR instead of offset and strand
             print(f"  Read {j + 1:3d}: {bases_str} (CIGAR:{read_entry['cigar']})")
     print()
 
