@@ -450,7 +450,6 @@ def process_single_node_for_pileup(task_args):
         if mean_alt_bq < min_allele_bq_threshold: continue
 
         variant_key_string = f"{v_pos}_{v_type}_{v_ref_from_cigar}_{v_alt_from_cigar}"
-        # Changed: Use simplified windowing logic for strict centering
         window_center_pos = v_pos + 1 if v_type == 'I' else v_pos
         window_start_pos = calculate_window_start(window_center_pos, TENSOR_WINDOW_SIZE)
 
@@ -567,7 +566,6 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
         variant_data = node_data_for_display_view[variant_key]
         v_pos, v_type = int(variant_key.split('_')[0]), variant_key.split('_')[1]
 
-        # Changed: Use simplified windowing logic for strict centering
         window_center_pos = v_pos + 1 if v_type == 'I' else v_pos
         window_start_pos = calculate_window_start(window_center_pos, TENSOR_WINDOW_SIZE)
 
@@ -577,7 +575,6 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
         print(
             f"  Alt Freq: {variant_data.get('alt_allele_frequency', 0.0):.4f}, Mean Alt BQ: {variant_data.get('mean_alt_allele_base_quality', 0.0):.2f}")
 
-        # Changed: More robust reference display that handles negative start positions for padding
         ref_chars = []
         for j in range(window_start_pos, window_start_pos + TENSOR_WINDOW_SIZE):
             if 0 <= j < len(full_node_sequence):
@@ -586,7 +583,6 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
                 ref_chars.append('0')
         print(f"  Node Ref: {''.join(ref_chars)}")
 
-        # This logic correctly centers the marker now
         marker_pos_in_window = v_pos - window_start_pos
         marker_line = [' '] * TENSOR_WINDOW_SIZE
         if 0 <= marker_pos_in_window < TENSOR_WINDOW_SIZE:
@@ -598,7 +594,8 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
                 print(f"  ... ({len(variant_data.get('pileup_reads_data', [])) - j} more reads not shown)")
                 break
             bases_str = "".join([INDEX_TO_BASE_FOR_VIEW.get(idx, '?') for idx in read_entry["bases"]])
-            print(f"  Read {j + 1:3d}: {bases_str} (Off:{read_entry['offset']},Str:{read_entry['strand']})")
+            # Changed: Display CIGAR instead of offset and strand
+            print(f"  Read {j + 1:3d}: {bases_str} (CIGAR:{read_entry['cigar']})")
     print()
 
 
