@@ -77,10 +77,8 @@ def extract_path_info_from_gfa(gfa_file_path, user_grep_pattern_input):
     final_path_segments_oriented = []
     path_identifier_gfa = ""
     path_source_type = None
-    # --- MODIFICATION START ---
-    # Default path start to 0. This will be used for P-lines or W-lines where the start can't be parsed.
-    path_start_offset = 0
-    # --- MODIFICATION END ---
+    # Default path start to 1 for 1-based output. This will be used for P-lines.
+    path_start_offset = 1
 
     line_parts = found_line_content.split('\t')
     actual_record_type = line_parts[0] if line_parts else None
@@ -99,15 +97,16 @@ def extract_path_info_from_gfa(gfa_file_path, user_grep_pattern_input):
         path_identifier_gfa = f"W:{sample_id}/{haplotype_id}/{seq_name}"  # For context in output
 
         # --- MODIFICATION START ---
-        # Use the start coordinate from the W-line (column 4) to initialize the position.
-        # The GFA specification states W-line coordinates are 0-based.
+        # Use the start coordinate from the W-line (column 4) and add 1 to convert to 1-based coordinate system.
         try:
-            path_start_offset = int(line_parts[4])
-            logging.info(f"Read path start offset {path_start_offset} from W-line.")
+            # Add 1 to convert 0-based GFA coordinate to 1-based output
+            path_start_offset = int(line_parts[4]) + 1
+            logging.info(
+                f"Read 0-based path start offset {path_start_offset - 1} from W-line, converted to 1-based {path_start_offset}.")
         except (ValueError, IndexError):
             logging.warning(
-                f"Could not parse start position from W-line, defaulting to 0. Line: '{found_line_content}'")
-            path_start_offset = 0
+                f"Could not parse start position from W-line, defaulting to 1. Line: '{found_line_content}'")
+            path_start_offset = 1
         # --- MODIFICATION END ---
 
         w_path_str = line_parts[6]
@@ -136,7 +135,7 @@ def extract_path_info_from_gfa(gfa_file_path, user_grep_pattern_input):
         msg = f"Path '{path_identifier_gfa}' (type {path_source_type}) definition found by grep, but its path string yielded no segments."
         logging.warning(msg)
         return json.dumps({
-            "message": msg, "path_name_input_pattern": user_grep_pattern_input,  # Changed to reflect it's a pattern
+            "message": msg, "path_name_input_pattern": user_grep_pattern_input,
             "path_identifier_gfa": path_identifier_gfa, "path_source_type": path_source_type,
             "nodes": [], "status": "success_empty_path_definition"
         })
@@ -165,10 +164,8 @@ def extract_path_info_from_gfa(gfa_file_path, user_grep_pattern_input):
 
     # Step 4: Process nodes
     output_nodes = []
-    # --- MODIFICATION START ---
-    # Initialize the cumulative position with the offset read from the W-line (or 0 for P-lines).
+    # Initialize the cumulative position with the 1-based offset.
     current_cumulative_pos = path_start_offset
-    # --- MODIFICATION END ---
     for seg_info in final_path_segments_oriented:
         seg_id, strand = seg_info['id'], seg_info['strand']
         if seg_id not in segments:
@@ -184,7 +181,7 @@ def extract_path_info_from_gfa(gfa_file_path, user_grep_pattern_input):
 
     logging.info(f"Successfully processed {len(output_nodes)} nodes for path '{path_identifier_gfa}'.")
     return json.dumps({
-        "path_name_input_pattern": user_grep_pattern_input,  # Changed field name
+        "path_name_input_pattern": user_grep_pattern_input,
         "path_identifier_gfa": path_identifier_gfa,
         "path_source_type": path_source_type, "nodes": output_nodes, "status": "success"
     }, indent=4)
@@ -194,7 +191,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description="Uses a user-provided grep pattern to find a W or P path in a GFA file, then extracts node information.\n"
                     "The script executes 'grep -P -m 1 <user_pattern> <gfa_file>'.\n"
-                    "The 'grch38_position_start' in the output is the cumulative position along the specified path.",
+                    "The 'grch38_position_start' in the output is the cumulative position along the specified path (1-based).",
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument(
