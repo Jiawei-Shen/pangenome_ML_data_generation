@@ -410,7 +410,7 @@ def process_single_node_for_pileup(task_args):
         for v_pos, v_type, v_alt, v_ref in detect_variants_from_cigar(
                 seg["offset_on_node"], seg["cigar_ops"], seg["read_sequence"], node_sequence):
             candidate_variants[(v_pos, v_type, v_ref, v_alt)] += 1
-    print(candidate_variants, len(candidate_variants))
+
     variant_headers_for_summary = []
     view_oriented_variant_data = {}
 
@@ -454,15 +454,24 @@ def process_single_node_for_pileup(task_args):
                 else:
                     other_allele_count += 1
 
+        # This filter applies to all variant types
         if alt_allele_count < min_variants_threshold:
             continue
+
+        # These filters only apply to SNPs
+        if v_type == 'X':
+            current_alt_freq = alt_allele_count / locus_coverage if locus_coverage > 0 else 0.0
+            if current_alt_freq < min_af_threshold:
+                continue
+            mean_alt_bq = sum(alt_allele_base_qualities) / len(
+                alt_allele_base_qualities) if alt_allele_base_qualities else 0.0
+            if mean_alt_bq < min_allele_bq_threshold:
+                continue
+
+        # For indels, we need to calculate these values for the summary, but we don't filter on them
         current_alt_freq = alt_allele_count / locus_coverage if locus_coverage > 0 else 0.0
-        if current_alt_freq < min_af_threshold:
-            continue
         mean_alt_bq = sum(alt_allele_base_qualities) / len(
             alt_allele_base_qualities) if alt_allele_base_qualities else 0.0
-        if mean_alt_bq < min_allele_bq_threshold:
-            continue
 
         variant_key_string = f"{v_pos}_{v_type}_{v_ref_from_cigar}_{v_alt_from_cigar}"
         window_center_pos = v_pos + 1 if v_type == 'I' else v_pos
