@@ -218,7 +218,7 @@ def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepat
                         batch_start_time_step4 = time.time()
         except FileNotFoundError:
             print(f"Error: VCF file not found at '{vcf_file}'. Cannot perform VCF filtering.", file=sys.stderr)
-            # Fallback to just filtering by IDX if VCF is not found
+            # Fallback to just filtering by ID X if VCF is not found
             ultimate_filtered_nodes_list = [json_nodes_map[node_id] for node_id in common_node_ids_int]
         except ValueError as e:  # Pysam raises ValueError for bad VCFs/indexes
             print(f"Error processing VCF file '{vcf_file}'. Is it a valid bgzipped VCF with a .tbi index? Details: {e}",
