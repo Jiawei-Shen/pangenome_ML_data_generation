@@ -520,7 +520,6 @@ def process_single_node_for_pileup(task_args):
 
         try:
             tensor_chw = torch.tensor([ch1_list, ch2_list, ch3_list, ch4_list], dtype=torch.int8)
-            tensor_hwc = tensor_chw.permute(1, 2, 0)
             numpy_array_to_save = tensor_hwc.numpy()
             tensor_filename_npy = f"{variant_key_string}.npy"
             tensor_filepath_npy = os.path.join(node_specific_output_dir, tensor_filename_npy)
