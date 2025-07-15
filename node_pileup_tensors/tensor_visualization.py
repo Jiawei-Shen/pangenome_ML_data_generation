@@ -31,14 +31,8 @@ def load_tensor(filepath):
     if tensor.ndim != 3:
         raise ValueError(f"Expected 3D tensor, got shape {tensor.shape}")
 
-    # Assume (W, H, C) and transpose to (C, H, W)
-    if tensor.shape[2] < tensor.shape[0] and tensor.shape[2] < tensor.shape[1]:
-        tensor = np.transpose(tensor, (2, 1, 0))  # (W, H, C) → (C, H, W)
-    elif tensor.shape[0] < tensor.shape[1] and tensor.shape[0] < tensor.shape[2]:
-        pass  # already (C, H, W)
-    else:
-        raise ValueError(f"Ambiguous tensor shape: {tensor.shape}. Expected (W,H,C) or (C,H,W)")
-
+    # Convert (C, W, H) → (C, H, W)
+    tensor = tensor[:, :, :].transpose(0, 2, 1)
     return tensor
 
 
