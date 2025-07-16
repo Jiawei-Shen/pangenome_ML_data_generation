@@ -1,265 +1,212 @@
+#!/usr/bin/env python3
 import json
 import argparse
 import sys
 import re
 import logging
-import subprocess
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', stream=sys.stderr)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper Functions
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_af_from_vcf(vcf_path, contig):
+    """
+    Directly loads allele frequencies from a VCF file into a dictionary using pysam.
+    """
+    try:
+        import pysam
+    except ImportError:
+        logging.critical("pysam is not installed. Please install it to use VCF annotation: pip install pysam")
+        sys.exit(1)
+
+    af_map = {}
+    logging.info(f"Loading allele frequency data directly from VCF: {vcf_path} for contig '{contig}'")
+    try:
+        vcf_file = pysam.VariantFile(vcf_path)
+        if contig not in vcf_file.header.contigs:
+            logging.warning(f"Contig '{contig}' not found in VCF header. No AF annotation will be added.")
+            return {}
+
+        for rec in vcf_file.fetch(contig):
+            if 'AF' in rec.info and rec.info['AF'] is not None:
+                try:
+                    position = rec.pos
+                    af = float(rec.info['AF'][0])
+                    af_map[position] = round(af, 5)
+                except (ValueError, TypeError, IndexError):
+                    continue
+        logging.info(f"Loaded {len(af_map):,} AF records from VCF.")
+    except FileNotFoundError:
+        logging.error(f"VCF file not found: {vcf_path}. Cannot perform AF annotation.")
+    except Exception as e:
+        logging.error(f"Could not load AF data from VCF due to an error: {e}.")
+
+    return af_map
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GFA Path Extraction Functionality (Optimized)
+# ─────────────────────────────────────────────────────────────────────────────
+
 def parse_w_line_path(w_path_str):
+    """Parses a W-line path string into oriented segments."""
     oriented_segments = []
     matches = re.findall(r"([<>])([\w.-]+)", w_path_str)
     for orientation_char, seg_id in matches:
         strand = '+' if orientation_char == '>' else '-'
         oriented_segments.append({'id': seg_id, 'strand': strand})
-    if not matches and w_path_str:
-        logging.warning(f"Could not parse segments from W-line path string: '{w_path_str}'.")
     return oriented_segments
 
 
 def parse_p_line_path(p_segments_str):
+    """Parses a P-line segment string into oriented segments."""
     oriented_segments = []
-    if not p_segments_str: return oriented_segments
     segment_entries = p_segments_str.split(',')
     for seg_orient in segment_entries:
-        if len(seg_orient) < 2:
-            logging.warning(f"Skipping malformed P-line segment entry '{seg_orient}'.")
-            continue
+        if len(seg_orient) < 2: continue
         seg_id, strand = seg_orient[:-1], seg_orient[-1]
-        if strand not in ['+', '-']:
-            logging.warning(f"Skipping P-line segment entry '{seg_orient}' with invalid strand '{strand}'.")
-            continue
-        oriented_segments.append({'id': seg_id, 'strand': strand})
+        if strand in ['+', '-']:
+            oriented_segments.append({'id': seg_id, 'strand': strand})
     return oriented_segments
 
 
-def find_path_line_with_user_pattern(gfa_file_path, user_grep_pattern):
+def extract_path_info_from_gfa(gfa_file_path, user_grep_pattern, af_data_map=None):
     """
-    Uses grep -P -m 1 with the exact pattern provided by the user.
-    Returns the found line content or None.
+    Optimized single-pass GFA parser. It reads the GFA file only once to find
+    the path and load all sequence segments simultaneously.
     """
-    cmd = ['grep', '-P', '-m', '1', user_grep_pattern, gfa_file_path]
-    logging.debug(f"Executing user-defined grep: {' '.join(cmd)}")
+    if af_data_map is None:
+        af_data_map = {}
 
+    segments = {}
+    found_path_line = None
+    path_pattern_re = re.compile(user_grep_pattern)
+
+    logging.info(f"Starting single-pass GFA parse. File: '{gfa_file_path}', Pattern: '{user_grep_pattern}'")
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False, encoding='utf-8')
-        if result.returncode == 0 and result.stdout.strip():
-            line_content = result.stdout.strip()
-            logging.info(f"Line found via grep using user pattern '{user_grep_pattern}'.")
-            return line_content
-        elif result.returncode == 1:  # grep found nothing
-            logging.info(f"No line found via grep for user pattern '{user_grep_pattern}'.")
-            return None
-        else:  # grep command itself had an error
-            logging.warning(
-                f"User-defined grep pattern '{user_grep_pattern}' failed (RC={result.returncode}): {result.stderr.strip()}")
-            return None
+        with open(gfa_file_path, 'r') as f_gfa:
+            for line in f_gfa:
+                # Load S-line (sequence)
+                if line.startswith('S\t'):
+                    parts = line.strip().split('\t')
+                    if len(parts) >= 3:
+                        segments[parts[1]] = {'seq': parts[2], 'len': len(parts[2])}
+
+                # Find the first matching P or W line
+                elif (line.startswith('P\t') or line.startswith('W\t')) and not found_path_line:
+                    if path_pattern_re.match(line):
+                        found_path_line = line.strip()
+                        logging.info(f"Found matching path line: {found_path_line[:100]}...")
+
     except FileNotFoundError:
-        logging.error("grep command not found. Please ensure grep is installed and in PATH.")
-        return None
+        return json.dumps({"error": f"GFA file not found: {gfa_file_path}", "status": "error_file_not_found"})
     except Exception as e:
-        logging.error(f"Exception running user-defined grep with pattern '{user_grep_pattern}': {e}")
-        return None
+        return json.dumps({"error": f"Error reading GFA file: {e}", "status": "error_gfa_read"})
 
+    if not found_path_line:
+        return json.dumps(
+            {"error": f"Path not found using pattern: '{user_grep_pattern}'", "status": "error_path_not_found"})
 
-def extract_path_info_from_gfa(gfa_file_path, user_grep_pattern_input):
-    # Step 1: Find the specific line using grep with the user's exact pattern
-    found_line_content = find_path_line_with_user_pattern(gfa_file_path, user_grep_pattern_input)
-
-    if not found_line_content:
-        err_msg = f"Path not found using user-provided grep pattern: '{user_grep_pattern_input}'."
-        return json.dumps({"error": err_msg, "status": "error_path_not_found_user_grep"})
-
-    # Step 2: Parse the found path line to determine its type and content
-    final_path_segments_oriented = []
-    path_identifier_gfa = ""
-    path_source_type = None
-    # Default path start to 1 for 1-based output. This will be used for P-lines.
-    path_start_offset = 1
-
-    line_parts = found_line_content.split('\t')
-    actual_record_type = line_parts[0] if line_parts else None
-
-    logging.info(
-        f"Line found by grep ('{user_grep_pattern_input}') starts with record type: '{actual_record_type}'. Parsing accordingly.")
+    # --- Process the found path line ---
+    line_parts = found_path_line.split('\t')
+    actual_record_type = line_parts[0]
+    path_source_type, path_identifier_gfa, path_start_offset, final_path_segments_oriented = None, "", 1, []
 
     if actual_record_type == "W":
         path_source_type = "W"
-        if len(line_parts) < 7:  # W(0) Samp(1) Hap(2) SeqN(3) Start(4) End(5) Path(6)
-            err_msg = f"Malformed W-line structure returned by grep: '{found_line_content}'"
-            logging.error(err_msg)
-            return json.dumps({"error": err_msg, "status": "error_malformed_grep_w_line"})
-
-        sample_id, haplotype_id, seq_name = line_parts[1], line_parts[2], line_parts[3]
-        path_identifier_gfa = f"W:{sample_id}/{haplotype_id}/{seq_name}"  # For context in output
-
-        # --- MODIFICATION START ---
-        # Use the start coordinate from the W-line (column 4) and add 1 to convert to 1-based coordinate system.
+        path_identifier_gfa = f"W:{line_parts[1]}/{line_parts[2]}/{line_parts[3]}"
         try:
-            # Add 1 to convert 0-based GFA coordinate to 1-based output
             path_start_offset = int(line_parts[4]) + 1
-            logging.info(
-                f"Read 0-based path start offset {path_start_offset - 1} from W-line, converted to 1-based {path_start_offset}.")
         except (ValueError, IndexError):
-            logging.warning(
-                f"Could not parse start position from W-line, defaulting to 1. Line: '{found_line_content}'")
             path_start_offset = 1
-        # --- MODIFICATION END ---
-
-        w_path_str = line_parts[6]
-        final_path_segments_oriented = parse_w_line_path(w_path_str)
-        logging.info(
-            f"Identified found line as W-line: '{path_identifier_gfa}'; {len(final_path_segments_oriented)} segment refs from path string.")
+        final_path_segments_oriented = parse_w_line_path(line_parts[6])
     elif actual_record_type == "P":
         path_source_type = "P"
-        if len(line_parts) < 3:  # P(0) PathName(1) Segments(2)
-            err_msg = f"Malformed P-line structure returned by grep: '{found_line_content}'"
-            logging.error(err_msg)
-            return json.dumps({"error": err_msg, "status": "error_malformed_grep_p_line"})
+        path_identifier_gfa = f"P:{line_parts[1]}"
+        final_path_segments_oriented = parse_p_line_path(line_parts[2])
 
-        path_name_from_line = line_parts[1]
-        path_identifier_gfa = f"P:{path_name_from_line}"  # For context in output
-        p_segments_str = line_parts[2]
-        final_path_segments_oriented = parse_p_line_path(p_segments_str)
-        logging.info(
-            f"Identified found line as P-line: '{path_identifier_gfa}'; {len(final_path_segments_oriented)} segment refs from segment string.")
-    else:
-        err_msg = f"Line found by grep pattern '{user_grep_pattern_input}' was not a W or P line. Found: '{found_line_content}'"
-        logging.error(err_msg)
-        return json.dumps({"error": err_msg, "status": "error_unexpected_line_type_from_grep"})
-
-    if not final_path_segments_oriented and path_source_type:
-        msg = f"Path '{path_identifier_gfa}' (type {path_source_type}) definition found by grep, but its path string yielded no segments."
-        logging.warning(msg)
-        return json.dumps({
-            "message": msg, "path_name_input_pattern": user_grep_pattern_input,
-            "path_identifier_gfa": path_identifier_gfa, "path_source_type": path_source_type,
-            "nodes": [], "status": "success_empty_path_definition"
-        })
-
-    # Step 3: Load S-records
-    segments = {}
-    logging.info(f"Loading S-records from GFA file: {gfa_file_path}")
-    try:
-        with open(gfa_file_path, 'r') as f_gfa:
-            for line_content in f_gfa:
-                clean_line = line_content.strip()
-                if not clean_line or clean_line.startswith('#') or not clean_line.startswith('S\t'):
-                    continue
-                parts = clean_line.split('\t')
-                if len(parts) < 3: continue
-                segments[parts[1]] = {'seq': parts[2], 'len': len(parts[2])}
-        logging.info(f"Loaded {len(segments)} S-records.")
-        if not segments and final_path_segments_oriented:
-            logging.warning("No S-records loaded, but path needs segments. Errors likely.")
-    except FileNotFoundError:
-        logging.error(f"File not found during S-record loading: {gfa_file_path}")
-        return json.dumps({"error": f"File not found: {gfa_file_path}", "status": "error_file_not_found_s_load"})
-    except Exception as e:
-        logging.error(f"Error reading GFA for S-records: {str(e)}")
-        return json.dumps({"error": f"Error reading GFA for S-records: {str(e)}", "status": "error_s_load_exception"})
-
-    # Step 4: Process nodes
+    # --- Assemble final node list with annotations ---
     output_nodes = []
-    # Initialize the cumulative position with the 1-based offset.
     current_cumulative_pos = path_start_offset
     for seg_info in final_path_segments_oriented:
-        seg_id, strand = seg_info['id'], seg_info['strand']
+        seg_id = seg_info['id']
         if seg_id not in segments:
-            err_msg = f"Segment '{seg_id}' from path '{path_identifier_gfa}' not found in S records."
-            logging.error(err_msg)
-            return json.dumps({"error": err_msg, "status": "error_segment_not_found_in_s_records"})
+            return json.dumps({"error": f"Segment '{seg_id}' not in S-records.", "status": "error_segment_not_found"})
+
         node_data = segments[seg_id]
+        node_start_pos = current_cumulative_pos
+        node_end_pos = current_cumulative_pos + node_data['len']
+
+        node_af_records = []
+        if af_data_map:
+            for pos in range(node_start_pos, node_end_pos):
+                if pos in af_data_map:
+                    node_af_records.append({"pos": pos, "af": af_data_map[pos]})
+
         output_nodes.append({
-            "node_id": seg_id, "grch38_position_start": current_cumulative_pos,
-            "strand_in_path": strand, "sequence": node_data['seq'], "length": node_data['len']
+            "node_id": seg_id,
+            "grch38_position_start": node_start_pos,
+            "strand_in_path": seg_info['strand'],
+            "length": node_data['len'],
+            "gnomad_af": node_af_records,
+            "sequence": node_data['seq']
         })
-        current_cumulative_pos += node_data['len']
+        current_cumulative_pos = node_end_pos
 
     logging.info(f"Successfully processed {len(output_nodes)} nodes for path '{path_identifier_gfa}'.")
     return json.dumps({
-        "path_name_input_pattern": user_grep_pattern_input,
+        "path_name_input_pattern": user_grep_pattern,
         "path_identifier_gfa": path_identifier_gfa,
         "path_source_type": path_source_type, "nodes": output_nodes, "status": "success"
     }, indent=4)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Main Execution Logic
+# ─────────────────────────────────────────────────────────────────────────────
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description="Uses a user-provided grep pattern to find a W or P path in a GFA file, then extracts node information.\n"
-                    "The script executes 'grep -P -m 1 <user_pattern> <gfa_file>'.\n"
-                    "The 'grch38_position_start' in the output is the cumulative position along the specified path (1-based).",
+        description="Extracts node information for a path from a GFA file, with optional direct annotation from a VCF.",
         formatter_class=argparse.RawTextHelpFormatter
     )
-    parser.add_argument(
-        "gfa_file",
-        help="Path to the GFA file."
-    )
-    parser.add_argument(
-        "path_grep_pattern",
-        help="The exact grep pattern (Perl-compatible, PCRE) to find the desired W or P line.\n"
-             "The script will run 'grep -P -m 1 \"YOUR_PATTERN\" GFA_FILE'.\n"
-             "Example to find a specific W-line (ensure your shell passes tabs correctly, e.g., using $'...'):\n"
-             "  '^W\tGRCh38\t0\tchr1'\n"
-             "Example for a P-line:\n"
-             "  '^P\tmyPathName'"
-    )
-    parser.add_argument(
-        "--output_file", "-o",
-        help="Optional. Path to save the JSON output. If not provided, prints to stdout.",
-        required=False
-    )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable debug level logging (includes the full grep command executed)."
-    )
+    parser.add_argument("gfa_file", help="Path to the GFA file.")
+    parser.add_argument("path_regex_pattern",
+                        help="Python regular expression to find the W or P line.\nExample: '^P\\tmyPathName.*'")
 
-    if len(sys.argv) == 1:
-        parser.print_help(sys.stderr);
-        sys.exit(1)
+    parser.add_argument("--vcf", help="Optional: Path to VCF file (.vcf.bgz) for AF annotation.")
+    parser.add_argument("--vcf-contig",
+                        help="The contig/chromosome to use from the VCF file (e.g., 'chr1'). Required if --vcf is used.")
+
+    parser.add_argument("--output_file", "-o",
+                        help="Optional path to save JSON output. Prints to stdout if not provided.")
+    parser.add_argument("--debug", action="store_true", help="Enable debug level logging.")
+
     args = parser.parse_args()
 
-    if args.debug: logging.getLogger().setLevel(logging.DEBUG)
+    if args.vcf and not args.vcf_contig:
+        parser.error("--vcf-contig is required when --vcf is provided.")
 
-    try:
-        subprocess.run(['grep', '--version'], capture_output=True, check=True, text=True, encoding='utf-8')
-        logging.debug("grep command is available and functional.")
-    except (FileNotFoundError, subprocess.CalledProcessError) as e:
-        logging.critical(f"Critical: grep command not found or not functional. Error: {e}")
-        sys.exit(1)
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
 
-    logging.info(
-        f"Starting GFA path extraction. File: '{args.gfa_file}', User Grep Pattern: '{args.path_grep_pattern}'")
-    json_result_str = extract_path_info_from_gfa(args.gfa_file, args.path_grep_pattern)
+    af_data_map = {}
+    if args.vcf:
+        af_data_map = load_af_from_vcf(args.vcf, args.vcf_contig)
 
-    try:
-        result_data = json.loads(json_result_str)
-    except json.JSONDecodeError:
-        logging.critical(f"Script produced invalid JSON: {json_result_str}")
-        print(json_result_str, file=sys.stdout)
-        sys.exit(1)
+    json_result_str = extract_path_info_from_gfa(args.gfa_file, args.path_regex_pattern, af_data_map)
 
     if args.output_file:
         try:
-            with open(args.output_file, 'w') as f_out:
-                f_out.write(json_result_str)
+            with open(args.output_file, 'w') as f:
+                f.write(json_result_str)
             logging.info(f"Output saved to {args.output_file}")
         except IOError as e:
             logging.error(f"Error writing to '{args.output_file}': {e}")
-            print("\nJSON Result (stdout fallback):", file=sys.stderr)
-            print(json_result_str, file=sys.stdout)
             sys.exit(1)
     else:
-        print(json_result_str, file=sys.stdout)
-
-    status = result_data.get("status", "unknown_status")
-    if status not in ["success", "success_empty_path_definition"]:
-        logging.warning(
-            f"Process completed with status '{status}'. Error: {result_data.get('error') or result_data.get('message', 'N/A')}")
-        sys.exit(1)
-    else:
-        logging.info(f"Process completed successfully with status: '{status}'.")
+        print(json_result_str)
