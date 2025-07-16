@@ -139,23 +139,24 @@ def extract_path_info_from_gfa(gfa_file_path, user_grep_pattern, af_data_map=Non
 
         node_data = segments[seg_id]
         node_start_pos = current_cumulative_pos
-        node_end_pos = current_cumulative_pos + node_data['len']
 
-        node_af_records = []
+        node_af_list = [0.0] * node_data['len']
+
         if af_data_map:
-            for pos in range(node_start_pos, node_end_pos):
-                if pos in af_data_map:
-                    node_af_records.append({"pos": pos, "af": af_data_map[pos]})
+            for i in range(node_data['len']):
+                genomic_pos = node_start_pos + i
+                if genomic_pos in af_data_map:
+                    node_af_list[i] = af_data_map[genomic_pos]
 
         output_nodes.append({
             "node_id": seg_id,
             "grch38_position_start": node_start_pos,
             "strand_in_path": seg_info['strand'],
             "length": node_data['len'],
-            "gnomad_af": node_af_records,
+            "genomead_af": node_af_list,  # Renamed this key
             "sequence": node_data['seq']
         })
-        current_cumulative_pos = node_end_pos
+        current_cumulative_pos += node_data['len']
 
     logging.info(f"Successfully processed {len(output_nodes)} nodes for path '{path_identifier_gfa}'.")
     return json.dumps({
