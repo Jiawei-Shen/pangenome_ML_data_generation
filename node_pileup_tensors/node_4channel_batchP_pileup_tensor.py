@@ -492,9 +492,27 @@ def process_single_node_for_pileup(task_args):
             if any(b != PADDING_BASE_INDEX for b in base_idx_row):
                 ch1_list.append(base_idx_row)
                 ch2_list.append(quality_score_row)
-                mismatch_flags_row = [
-                    MISMATCH_COMPARISON_PADDING_VALUE if b == PADDING_BASE_INDEX or r == PADDING_BASE_INDEX else (
-                        0 if b == r else 1) for b, r in zip(base_idx_row, ref_base_indices_row)]
+
+                # --- MODIFICATION START ---
+                # Calculate the variant's index within the tensor window.
+                variant_window_index = v_pos - window_start_pos
+
+                mismatch_flags_row = []
+                for i in range(TENSOR_WINDOW_SIZE):
+                    read_base_idx = base_idx_row[i]
+                    ref_base_idx = ref_base_indices_row[i]
+
+                    if read_base_idx == PADDING_BASE_INDEX or ref_base_idx == PADDING_BASE_INDEX:
+                        mismatch_flags_row.append(MISMATCH_COMPARISON_PADDING_VALUE)
+                    elif read_base_idx == ref_base_idx:
+                        mismatch_flags_row.append(0)  # Match
+                    else:  # Mismatch
+                        if i == variant_window_index:
+                            mismatch_flags_row.append(5)  # Special value for the central variant
+                        else:
+                            mismatch_flags_row.append(1)  # Regular mismatch
+                # --- MODIFICATION END ---
+
                 ch3_list.append(mismatch_flags_row)
                 mapq = max(0, min(int(seg_data["mapping_quality"]), 127))
                 ch4_list.append([mapq] * TENSOR_WINDOW_SIZE)
@@ -603,11 +621,8 @@ def main():
     parser.add_argument("idx", help=".idx index file")
     parser.add_argument("output", help="Base output directory")
 
-    # --- MODIFICATION START ---
-    # Replace the old input group with a single argument for the JSON file.
     parser.add_argument("candidate_variants_json",
                         help="JSON file containing nodes and their sequences to process.")
-    # --- MODIFICATION END ---
 
     parser.add_argument("--num_workers", type=int, default=os.cpu_count(), help="Number of worker processes")
     parser.add_argument("--view", nargs='?', const=-1, default=None, type=int, metavar='N',
@@ -624,13 +639,10 @@ def main():
 
     args = parser.parse_args()
 
-    # --- MODIFICATION START ---
-    # Check for the existence of the required files.
     if not all([os.path.isfile(args.dat), os.path.isfile(args.idx), os.path.isfile(args.candidate_variants_json)]):
         sys.exit("Error: One or more input files (dat, idx, or json) were not found.")
     os.makedirs(args.output, exist_ok=True)
 
-    # Load node information directly from the provided JSON file.
     node_sequences = {}
     node_ids_to_process = set()
     print(f"Loading nodes from {args.candidate_variants_json}...")
@@ -642,24 +654,19 @@ def main():
                 sequence = node_obj.get('sequence')
                 if node_id_str and sequence:
                     try:
-                        # The script's core logic requires integer node IDs for the .idx file.
                         node_id_int = int(node_id_str)
                         node_sequences[node_id_int] = sequence.upper()
                         node_ids_to_process.add(node_id_int)
                     except ValueError:
-                        # Silently skip nodes with non-integer IDs like 's1', as they won't be in the .idx file.
                         pass
     except Exception as e:
         sys.exit(f"Error reading or parsing JSON file: {e}")
 
     print(f"Found {len(node_sequences)} nodes with integer-compatible IDs to process.")
-    # --- MODIFICATION END ---
 
     full_idx_data = load_full_idx_data(args.idx)
     if not full_idx_data: sys.exit("Failed to load index data.")
 
-    # --- MODIFICATION START ---
-    # Build the list of tasks to be processed by the workers.
     tasks = []
     for node_id in node_ids_to_process:
         if node_id in full_idx_data:
@@ -669,8 +676,6 @@ def main():
                           args.min_allele_bq, args.variant_type))
         else:
             print(f"Warning: Node ID {node_id} from JSON was not found in the index file and will be skipped.")
-    # --- MODIFICATION END ---
-
 
     if not tasks:
         sys.exit("No valid tasks to run after processing JSON and index file.")
@@ -694,7 +699,6 @@ def main():
                 tensors_since_last_report += tensor_count
 
                 if args.view is not None and view_data:
-                    # We need the original node sequence for the display function.
                     node_sequence_for_view = node_sequences.get(node_id, "")
                     display_pileup_data(view_data, str(node_id), node_sequence_for_view, args.max_view_reads,
                                         args.view if args.view != -1 else float('inf'))
