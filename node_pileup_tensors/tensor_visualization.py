@@ -32,7 +32,7 @@ def load_tensor(filepath):
         raise ValueError(f"Expected 3D tensor, got shape {tensor.shape}")
 
     # Convert (C, W, H) → (C, H, W)
-    tensor = tensor[:, :, :].transpose(0, 2, 1)
+    tensor = tensor[:, :, :].transpose(2, 0, 1)
     return tensor
 
 
@@ -42,18 +42,16 @@ def plot_on_ax(ax, channel_data, channel_index, tensor_basename, num_rows, windo
     norm = None
 
     if channel_index == 0:
-        base_colors = ['lightcoral', 'lightskyblue', 'lightgreen', 'gold', 'plum', 'grey', 'whitesmoke']
-        extended_colors = (base_colors * ((MAX_BASE_INDEX + 1) // len(base_colors) + 1))[:MAX_BASE_INDEX + 1]
-        cmap = mcolors.ListedColormap(extended_colors)
+        # Custom color map: padding (0) = white, rest follow base indices
+        base_colors = ['white', 'plum', 'lightcoral', 'lightskyblue', 'gray',
+                       'lightgreen', 'orange', 'gold', 'tan', 'lightgray']
+        cmap = mcolors.ListedColormap(base_colors[:MAX_BASE_INDEX + 1])
         norm = mcolors.BoundaryNorm(np.arange(-0.5, MAX_BASE_INDEX + 1.5, 1), cmap.N)
 
         legend_elements = []
         unique_indices = np.unique(channel_data)
         for i in unique_indices:
-            if i in INDEX_TO_BASE_VIS:
-                label = INDEX_TO_BASE_VIS[i]
-            else:
-                label = f"Idx {i}"
+            label = INDEX_TO_BASE_VIS.get(i, f"Idx {i}")
             legend_elements.append(
                 Line2D([0], [0], marker='s', color='w', label=f'{label} ({i})',
                        markerfacecolor=cmap(norm(i)), markersize=6)
@@ -70,9 +68,18 @@ def plot_on_ax(ax, channel_data, channel_index, tensor_basename, num_rows, windo
     ax.set_xlabel("Position", fontsize=9)
     ax.set_ylabel(f"Row (Total: {num_rows})", fontsize=9)
     ax.tick_params(axis='both', labelsize=8)
+
     if num_rows > 10:
         step = max(1, num_rows // (5 if num_rows <= 40 else 10))
         ax.set_yticks(np.arange(0, num_rows, step))
+
+    # Draw downward arrow to center of the width
+    h, w = channel_data.shape  # rows, cols
+    center_x = w / 2.0 - 0.5   # align with imshow pixel center
+    ax.annotate('▼', xy=(center_x, -1), xytext=(center_x, -3),
+                ha='center', va='center',
+                fontsize=14, color='black',
+                arrowprops=dict(arrowstyle='-|>', color='black'))
 
 
 def process_file(filepath, output_dir, args):
