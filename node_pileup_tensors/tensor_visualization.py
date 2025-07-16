@@ -32,7 +32,7 @@ def load_tensor(filepath):
         raise ValueError(f"Expected 3D tensor, got shape {tensor.shape}")
 
     # Convert (C, W, H) → (C, H, W)
-    tensor = tensor[:, :, :].transpose(2, 0, 1)
+    # tensor = tensor[:, :, :].transpose(2, 0, 1)
     return tensor
 
 
