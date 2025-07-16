@@ -108,37 +108,6 @@ def load_full_idx_data(idx_path):
         return None
 
 
-def load_multiple_node_sequences_from_gfa(gfa_path, target_node_ids_set):
-    node_sequences = {}
-    if not target_node_ids_set: return node_sequences
-    nodes_to_find_int = {int(nid) for nid in target_node_ids_set}
-
-    try:
-        with open(gfa_path, 'r') as f:
-            print(f"Reading GFA file for {len(nodes_to_find_int)} target nodes: {gfa_path}")
-            for line in f:
-                if line.startswith('S\t'):
-                    parts = line.strip().split('\t')
-                    if len(parts) >= 3:
-                        try:
-                            nid_int_from_gfa = int(parts[1])
-                            if nid_int_from_gfa in nodes_to_find_int:
-                                node_sequences[str(nid_int_from_gfa)] = parts[2]
-                                if len(node_sequences) == len(nodes_to_find_int):
-                                    break
-                        except ValueError:
-                            continue
-            missing_nodes = len(nodes_to_find_int) - len(node_sequences)
-            if missing_nodes > 0:
-                print(f"Warning: Could not find GFA sequences for {missing_nodes} node(s).")
-    except FileNotFoundError:
-        sys.stderr.write(f"Error: GFA file not found at {gfa_path}\n")
-        return {}
-    except Exception as e:
-        sys.stderr.write(f"Error reading GFA file {gfa_path}: {e}\n")
-    return node_sequences
-
-
 def decode_cigar_to_int_ops(cigar_string):
     if not cigar_string or cigar_string == '*': return []
     try:
@@ -383,7 +352,6 @@ def process_single_node_for_pileup(task_args):
                 current_decoded_cigar_ops = [op for op in
                                              reversed(original_decoded_cigar_ops)] if original_decoded_cigar_ops else []
 
-                # Applying user-confirmed offset logic for reverse strand
                 alignment_span_on_node = len(current_read_sequence)
                 current_offset_on_node = node_len - alignment_span_on_node - off_from_file
                 if current_offset_on_node < 0:
@@ -454,11 +422,9 @@ def process_single_node_for_pileup(task_args):
                 else:
                     other_allele_count += 1
 
-        # This filter applies to all variant types
         if alt_allele_count < min_variants_threshold:
             continue
 
-        # These filters only apply to SNPs
         if v_type == 'X':
             current_alt_freq = alt_allele_count / locus_coverage if locus_coverage > 0 else 0.0
             if current_alt_freq < min_af_threshold:
@@ -468,7 +434,6 @@ def process_single_node_for_pileup(task_args):
             if mean_alt_bq < min_allele_bq_threshold:
                 continue
 
-        # For indels, we need to calculate these values for the summary, but we don't filter on them
         current_alt_freq = alt_allele_count / locus_coverage if locus_coverage > 0 else 0.0
         mean_alt_bq = sum(alt_allele_base_qualities) / len(
             alt_allele_base_qualities) if alt_allele_base_qualities else 0.0
@@ -638,13 +603,11 @@ def main():
     parser.add_argument("idx", help=".idx index file")
     parser.add_argument("output", help="Base output directory")
 
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--node_id", type=int, help="Specific node ID to process")
-    group.add_argument("--node_id_file", help="File with node IDs to process")
-
-    parser.add_argument("--gfa", help="GFA graph file (required if no cache)")
-    parser.add_argument("--load-cache", help="Load node sequences from JSON cache")
-    parser.add_argument("--save-cache", help="Save node sequences to JSON cache")
+    # --- MODIFICATION START ---
+    # Replace the old input group with a single argument for the JSON file.
+    parser.add_argument("candidate_variants_json",
+                        help="JSON file containing nodes and their sequences to process.")
+    # --- MODIFICATION END ---
 
     parser.add_argument("--num_workers", type=int, default=os.cpu_count(), help="Number of worker processes")
     parser.add_argument("--view", nargs='?', const=-1, default=None, type=int, metavar='N',
@@ -661,48 +624,56 @@ def main():
 
     args = parser.parse_args()
 
-    if not all([os.path.isfile(args.dat), os.path.isfile(args.idx)]):
-        sys.exit("Error: DAT or IDX file not found.")
-    if not args.gfa and not args.load_cache:
-        sys.exit("Error: Must provide --gfa or --load-cache.")
+    # --- MODIFICATION START ---
+    # Check for the existence of the required files.
+    if not all([os.path.isfile(args.dat), os.path.isfile(args.idx), os.path.isfile(args.candidate_variants_json)]):
+        sys.exit("Error: One or more input files (dat, idx, or json) were not found.")
     os.makedirs(args.output, exist_ok=True)
 
-    target_node_ids = set()
-    if args.node_id:
-        target_node_ids.add(args.node_id)
-    else:
-        with open(args.node_id_file, 'r') as f:
-            for line in f:
-                if line.strip() and not line.startswith('#'):
-                    target_node_ids.add(int(line.strip()))
-
+    # Load node information directly from the provided JSON file.
     node_sequences = {}
-    if args.load_cache and os.path.isfile(args.load_cache):
-        with open(args.load_cache, 'r') as f:
-            node_sequences = json.load(f)
+    node_ids_to_process = set()
+    print(f"Loading nodes from {args.candidate_variants_json}...")
+    try:
+        with open(args.candidate_variants_json, 'r') as f:
+            data = json.load(f)
+            for node_obj in data.get('nodes', []):
+                node_id_str = node_obj.get('node_id')
+                sequence = node_obj.get('sequence')
+                if node_id_str and sequence:
+                    try:
+                        # The script's core logic requires integer node IDs for the .idx file.
+                        node_id_int = int(node_id_str)
+                        node_sequences[node_id_int] = sequence.upper()
+                        node_ids_to_process.add(node_id_int)
+                    except ValueError:
+                        # Silently skip nodes with non-integer IDs like 's1', as they won't be in the .idx file.
+                        pass
+    except Exception as e:
+        sys.exit(f"Error reading or parsing JSON file: {e}")
 
-    nodes_to_fetch = {nid for nid in target_node_ids if str(nid) not in node_sequences}
-    if nodes_to_fetch and args.gfa:
-        fetched_sequences = load_multiple_node_sequences_from_gfa(args.gfa, nodes_to_fetch)
-        for nid, seq in fetched_sequences.items():
-            node_sequences[str(nid)] = seq.upper()
-
-    if args.save_cache:
-        with open(args.save_cache, 'w') as f:
-            json.dump(node_sequences, f, indent=2)
+    print(f"Found {len(node_sequences)} nodes with integer-compatible IDs to process.")
+    # --- MODIFICATION END ---
 
     full_idx_data = load_full_idx_data(args.idx)
     if not full_idx_data: sys.exit("Failed to load index data.")
 
+    # --- MODIFICATION START ---
+    # Build the list of tasks to be processed by the workers.
     tasks = []
-    for node_id in target_node_ids:
-        if str(node_id) in node_sequences and node_id in full_idx_data:
+    for node_id in node_ids_to_process:
+        if node_id in full_idx_data:
             offset, n_records = full_idx_data[node_id]
-            tasks.append((node_id, offset, n_records, node_sequences[str(node_id)], args.min_af, args.min_variants,
+            sequence = node_sequences[node_id]
+            tasks.append((node_id, offset, n_records, sequence, args.min_af, args.min_variants,
                           args.min_allele_bq, args.variant_type))
+        else:
+            print(f"Warning: Node ID {node_id} from JSON was not found in the index file and will be skipped.")
+    # --- MODIFICATION END ---
+
 
     if not tasks:
-        sys.exit("No valid tasks to run after checking for sequences and index entries.")
+        sys.exit("No valid tasks to run after processing JSON and index file.")
 
     print(f"\nSubmitting {len(tasks)} tasks to {args.num_workers} workers...")
     total_tensors = 0
@@ -723,7 +694,9 @@ def main():
                 tensors_since_last_report += tensor_count
 
                 if args.view is not None and view_data:
-                    display_pileup_data(view_data, str(node_id), node_sequences[str(node_id)], args.max_view_reads,
+                    # We need the original node sequence for the display function.
+                    node_sequence_for_view = node_sequences.get(node_id, "")
+                    display_pileup_data(view_data, str(node_id), node_sequence_for_view, args.max_view_reads,
                                         args.view if args.view != -1 else float('inf'))
             except Exception as e:
                 print(f"Error processing node {node_id}: {e}", file=sys.stderr)
