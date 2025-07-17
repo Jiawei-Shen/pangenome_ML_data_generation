@@ -305,7 +305,7 @@ def init_worker(dat_file_path_for_worker, base_output_dir_for_worker):
 
 
 def process_single_node_for_pileup(task_args):
-    node_id, dat_file_offset, n_records, node_sequence, min_af_threshold, min_variants_threshold, min_allele_bq_threshold, variant_type_to_process = task_args
+    node_id, dat_file_offset, n_records, node_sequence, genomead_af_list, min_af_threshold, min_variants_threshold, min_allele_bq_threshold, variant_type_to_process = task_args
     global worker_dat_file, worker_base_output_dir
 
     tensor_files_generated_for_node = 0
@@ -466,7 +466,7 @@ def process_single_node_for_pileup(task_args):
             "mean_alt_allele_base_quality": round(mean_alt_bq, 2)
         }
 
-        ch1_list, ch2_list, ch3_list, ch4_list, ch5_list = [], [], [], [], []
+        ch1_list, ch2_list, ch3_list, ch4_list, ch5_list, ch6_list = [], [], [], [], [], []
 
         ref_base_indices_row = [PADDING_BASE_INDEX] * TENSOR_WINDOW_SIZE
         for i, node_pos_in_window in enumerate(range(window_start_pos, window_start_pos + TENSOR_WINDOW_SIZE)):
@@ -474,11 +474,31 @@ def process_single_node_for_pileup(task_args):
                 ref_base_indices_row[i] = BASE_TO_INDEX.get(node_sequence[node_pos_in_window].upper(),
                                                             BASE_TO_INDEX['N'])
 
+        genomead_af_row = [0] * TENSOR_WINDOW_SIZE
+        if genomead_af_list:
+            for i, node_pos_in_window in enumerate(range(window_start_pos, window_start_pos + TENSOR_WINDOW_SIZE)):
+                if 0 <= node_pos_in_window < node_len:
+                    af_value = genomead_af_list[node_pos_in_window]
+
+                    # --- MODIFICATION: Use inverted Phred-like scaling ---
+                    if af_value == 0.0:
+                        scaled_af = 0
+                    else:
+                        # Calculate Phred-like score
+                        phred_af = -10.0 * np.log10(af_value)
+                        # Invert the scale so common variants get high scores
+                        inverted_phred = 127.0 - phred_af
+                        # Clamp the value to the 1-127 range for int8
+                        scaled_af = max(1, min(int(inverted_phred), 127))
+                    genomead_af_row[i] = scaled_af
+                    # --- END MODIFICATION ---
+
         ch1_list.append(ref_base_indices_row)
         ch2_list.append([DEFAULT_QUALITY_PADDING] * TENSOR_WINDOW_SIZE)
         ch3_list.append([MISMATCH_CHANNEL_REF_ROW_VALUE] * TENSOR_WINDOW_SIZE)
         ch4_list.append([DEFAULT_MAPPING_QUALITY_PADDING] * TENSOR_WINDOW_SIZE)
         ch5_list.append([CIGAR_PADDING_INDEX] * TENSOR_WINDOW_SIZE)
+        ch6_list.append(genomead_af_row)
 
         reads_added = 0
         for seg_data in aligned_read_segments:
@@ -493,10 +513,7 @@ def process_single_node_for_pileup(task_args):
                 ch1_list.append(base_idx_row)
                 ch2_list.append(quality_score_row)
 
-                # --- MODIFICATION START ---
-                # Calculate the variant's index within the tensor window.
                 variant_window_index = v_pos - window_start_pos
-
                 mismatch_flags_row = []
                 for i in range(TENSOR_WINDOW_SIZE):
                     read_base_idx = base_idx_row[i]
@@ -505,18 +522,18 @@ def process_single_node_for_pileup(task_args):
                     if read_base_idx == PADDING_BASE_INDEX or ref_base_idx == PADDING_BASE_INDEX:
                         mismatch_flags_row.append(MISMATCH_COMPARISON_PADDING_VALUE)
                     elif read_base_idx == ref_base_idx:
-                        mismatch_flags_row.append(0)  # Match
-                    else:  # Mismatch
+                        mismatch_flags_row.append(0)
+                    else:
                         if i == variant_window_index:
-                            mismatch_flags_row.append(5)  # Special value for the central variant
+                            mismatch_flags_row.append(5)
                         else:
-                            mismatch_flags_row.append(1)  # Regular mismatch
-                # --- MODIFICATION END ---
+                            mismatch_flags_row.append(1)
 
                 ch3_list.append(mismatch_flags_row)
                 mapq = max(0, min(int(seg_data["mapping_quality"]), 127))
                 ch4_list.append([mapq] * TENSOR_WINDOW_SIZE)
                 ch5_list.append(cigar_op_row)
+                ch6_list.append(genomead_af_row)
                 reads_added += 1
 
         for _ in range(TENSOR_MAX_READ_ROWS - reads_added):
@@ -525,9 +542,10 @@ def process_single_node_for_pileup(task_args):
             ch3_list.append([MISMATCH_COMPARISON_PADDING_VALUE] * TENSOR_WINDOW_SIZE)
             ch4_list.append([DEFAULT_MAPPING_QUALITY_PADDING] * TENSOR_WINDOW_SIZE)
             ch5_list.append([CIGAR_PADDING_INDEX] * TENSOR_WINDOW_SIZE)
+            ch6_list.append([0] * TENSOR_WINDOW_SIZE)
 
         try:
-            tensor_chw = torch.tensor([ch1_list, ch2_list, ch3_list, ch4_list, ch5_list], dtype=torch.int8)
+            tensor_chw = torch.tensor([ch1_list, ch2_list, ch3_list, ch4_list, ch5_list, ch6_list], dtype=torch.int8)
             numpy_array_to_save = tensor_chw.numpy()
             tensor_filename_npy = f"{variant_key_string}.npy"
             tensor_filepath_npy = os.path.join(node_specific_output_dir, tensor_filename_npy)
@@ -644,6 +662,7 @@ def main():
     os.makedirs(args.output, exist_ok=True)
 
     node_sequences = {}
+    node_af_data = {}
     node_ids_to_process = set()
     print(f"Loading nodes from {args.candidate_variants_json}...")
     try:
@@ -652,10 +671,12 @@ def main():
             for node_obj in data.get('nodes', []):
                 node_id_str = node_obj.get('node_id')
                 sequence = node_obj.get('sequence')
+                af_list = node_obj.get('genomead_af', [])
                 if node_id_str and sequence:
                     try:
                         node_id_int = int(node_id_str)
                         node_sequences[node_id_int] = sequence.upper()
+                        node_af_data[node_id_int] = af_list
                         node_ids_to_process.add(node_id_int)
                     except ValueError:
                         pass
@@ -672,7 +693,8 @@ def main():
         if node_id in full_idx_data:
             offset, n_records = full_idx_data[node_id]
             sequence = node_sequences[node_id]
-            tasks.append((node_id, offset, n_records, sequence, args.min_af, args.min_variants,
+            af_list = node_af_data.get(node_id, [])
+            tasks.append((node_id, offset, n_records, sequence, af_list, args.min_af, args.min_variants,
                           args.min_allele_bq, args.variant_type))
         else:
             print(f"Warning: Node ID {node_id} from JSON was not found in the index file and will be skipped.")
