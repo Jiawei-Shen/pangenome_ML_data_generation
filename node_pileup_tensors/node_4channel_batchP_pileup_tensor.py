@@ -27,7 +27,7 @@ PADDING_BASE_INDEX = 0
 
 # CIGAR Operation to Index Mapping
 CIGAR_OP_TO_INDEX = {
-    'M': 1, 'I': 2, 'D': 3, 'N': 4, 'S': 5, 'H': 6, 'P': 7, '=': 8, 'X': 9,
+    'M': 1, 'N': 2, 'S': 3, 'I': 4, 'D': 5, 'H': 6, 'P': 7, '=': 8, 'X': 9,
     '_PADDING_': 0
 }
 CIGAR_PADDING_INDEX = 0
@@ -245,9 +245,11 @@ def get_read_representation_in_window_for_view(segment_cigar_ops, segment_offset
 
 def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
                                    segment_read_sequence, segment_quality_values,
+                                   mapping_quality,
                                    window_start_node, tensor_win_size, node_len):
     bases = [PADDING_BASE_INDEX] * tensor_win_size
     quals = [DEFAULT_QUALITY_PADDING] * tensor_win_size
+    mapqs = [DEFAULT_MAPPING_QUALITY_PADDING] * tensor_win_size
     cigar_ops_indices = [CIGAR_PADDING_INDEX] * tensor_win_size
 
     node_pos, read_pos = segment_offset_on_node, 0
@@ -264,6 +266,7 @@ def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
                 win_idx = n_aln - window_start_node
                 if 0 <= win_idx < tensor_win_size:
                     cigar_ops_indices[win_idx] = op_idx
+                    mapqs[win_idx] = mapping_quality
                     if r_aln < read_seq_len:
                         base_char = segment_read_sequence[r_aln].upper()
                         bases[win_idx] = BASE_TO_INDEX.get(base_char, BASE_TO_INDEX['N'])
@@ -277,6 +280,7 @@ def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
                 win_idx = n_aln - window_start_node
                 if 0 <= win_idx < tensor_win_size:
                     cigar_ops_indices[win_idx] = op_idx
+                    mapqs[win_idx] = mapping_quality
                     bases[win_idx] = BASE_TO_INDEX['*']
                     quals[win_idx] = DEFAULT_QUALITY_PADDING
             node_pos += L
@@ -284,7 +288,7 @@ def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
             read_pos += L
 
         if read_pos >= read_seq_len: break
-    return bases, quals, cigar_ops_indices
+    return bases, quals, mapqs, cigar_ops_indices
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -480,18 +484,13 @@ def process_single_node_for_pileup(task_args):
                 if 0 <= node_pos_in_window < node_len:
                     af_value = genomead_af_list[node_pos_in_window]
 
-                    # --- MODIFICATION: Use inverted Phred-like scaling ---
                     if af_value == 0.0:
                         scaled_af = 0
                     else:
-                        # Calculate Phred-like score
                         phred_af = -10.0 * np.log10(af_value)
-                        # Invert the scale so common variants get high scores
                         inverted_phred = 127.0 - phred_af
-                        # Clamp the value to the 1-127 range for int8
                         scaled_af = max(1, min(int(inverted_phred), 127))
                     genomead_af_row[i] = scaled_af
-                    # --- END MODIFICATION ---
 
         ch1_list.append(ref_base_indices_row)
         ch2_list.append([DEFAULT_QUALITY_PADDING] * TENSOR_WINDOW_SIZE)
@@ -504,9 +503,11 @@ def process_single_node_for_pileup(task_args):
         for seg_data in aligned_read_segments:
             if reads_added >= TENSOR_MAX_READ_ROWS: break
 
-            base_idx_row, quality_score_row, cigar_op_row = get_read_tensor_rows_in_window(
+            mapq = max(0, min(int(seg_data["mapping_quality"]), 127))
+            base_idx_row, quality_score_row, mapq_row, cigar_op_row = get_read_tensor_rows_in_window(
                 seg_data["cigar_ops"], seg_data["offset_on_node"],
                 seg_data["read_sequence"], seg_data["processed_quality_values"],
+                mapq,
                 window_start_pos, TENSOR_WINDOW_SIZE, node_len)
 
             if any(b != PADDING_BASE_INDEX for b in base_idx_row):
@@ -530,8 +531,7 @@ def process_single_node_for_pileup(task_args):
                             mismatch_flags_row.append(1)
 
                 ch3_list.append(mismatch_flags_row)
-                mapq = max(0, min(int(seg_data["mapping_quality"]), 127))
-                ch4_list.append([mapq] * TENSOR_WINDOW_SIZE)
+                ch4_list.append(mapq_row)
                 ch5_list.append(cigar_op_row)
                 ch6_list.append(genomead_af_row)
                 reads_added += 1
