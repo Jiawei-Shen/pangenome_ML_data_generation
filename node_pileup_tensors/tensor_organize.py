@@ -1,128 +1,50 @@
 #!/usr/bin/env python3
+
 import argparse
-import json
 import os
 import shutil
-import sys
-import time
 import random
-from multiprocessing import Pool, cpu_count
-import pysam
+from pathlib import Path
 
-node_positions = {}
+def split_and_copy(src_dir, dest_dir, ratio, label):
+    files = sorted(os.listdir(src_dir))
+    random.shuffle(files)
+    total = len(files)
+    n_train = int(total * ratio[0])
+    n_val = int(total * ratio[1])
+    n_test = total - n_train - n_val
 
-copy_counter = 0
+    splits = {
+        "train": files[:n_train],
+        "val": files[n_train:n_train + n_val],
+        "test": files[n_train + n_val:]
+    }
 
+    for split, split_files in splits.items():
+        split_path = os.path.join(dest_dir, split, label)
+        os.makedirs(split_path, exist_ok=True)
+        for i, fname in enumerate(split_files, 1):
+            shutil.copy(os.path.join(src_dir, fname), os.path.join(split_path, fname))
+            if i % 10000 == 0:
+                print(f"[{label}/{split}] Copied {i} files...")
 
-def format_time(seconds):
-    seconds = int(seconds)
-    hours, remainder = divmod(seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    return f"{hours:02}:{minutes:02}:{seconds:02}"
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source", required=True, help="Path to source folder with true/ and false/")
+    parser.add_argument("--output", required=True, help="Path to output folder")
+    parser.add_argument("--organize", nargs=3, type=float, metavar=('TRAIN', 'VAL', 'TEST'),
+                        help="Split ratio, e.g., --organize 0.6 0.2 0.2")
 
+    args = parser.parse_args()
+    if args.organize:
+        assert abs(sum(args.organize) - 1.0) < 1e-6, "Split ratio must sum to 1.0"
 
-def get_variant_count(vcf_file_path, chromosome):
-    print(f"Counting variants in {os.path.basename(vcf_file_path)} for {chromosome}...")
-    count = 0
-    try:
-        with pysam.VariantFile(vcf_file_path) as vcf_in:
-            for record in vcf_in.fetch(chromosome):
-                if record.alts:
-                    count += len(record.alts)
-        return count
-    except Exception as e:
-        print(f"Error loading VCF: {e}", file=sys.stderr)
-        return -1
+        for label in ['true', 'false']:
+            src_subdir = os.path.join(args.source, label)
+            assert os.path.isdir(src_subdir), f"Missing directory: {src_subdir}"
+            split_and_copy(src_subdir, args.output, args.organize, label)
 
+        print(f"Data organized into {args.output}/train|val|test with true/false splits.")
 
-def query_vcf_for_chromosome(vcf_file_path, chromosome):
-    local_variants = set()
-    try:
-        with pysam.VariantFile(vcf_file_path) as vcf_in:
-            for record in vcf_in.fetch(chromosome):
-                pos = record.pos
-                ref = record.ref.upper()
-                if record.alts:
-                    for alt in record.alts:
-                        local_variants.add((pos, ref, alt.upper()))
-        return local_variants
-    except Exception as e:
-        print(f"Failed to read VCF: {e}", file=sys.stderr)
-        return set()
-
-
-def load_node_positions(json_path):
-    try:
-        with open(json_path) as f:
-            data = json.load(f)
-        return {
-            str(node.get("node_id")): node.get("grch38_position_start")
-            for node in data.get("nodes", [])
-            if node.get("node_id") and isinstance(node.get("grch38_position_start"), int)
-        }
-    except Exception:
-        return {}
-
-
-def process_node_directory(args):
-    global copy_counter
-    node_dir, true_dir, false_dir, use_symlinks, vcf_variants = args
-    node_id = os.path.basename(node_dir)
-    summary_path = os.path.join(node_dir, "variant_summary.json")
-    if not os.path.isfile(summary_path):
-        return [], 0, 0
-
-    start_pos = node_positions.get(node_id)
-    if start_pos is None:
-        return [], 0, 0
-
-    local_true_count = 0
-    local_false_count = 0
-    summary_records = []
-
-    try:
-        with open(summary_path) as f:
-            summary = json.load(f)
-    except (IOError, json.JSONDecodeError):
-        return [], 0, 0
-
-    for variant in summary.get("variants_passing_af_filter", []):
-        tensor_file = variant.get("tensor_file")
-        variant_key = variant.get("variant_key")
-        if not all([tensor_file, variant_key, tensor_file.endswith(".npy")]):
-            continue
-        tensor_path = os.path.join(node_dir, tensor_file)
-        if not os.path.isfile(tensor_path):
-            continue
-        try:
-            parts = variant_key.split("_")
-            offset, ref, alt = int(parts[0]), parts[2].upper(), parts[3].upper()
-        except (ValueError, IndexError):
-            continue
-        grch38_pos = start_pos + offset
-        is_match = (grch38_pos, ref, alt) in vcf_variants
-        dest_dir = true_dir if is_match else false_dir
-        if is_match:
-            local_true_count += 1
-        else:
-            local_false_count += 1
-        destination_path = os.path.join(dest_dir, f"{node_id}_{tensor_file}")
-        try:
-            if use_symlinks:
-                os.symlink(os.path.abspath(tensor_path), destination_path)
-            else:
-                shutil.copyfile(tensor_path, destination_path)
-                copy_counter += 1
-                if copy_counter % 10000 == 0:
-                    print(f"Copied {copy_counter} items so far...")
-        except (FileExistsError, OSError):
-            pass
-        summary_records.append({
-            "node_id": node_id, "tensor_file": tensor_file,
-            "variant_key": variant_key, "genomic_position": grch38_pos,
-            "ref": ref, "alt": alt,
-            "classification": "true" if is_match else "false"
-        })
-    return summary_records, local_true_count, local_false_count
-
-# ... (rest of the script remains unchanged)
+if __name__ == "__main__":
+    main()
