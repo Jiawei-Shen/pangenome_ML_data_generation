@@ -7,11 +7,8 @@ import sys
 import time
 import random
 from multiprocessing import Pool, cpu_count
-from functools import partial
-import pysam  # Use pysam instead of subprocess
+import pysam
 
-# --- Global variables for worker processes ---
-vcf_variants = set()
 node_positions = {}
 
 def format_time(seconds):
@@ -29,12 +26,8 @@ def get_variant_count(vcf_file_path, chromosome):
                 if record.alts:
                     count += len(record.alts)
         return count
-    except ValueError as e:
-        print(f"Error: Could not read VCF file with pysam. Is it a valid bgzipped VCF with a .tbi index?", file=sys.stderr)
-        print(f"Pysam error: {e}", file=sys.stderr)
-        sys.exit(1)
     except Exception as e:
-        print(f"An unexpected error occurred while counting variants: {e}", file=sys.stderr)
+        print(f"Error loading VCF: {e}", file=sys.stderr)
         return -1
 
 def query_vcf_for_chromosome(vcf_file_path, chromosome):
@@ -48,12 +41,8 @@ def query_vcf_for_chromosome(vcf_file_path, chromosome):
                     for alt in record.alts:
                         local_variants.add((pos, ref, alt.upper()))
         return local_variants
-    except ValueError as e:
-        print(f"FATAL ERROR in worker: Pysam could not read VCF file.", file=sys.stderr)
-        print(f"Please ensure '{vcf_file_path}' is a bgzipped VCF with a .tbi index.", file=sys.stderr)
-        print(f"Pysam error: {e}", file=sys.stderr)
-        sys.exit(1)
-    except Exception:
+    except Exception as e:
+        print(f"Failed to read VCF: {e}", file=sys.stderr)
         return set()
 
 def load_node_positions(json_path):
@@ -68,16 +57,13 @@ def load_node_positions(json_path):
     except Exception:
         return {}
 
-def init_worker(vcf_path, vcf_chrom, node_pos_path):
-    global vcf_variants, node_positions
-    vcf_variants = query_vcf_for_chromosome(vcf_path, vcf_chrom)
-    node_positions = load_node_positions(node_pos_path)
-
-def process_node_directory(node_dir, true_dir, false_dir, use_symlinks):
+def process_node_directory(args):
+    node_dir, true_dir, false_dir, use_symlinks, vcf_variants = args
     node_id = os.path.basename(node_dir)
     summary_path = os.path.join(node_dir, "variant_summary.json")
     if not os.path.isfile(summary_path):
         return [], 0, 0
+
     start_pos = node_positions.get(node_id)
     if start_pos is None:
         return [], 0, 0
@@ -155,7 +141,7 @@ def organize_classified_data(base_dir, ratios, seed=None):
         shutil.rmtree(src_dir)
 
 def main():
-    parser = argparse.ArgumentParser(description="Classify variant tensors against a VCF file using pysam.")
+    parser = argparse.ArgumentParser()
     parser.add_argument("tensor_folder_path")
     parser.add_argument("vcf_file")
     parser.add_argument("node_pos_json")
@@ -163,9 +149,8 @@ def main():
     parser.add_argument("--chr", default="chr1")
     parser.add_argument("--use-symlinks", action="store_true")
     parser.add_argument("-j", "--workers", type=int, default=cpu_count())
-    parser.add_argument("--organize", nargs=3, type=float, metavar=('TRAIN', 'VAL', 'TEST'), default=None,
-                        help="Split ratio for organizing true/false data (e.g., 0.6 0.2 0.2)")
-    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
+    parser.add_argument("--organize", nargs=3, type=float, metavar=('TRAIN', 'VAL', 'TEST'), default=None)
+    parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
     os.makedirs(args.output_folder, exist_ok=True)
@@ -174,63 +159,50 @@ def main():
     os.makedirs(true_dir, exist_ok=True)
     os.makedirs(false_dir, exist_ok=True)
 
-    total_variants = get_variant_count(args.vcf_file, args.chr)
-    if total_variants >= 0:
-        print(f"Found a total of {total_variants:,} unique variants to be used as ground truth.\n")
-    else:
-        print("Could not count variants due to an error.\n")
+    vcf_variants = query_vcf_for_chromosome(args.vcf_file, args.chr)
+    global node_positions
+    node_positions = load_node_positions(args.node_pos_json)
+
+    total_variants = len(vcf_variants)
+    print(f"Found a total of {total_variants:,} variants in VCF for {args.chr}.")
 
     node_dirs = [d.path for d in os.scandir(args.tensor_folder_path) if d.is_dir()]
     total_nodes = len(node_dirs)
-    if total_nodes == 0:
-        print("No node directories found to process. Exiting.")
-        return
+    print(f"Found {total_nodes} nodes. Processing with {args.workers} workers...\n")
 
-    print(f"Found {total_nodes} nodes. Initializing {args.workers} worker processes...")
-    print("(This may take a moment before the progress bar appears...)\n")
+    start_time = time.monotonic()
+    tasks = [
+        (node_dir, true_dir, false_dir, args.use_symlinks, vcf_variants)
+        for node_dir in node_dirs
+    ]
+    with Pool(processes=args.workers) as pool:
+        results = pool.map(process_node_directory, tasks)
 
-    worker_func = partial(process_node_directory, true_dir=true_dir, false_dir=false_dir, use_symlinks=args.use_symlinks)
     all_summary_records = []
     total_true = 0
     total_false = 0
-    start_time = time.monotonic()
+    for records, true_c, false_c in results:
+        all_summary_records.extend(records)
+        total_true += true_c
+        total_false += false_c
 
-    init_args = (args.vcf_file, args.chr, args.node_pos_json)
-    with Pool(processes=args.workers, initializer=init_worker, initargs=init_args) as pool:
-        results = pool.imap_unordered(worker_func, node_dirs)
-        for i, (records, true_c, false_c) in enumerate(results):
-            processed_count = i + 1
-            all_summary_records.extend(records)
-            total_true += true_c
-            total_false += false_c
-            elapsed_time = time.monotonic() - start_time
-            progress = processed_count / total_nodes
-            rate = processed_count / elapsed_time if elapsed_time > 0 else 0
-            eta_str = format_time((total_nodes - processed_count) / rate) if rate > 0 else "..."
-            elapsed_str = format_time(elapsed_time)
-            print(
-                f"\rProgress: {processed_count}/{total_nodes} ({progress:.1%}) | "
-                f"Elapsed: {elapsed_str} | ETA: {eta_str} | Rate: {rate:.2f} nodes/s  ", end=""
-            )
+    elapsed = format_time(time.monotonic() - start_time)
+    print(f"Processing complete. Time elapsed: {elapsed}")
 
-    print("\n\nProcessing complete.")
-    summary_json_path = os.path.join(args.output_folder, "classification_summary.json")
-    print(f"Writing classification summary to {summary_json_path}...")
-    with open(summary_json_path, 'w') as f:
+    summary_path = os.path.join(args.output_folder, "classification_summary.json")
+    with open(summary_path, 'w') as f:
         json.dump({"chromosome": args.chr, "results": all_summary_records}, f, indent=2)
 
-    print("\n--- Classification Summary ---")
-    print(f"Total nodes processed: {total_nodes}")
-    print(f"Total tensors classified: {total_true + total_false}")
-    print(f"True (matches in VCF): {total_true}")
+    print("\n--- Summary ---")
+    print(f"Total nodes: {total_nodes}")
+    print(f"Total tensors: {total_true + total_false}")
+    print(f"True (in VCF): {total_true}")
     print(f"False (not in VCF): {total_false}")
 
     if args.organize:
-        print("\nOrganizing classified data into train/val/test splits...")
+        print("Organizing tensors into train/val/test...")
         organize_classified_data(args.output_folder, args.organize, seed=args.seed)
-        print("Organization complete.")
+        print("Done organizing.")
 
 if __name__ == "__main__":
-    if sys.version_info < (3, 6):
-        sys.exit("This script requires Python 3.6+.")
     main()
