@@ -175,20 +175,27 @@ def main():
         (node_dir, true_dir, false_dir, args.use_symlinks, vcf_variants)
         for node_dir in node_dirs
     ]
-    with Pool(processes=args.workers) as pool:
-        results = pool.map(process_node_directory, tasks)
-
     all_summary_records = []
     total_true = 0
     total_false = 0
-    for records, true_c, false_c in results:
-        all_summary_records.extend(records)
-        total_true += true_c
-        total_false += false_c
 
-    elapsed = format_time(time.monotonic() - start_time)
-    print(f"Processing complete. Time elapsed: {elapsed}")
+    with Pool(processes=args.workers) as pool:
+        for i, result in enumerate(pool.imap_unordered(process_node_directory, tasks)):
+            records, true_c, false_c = result
+            all_summary_records.extend(records)
+            total_true += true_c
+            total_false += false_c
+            processed_count = i + 1
+            elapsed_time = time.monotonic() - start_time
+            rate = processed_count / elapsed_time if elapsed_time > 0 else 0
+            eta_str = format_time((total_nodes - processed_count) / rate) if rate > 0 else "..."
+            elapsed_str = format_time(elapsed_time)
+            print(
+                f"\rProgress: {processed_count}/{total_nodes} ({processed_count/total_nodes:.1%}) | "
+                f"Elapsed: {elapsed_str} | ETA: {eta_str} | Rate: {rate:.2f} nodes/s  ", end=""
+            )
 
+    print("\n\nProcessing complete.")
     summary_path = os.path.join(args.output_folder, "classification_summary.json")
     with open(summary_path, 'w') as f:
         json.dump({"chromosome": args.chr, "results": all_summary_records}, f, indent=2)
