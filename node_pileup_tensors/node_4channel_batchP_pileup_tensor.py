@@ -18,25 +18,25 @@ RECORD_SIZE = RECORD_STRUCT.size
 
 # Base to Index Mapping
 BASE_TO_INDEX = {
-    'A': 2, 'C': 3, 'G': 5, 'T': 7,  # Standard bases
-    'N': 1,  # Unknown or ambiguous base
-    '*': 9,  # Deletion character from CIGAR or gap
+    'A': 20, 'C': 30, 'G': 50, 'T': 70,  # Standard bases
+    'N': 10,  # Unknown or ambiguous base
+    '*': 90,  # Deletion character from CIGAR or gap
     '_PADDING_': 0  # Representing padding, mapped to index 0
 }
 PADDING_BASE_INDEX = 0
 
 # CIGAR Operation to Index Mapping
 CIGAR_OP_TO_INDEX = {
-    'M': 1, 'N': 2, 'S': 3, 'I': 4, 'D': 5, 'H': 6, 'P': 7, '=': 8, 'X': 9,
+    'M': 10, 'N': 20, 'S': 30, 'I': 40, 'D': 50, 'H': 60, 'P': 70, '=': 80, 'X': 90,
     '_PADDING_': 0
 }
 CIGAR_PADDING_INDEX = 0
 
 # Index to Base Mapping for console visualization
 INDEX_TO_BASE_FOR_VIEW = {
-    2: 'A', 3: 'C', 5: 'G', 7: 'T',
-    1: 'N',
-    9: '*',
+    20: 'A', 30: 'C', 50: 'G', 70: 'T',
+    10: 'N',
+    90: '*',
     0: '0'  # Padding is represented by '0'
 }
 
