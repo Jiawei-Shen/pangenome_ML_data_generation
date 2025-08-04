@@ -86,14 +86,14 @@ def count_matches(tsv_path, idx_nodes):
         with open(tsv_path, 'r') as f:
             for line in f:
                 line_num += 1
-                print(line, line.strip(), line.startswith("chr"))
+                # print(line, line.strip(), line.startswith("chr"))
                 # Skip header or empty lines
-                if not line.strip() or line.startswith("chr"):
+                if not line.strip():
                     continue
 
                 # Split by any whitespace to handle both tabs and spaces
                 parts = line.split()
-                print(parts, parts[-1])
+                # print(parts, parts[-1])
                 # The alt_node is the last element. Check for sufficient columns.
                 # Based on the example, we need at least 7 columns.
                 if len(parts) < 7:
