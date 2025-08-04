@@ -71,14 +71,14 @@ def load_index(idx_path):
 
 def count_matches(tsv_path, idx_nodes):
     """
-    Counts how many ref_nodes from a TSV file are present in a given set of nodes.
+    Counts how many alt_nodes from a TSV file are present in a given set of nodes.
 
     Args:
         tsv_path (str): The path to the input TSV file.
         idx_nodes (set): A set of node IDs loaded from the index file.
 
     Returns:
-        int: The total number of matching nodes found.
+        int: The total number of matching nodes found. Returns -1 on file error.
     """
     match_count = 0
     line_num = 0
@@ -93,18 +93,19 @@ def count_matches(tsv_path, idx_nodes):
                 # Split by any whitespace to handle both tabs and spaces
                 parts = line.split()
 
-                # The ref_node is in the 5th column (index 4)
-                if len(parts) < 5:
+                # The alt_node is the last element. Check for sufficient columns.
+                # Based on the example, we need at least 7 columns.
+                if len(parts) < 7:
                     print(f"Warning: Skipping malformed line {line_num}: not enough columns.", file=sys.stderr)
                     continue
 
                 try:
-                    # The ref_node is the 5th element in the row
-                    ref_node = int(parts[4])
-                    if ref_node in idx_nodes:
+                    # The alt_node is the last element in the row
+                    alt_node = int(parts[-1])
+                    if alt_node in idx_nodes:
                         match_count += 1
                 except ValueError:
-                    print(f"Warning: Skipping line {line_num} due to non-integer ref_node: '{parts[4]}'",
+                    print(f"Warning: Skipping line {line_num} due to non-integer alt_node: '{parts[-1]}'",
                           file=sys.stderr)
                     continue
     except FileNotFoundError:
@@ -122,7 +123,7 @@ def main():
     Main function to orchestrate the node counting process.
     """
     parser = argparse.ArgumentParser(
-        description="Count how many 'ref_node' entries from a TSV file exist in a binary .idx file."
+        description="Count how many 'alt_node' entries (last column) from a TSV file exist in a binary .idx file."
     )
     parser.add_argument("tsv_file", help="Path to the input TSV file.")
     parser.add_argument("idx_file", help="Path to the .idx index file.")
@@ -140,13 +141,13 @@ def main():
     print(f"Loaded {len(idx_nodes)} unique nodes from the index.", file=sys.stderr)
 
     # 2. Count the matches in the TSV file
-    print(f"Comparing with ref_nodes from TSV file: {args.tsv_file}...", file=sys.stderr)
+    print(f"Comparing with alt_nodes from TSV file: {args.tsv_file}...", file=sys.stderr)
     total_matches = count_matches(args.tsv_file, idx_nodes)
 
     # 3. Output the final result
     if total_matches != -1:
         print("\n--- Results ---")
-        print(f"Total matching nodes found: {total_matches}")
+        print(f"Total matching alternate nodes found: {total_matches}")
 
 
 if __name__ == "__main__":
