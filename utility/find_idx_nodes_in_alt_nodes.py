@@ -86,7 +86,6 @@ def count_matches(tsv_path, idx_nodes):
         with open(tsv_path, 'r') as f:
             for line in f:
                 line_num += 1
-                print(line)
                 # Skip header or empty lines
                 if not line.strip() or line.startswith("chr"):
                     continue
