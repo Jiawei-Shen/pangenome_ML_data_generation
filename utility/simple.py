@@ -1,71 +1,66 @@
-import json
+#!/usr/bin/env python3
+"""
+collect_nodes_from_vcf.py
+-------------------------------------------------
+Collect ALL node IDs that appear in a vg-deconstructed VCF:
+
+  • ID field  (e.g.  >1745>1742  ➟ 1745, 1742)
+  • AT= tag   (e.g.  >1745>1743>1742  ➟ 1745, 1743, 1742)
+
+Output: one node ID per line, unsorted or (optionally) sorted numerically.
+
+Usage
+-----
+    python collect_nodes_from_vcf.py  input.vcf[.gz]  nodes.txt          # unsorted
+    python collect_nodes_from_vcf.py  -s input.vcf.gz nodes.txt          # sorted
+
+Dependencies:  pysam  (pip install pysam)
+"""
+
 import argparse
-import subprocess
+import re
+import sys
+import pysam
 
-def load_vcf_variants(vcf_file, target_chr):
-    """Load variants from a specific chromosome in the VCF using bcftools."""
-    variants = set()
-    try:
-        cmd = ["bcftools", "view", "-r", target_chr, "-H", vcf_file]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        for line in result.stdout.strip().split('\n'):
-            if not line:
-                continue
-            fields = line.strip().split('\t')
-            chrom, pos, ref, alt = fields[0], fields[1], fields[3], fields[4]
-            for allele in alt.split(','):
-                variants.add((chrom, int(pos), ref, allele))
-    except Exception as e:
-        print(f"Error reading VCF with bcftools: {e}")
-    return variants
+# matches every run of digits, ignoring orientation symbols >  <
+_DIGIT_RE = re.compile(r"\d+")
 
-def load_json_variants(json_file):
-    """Extract (chrom, pos, ref, alt) from raw VCF strings in vcf_query_results."""
-    variants = set()
-    try:
-        with open(json_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+def extract_ids_from_string(s: str):
+    """Yield every integer found in a traversal or ID string."""
+    for m in _DIGIT_RE.finditer(s):
+        yield int(m.group())
 
-        for node in data.get("nodes", []):
-            for line in node.get("vcf_query_results", []):
-                if isinstance(line, str):
-                    fields = line.strip().split('\t')
-                    if len(fields) >= 5:
-                        chrom = fields[0]
-                        pos = int(fields[1])
-                        ref = fields[3]
-                        alt = fields[4]
-                        for allele in alt.split(','):
-                            variants.add((chrom, pos, ref, allele))
-    except Exception as e:
-        print(f"Error reading JSON file: {e}")
-    return variants
+def main(vcf_path: str, out_path: str, do_sort: bool):
+    seen = set()
+    vcf = pysam.VariantFile(vcf_path)
 
-def compare_and_output_missing(vcf_variants, json_variants, output_file):
-    missing = sorted(vcf_variants - json_variants)
-    print(f"Total variants in VCF: {len(vcf_variants)}")
-    print(f"Total variants in JSON: {len(json_variants)}")
-    print(f"Variants present in VCF but missing in JSON: {len(missing)}")
+    # -- iterate through records ------------------------------------------------
+    for rec in vcf:
+        # 1.  ID field  (might be '.')
+        if rec.id and rec.id != ".":
+            seen.update(extract_ids_from_string(rec.id))
 
-    if missing:
-        print("\nMissing variants:")
-        for chrom, pos, ref, alt in missing:
-            print(f"{chrom}\t{pos}\t.\t{ref}\t{alt}\t.\t.\t.")
+        # 2.  AT tag: list[str] like ['>1745>1743>1742', ...]
+        at_vals = rec.info.get("AT")
+        if at_vals:
+            for trav in at_vals:
+                seen.update(extract_ids_from_string(trav))
 
-    with open(output_file, 'w', encoding='utf-8') as out_f:
-        for chrom, pos, ref, alt in missing:
-            out_f.write(f"{chrom}\t{pos}\t.\t{ref}\t{alt}\t.\t.\t.\n")
+    # -- write output -----------------------------------------------------------
+    with open(out_path, "w") as fout:
+        ids = sorted(seen) if do_sort else seen
+        for nid in ids:
+            fout.write(f"{nid}\n")
 
-    print(f"\nMissing variants written to: {output_file}")
+    sys.stderr.write(f"Wrote {len(seen):,} unique node IDs ➟ {out_path}\n")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Compare VCF and JSON vcf_query_results for a given chromosome")
-    parser.add_argument("vcf_file", help="Path to the VCF(.gz) file")
-    parser.add_argument("json_file", help="Path to the JSON file with vcf_query_results")
-    parser.add_argument("--chr", required=True, help="Chromosome to compare (e.g., chr1)")
-    parser.add_argument("--out", default="missing_variants.tsv", help="Output file for missing variants")
+    parser = argparse.ArgumentParser(
+        description="Collect all node IDs referenced in a vg-deconstructed VCF."
+    )
+    parser.add_argument("vcf",  help="Input VCF (.vcf or .vcf.gz)")
+    parser.add_argument("out",  help="Output text file (one node ID per line)")
+    parser.add_argument("-s", "--sort", action="store_true",
+                        help="sort node IDs numerically before writing")
     args = parser.parse_args()
-
-    vcf_vars = load_vcf_variants(args.vcf_file, args.chr)
-    json_vars = load_json_variants(args.json_file)
-    compare_and_output_missing(vcf_vars, json_vars, args.out)
+    main(args.vcf, args.out, args.sort)
