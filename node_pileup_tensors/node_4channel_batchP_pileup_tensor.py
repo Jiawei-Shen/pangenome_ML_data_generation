@@ -18,25 +18,25 @@ RECORD_SIZE = RECORD_STRUCT.size
 
 # Base to Index Mapping
 BASE_TO_INDEX = {
-    'A': 2, 'C': 3, 'G': 5, 'T': 7,  # Standard bases
-    'N': 1,  # Unknown or ambiguous base
-    '*': 9,  # Deletion character from CIGAR or gap
+    'A': 20, 'C': 30, 'G': 50, 'T': 70,  # Standard bases
+    'N': 10,  # Unknown or ambiguous base
+    '*': 90,  # Deletion character from CIGAR or gap
     '_PADDING_': 0  # Representing padding, mapped to index 0
 }
 PADDING_BASE_INDEX = 0
 
 # CIGAR Operation to Index Mapping
 CIGAR_OP_TO_INDEX = {
-    'M': 1, 'I': 2, 'D': 3, 'N': 4, 'S': 5, 'H': 6, 'P': 7, '=': 8, 'X': 9,
+    'M': 10, 'N': 20, 'S': 30, 'I': 40, 'D': 50, 'H': 60, 'P': 70, '=': 80, 'X': 90,
     '_PADDING_': 0
 }
 CIGAR_PADDING_INDEX = 0
 
 # Index to Base Mapping for console visualization
 INDEX_TO_BASE_FOR_VIEW = {
-    2: 'A', 3: 'C', 5: 'G', 7: 'T',
-    1: 'N',
-    9: '*',
+    20: 'A', 30: 'C', 50: 'G', 70: 'T',
+    10: 'N',
+    90: '*',
     0: '0'  # Padding is represented by '0'
 }
 
@@ -245,9 +245,11 @@ def get_read_representation_in_window_for_view(segment_cigar_ops, segment_offset
 
 def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
                                    segment_read_sequence, segment_quality_values,
+                                   mapping_quality,
                                    window_start_node, tensor_win_size, node_len):
     bases = [PADDING_BASE_INDEX] * tensor_win_size
     quals = [DEFAULT_QUALITY_PADDING] * tensor_win_size
+    mapqs = [DEFAULT_MAPPING_QUALITY_PADDING] * tensor_win_size
     cigar_ops_indices = [CIGAR_PADDING_INDEX] * tensor_win_size
 
     node_pos, read_pos = segment_offset_on_node, 0
@@ -264,6 +266,7 @@ def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
                 win_idx = n_aln - window_start_node
                 if 0 <= win_idx < tensor_win_size:
                     cigar_ops_indices[win_idx] = op_idx
+                    mapqs[win_idx] = mapping_quality
                     if r_aln < read_seq_len:
                         base_char = segment_read_sequence[r_aln].upper()
                         bases[win_idx] = BASE_TO_INDEX.get(base_char, BASE_TO_INDEX['N'])
@@ -277,6 +280,7 @@ def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
                 win_idx = n_aln - window_start_node
                 if 0 <= win_idx < tensor_win_size:
                     cigar_ops_indices[win_idx] = op_idx
+                    mapqs[win_idx] = mapping_quality
                     bases[win_idx] = BASE_TO_INDEX['*']
                     quals[win_idx] = DEFAULT_QUALITY_PADDING
             node_pos += L
@@ -284,7 +288,7 @@ def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
             read_pos += L
 
         if read_pos >= read_seq_len: break
-    return bases, quals, cigar_ops_indices
+    return bases, quals, mapqs, cigar_ops_indices
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -305,7 +309,7 @@ def init_worker(dat_file_path_for_worker, base_output_dir_for_worker):
 
 
 def process_single_node_for_pileup(task_args):
-    node_id, dat_file_offset, n_records, node_sequence, min_af_threshold, min_variants_threshold, min_allele_bq_threshold, variant_type_to_process = task_args
+    node_id, dat_file_offset, n_records, node_sequence, genomead_af_list, min_af_threshold, min_variants_threshold, min_allele_bq_threshold, variant_type_to_process = task_args
     global worker_dat_file, worker_base_output_dir
 
     tensor_files_generated_for_node = 0
@@ -466,7 +470,7 @@ def process_single_node_for_pileup(task_args):
             "mean_alt_allele_base_quality": round(mean_alt_bq, 2)
         }
 
-        ch1_list, ch2_list, ch3_list, ch4_list, ch5_list = [], [], [], [], []
+        ch1_list, ch2_list, ch3_list, ch4_list, ch5_list, ch6_list = [], [], [], [], [], []
 
         ref_base_indices_row = [PADDING_BASE_INDEX] * TENSOR_WINDOW_SIZE
         for i, node_pos_in_window in enumerate(range(window_start_pos, window_start_pos + TENSOR_WINDOW_SIZE)):
@@ -474,31 +478,62 @@ def process_single_node_for_pileup(task_args):
                 ref_base_indices_row[i] = BASE_TO_INDEX.get(node_sequence[node_pos_in_window].upper(),
                                                             BASE_TO_INDEX['N'])
 
+        genomead_af_row = [0] * TENSOR_WINDOW_SIZE
+        if genomead_af_list:
+            for i, node_pos_in_window in enumerate(range(window_start_pos, window_start_pos + TENSOR_WINDOW_SIZE)):
+                if 0 <= node_pos_in_window < node_len:
+                    af_value = genomead_af_list[node_pos_in_window]
+
+                    if af_value == 0.0:
+                        scaled_af = 0
+                    else:
+                        phred_af = -10.0 * np.log10(af_value)
+                        inverted_phred = 127.0 - phred_af
+                        scaled_af = max(1, min(int(inverted_phred), 127))
+                    genomead_af_row[i] = scaled_af
+
         ch1_list.append(ref_base_indices_row)
         ch2_list.append([DEFAULT_QUALITY_PADDING] * TENSOR_WINDOW_SIZE)
         ch3_list.append([MISMATCH_CHANNEL_REF_ROW_VALUE] * TENSOR_WINDOW_SIZE)
         ch4_list.append([DEFAULT_MAPPING_QUALITY_PADDING] * TENSOR_WINDOW_SIZE)
         ch5_list.append([CIGAR_PADDING_INDEX] * TENSOR_WINDOW_SIZE)
+        ch6_list.append(genomead_af_row)
 
         reads_added = 0
         for seg_data in aligned_read_segments:
             if reads_added >= TENSOR_MAX_READ_ROWS: break
 
-            base_idx_row, quality_score_row, cigar_op_row = get_read_tensor_rows_in_window(
+            mapq = max(0, min(int(seg_data["mapping_quality"]), 127))
+            base_idx_row, quality_score_row, mapq_row, cigar_op_row = get_read_tensor_rows_in_window(
                 seg_data["cigar_ops"], seg_data["offset_on_node"],
                 seg_data["read_sequence"], seg_data["processed_quality_values"],
+                mapq,
                 window_start_pos, TENSOR_WINDOW_SIZE, node_len)
 
             if any(b != PADDING_BASE_INDEX for b in base_idx_row):
                 ch1_list.append(base_idx_row)
                 ch2_list.append(quality_score_row)
-                mismatch_flags_row = [
-                    MISMATCH_COMPARISON_PADDING_VALUE if b == PADDING_BASE_INDEX or r == PADDING_BASE_INDEX else (
-                        0 if b == r else 1) for b, r in zip(base_idx_row, ref_base_indices_row)]
+
+                variant_window_index = v_pos - window_start_pos
+                mismatch_flags_row = []
+                for i in range(TENSOR_WINDOW_SIZE):
+                    read_base_idx = base_idx_row[i]
+                    ref_base_idx = ref_base_indices_row[i]
+
+                    if read_base_idx == PADDING_BASE_INDEX or ref_base_idx == PADDING_BASE_INDEX:
+                        mismatch_flags_row.append(MISMATCH_COMPARISON_PADDING_VALUE)
+                    elif read_base_idx == ref_base_idx:
+                        mismatch_flags_row.append(0)
+                    else:
+                        if i == variant_window_index:
+                            mismatch_flags_row.append(5)
+                        else:
+                            mismatch_flags_row.append(1)
+
                 ch3_list.append(mismatch_flags_row)
-                mapq = max(0, min(int(seg_data["mapping_quality"]), 127))
-                ch4_list.append([mapq] * TENSOR_WINDOW_SIZE)
+                ch4_list.append(mapq_row)
                 ch5_list.append(cigar_op_row)
+                ch6_list.append(genomead_af_row)
                 reads_added += 1
 
         for _ in range(TENSOR_MAX_READ_ROWS - reads_added):
@@ -507,9 +542,10 @@ def process_single_node_for_pileup(task_args):
             ch3_list.append([MISMATCH_COMPARISON_PADDING_VALUE] * TENSOR_WINDOW_SIZE)
             ch4_list.append([DEFAULT_MAPPING_QUALITY_PADDING] * TENSOR_WINDOW_SIZE)
             ch5_list.append([CIGAR_PADDING_INDEX] * TENSOR_WINDOW_SIZE)
+            ch6_list.append([0] * TENSOR_WINDOW_SIZE)
 
         try:
-            tensor_chw = torch.tensor([ch1_list, ch2_list, ch3_list, ch4_list, ch5_list], dtype=torch.int8)
+            tensor_chw = torch.tensor([ch1_list, ch2_list, ch3_list, ch4_list, ch5_list, ch6_list], dtype=torch.int8)
             numpy_array_to_save = tensor_chw.numpy()
             tensor_filename_npy = f"{variant_key_string}.npy"
             tensor_filepath_npy = os.path.join(node_specific_output_dir, tensor_filename_npy)
@@ -603,11 +639,8 @@ def main():
     parser.add_argument("idx", help=".idx index file")
     parser.add_argument("output", help="Base output directory")
 
-    # --- MODIFICATION START ---
-    # Replace the old input group with a single argument for the JSON file.
     parser.add_argument("candidate_variants_json",
                         help="JSON file containing nodes and their sequences to process.")
-    # --- MODIFICATION END ---
 
     parser.add_argument("--num_workers", type=int, default=os.cpu_count(), help="Number of worker processes")
     parser.add_argument("--view", nargs='?', const=-1, default=None, type=int, metavar='N',
@@ -624,14 +657,12 @@ def main():
 
     args = parser.parse_args()
 
-    # --- MODIFICATION START ---
-    # Check for the existence of the required files.
     if not all([os.path.isfile(args.dat), os.path.isfile(args.idx), os.path.isfile(args.candidate_variants_json)]):
         sys.exit("Error: One or more input files (dat, idx, or json) were not found.")
     os.makedirs(args.output, exist_ok=True)
 
-    # Load node information directly from the provided JSON file.
     node_sequences = {}
+    node_af_data = {}
     node_ids_to_process = set()
     print(f"Loading nodes from {args.candidate_variants_json}...")
     try:
@@ -640,37 +671,33 @@ def main():
             for node_obj in data.get('nodes', []):
                 node_id_str = node_obj.get('node_id')
                 sequence = node_obj.get('sequence')
+                af_list = node_obj.get('genomead_af', [])
                 if node_id_str and sequence:
                     try:
-                        # The script's core logic requires integer node IDs for the .idx file.
                         node_id_int = int(node_id_str)
                         node_sequences[node_id_int] = sequence.upper()
+                        node_af_data[node_id_int] = af_list
                         node_ids_to_process.add(node_id_int)
                     except ValueError:
-                        # Silently skip nodes with non-integer IDs like 's1', as they won't be in the .idx file.
                         pass
     except Exception as e:
         sys.exit(f"Error reading or parsing JSON file: {e}")
 
     print(f"Found {len(node_sequences)} nodes with integer-compatible IDs to process.")
-    # --- MODIFICATION END ---
 
     full_idx_data = load_full_idx_data(args.idx)
     if not full_idx_data: sys.exit("Failed to load index data.")
 
-    # --- MODIFICATION START ---
-    # Build the list of tasks to be processed by the workers.
     tasks = []
     for node_id in node_ids_to_process:
         if node_id in full_idx_data:
             offset, n_records = full_idx_data[node_id]
             sequence = node_sequences[node_id]
-            tasks.append((node_id, offset, n_records, sequence, args.min_af, args.min_variants,
+            af_list = node_af_data.get(node_id, [])
+            tasks.append((node_id, offset, n_records, sequence, af_list, args.min_af, args.min_variants,
                           args.min_allele_bq, args.variant_type))
         else:
             print(f"Warning: Node ID {node_id} from JSON was not found in the index file and will be skipped.")
-    # --- MODIFICATION END ---
-
 
     if not tasks:
         sys.exit("No valid tasks to run after processing JSON and index file.")
@@ -694,7 +721,6 @@ def main():
                 tensors_since_last_report += tensor_count
 
                 if args.view is not None and view_data:
-                    # We need the original node sequence for the display function.
                     node_sequence_for_view = node_sequences.get(node_id, "")
                     display_pileup_data(view_data, str(node_id), node_sequence_for_view, args.max_view_reads,
                                         args.view if args.view != -1 else float('inf'))
