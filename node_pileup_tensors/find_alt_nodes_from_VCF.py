@@ -23,21 +23,49 @@ def nodes(trav: str) -> List[int]:
     """'>1745>1743>1742' → [1745, 1743, 1742]"""
     return [int(tok) for tok in _SPLIT.split(trav) if tok]
 
-def snps_for_alt(ref_seq, ref_nodes, alt_seq, alt_nodes):
-    """Yield (offset, ref_base, ref_node, alt_base, alt_node) tuples."""
-    if len(ref_seq) != len(alt_seq):           # skip indels
+def snps_for_alt(
+    ref_seq: str,
+    ref_nodes: List[int],
+    alt_seq: str,
+    alt_nodes: List[int],
+):
+    """
+    Yield tuples   (offset, ref_base, ref_node, alt_base, alt_node)
+
+    • Works even when node lists are shorter/longer than the base string.
+    • For k single-base differences, uses the first k node IDs that appear
+      *only* on the REF side and the first k node IDs that appear *only*
+      on the ALT side.
+    """
+    if len(ref_seq) != len(alt_seq):          # skip indels
         return
-    # positions where the bases differ
-    diff_idx = [i for i,(rb,ab) in enumerate(zip(ref_seq,alt_seq)) if rb!=ab]
-    if not diff_idx:                           # identical allele
+
+    # 1. Which positions differ at the nucleotide level?
+    diff_idx = [i for i, (rb, ab) in enumerate(zip(ref_seq, alt_seq)) if rb != ab]
+    if not diff_idx:
         return
-    ref_set = set(ref_nodes)
-    for i in diff_idx:
-        ref_base, alt_base = ref_seq[i], alt_seq[i]
-        # heuristic: alt_node = first node in ALT at or after i that’s not in REF
-        alt_node = next((n for n in alt_nodes[i:] if n not in ref_set), alt_nodes[i])
-        ref_node = ref_nodes[i] if i < len(ref_nodes) else ref_nodes[-1]
-        yield i, ref_base, ref_node, alt_base, alt_node
+
+    # 2. Node IDs that are unique to each traversal
+    ref_only = [n for n in ref_nodes if n not in alt_nodes]
+    alt_only = [n for n in alt_nodes if n not in ref_nodes]
+
+    # Pad with last node if we ran out (rare, but keeps script robust)
+    while len(ref_only) < len(diff_idx):
+        ref_only.append(ref_nodes[-1])
+    while len(alt_only) < len(diff_idx):
+        alt_only.append(alt_nodes[-1])
+
+    # 3. Emit one row per differing base, pairing node IDs in order
+    for k, i in enumerate(diff_idx):
+        ref_base = ref_seq[i]
+        alt_base = alt_seq[i]
+        yield (
+            i,                # offset within the record
+            ref_base,
+            ref_only[k],      # kth node unique to REF
+            alt_base,
+            alt_only[k],      # kth node unique to ALT
+        )
 
 def main(vcf_path):
     vcf = pysam.VariantFile(vcf_path)
@@ -45,7 +73,6 @@ def main(vcf_path):
         sys.exit("ERROR: VCF header lacks AT tag")
 
     print("CHROM\tSNP_POS\tID\tREF_BASE\tREF_NODE\tALT_BASE\tALT_NODE")
-
     for rec in vcf:
         ref_seq, ref_trav = rec.ref, rec.info["AT"][0]
         ref_nodes = nodes(ref_trav)
