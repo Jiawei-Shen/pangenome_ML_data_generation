@@ -141,8 +141,8 @@ def main():
         print("\n--- Matching Nodes Found ---")
         if found_nodes:
             # Sort the nodes for consistent output
-            for node in sorted(list(found_nodes)):
-                print(node)
+            # for node in sorted(list(found_nodes)):
+            #     print(node)
             print(f"\nTotal unique matching nodes: {len(found_nodes)}", file=sys.stderr)
         else:
             print("No matching nodes were found.")
