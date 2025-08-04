@@ -101,7 +101,7 @@ def count_matches(tsv_path, idx_nodes):
 
                 try:
                     # The alt_node is the last element in the row
-                    alt_node = int(parts[-1])
+                    alt_node = int(parts[-3])
                     if alt_node in idx_nodes:
                         match_count += 1
                 except ValueError:
