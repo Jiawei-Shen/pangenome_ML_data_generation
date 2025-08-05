@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import argparse
 import struct
 import sys
@@ -69,56 +71,76 @@ def load_index(idx_path):
     return node_index
 
 
-def find_matches_in_txt(txt_path, idx_nodes):
+def count_matches(tsv_path, idx_nodes):
     """
-    Finds all node IDs from a text file that are present in a given set of nodes.
-    Each line in the text file is assumed to contain one node ID.
+    Counts how many alt_nodes from a TSV file are present in a given set of nodes.
+    The alt_nodes column may contain multiple comma-separated IDs.
 
     Args:
-        txt_path (str): The path to the input text file.
+        tsv_path (str): The path to the input TSV file.
         idx_nodes (set): A set of node IDs loaded from the index file.
 
     Returns:
-        set: A set of all unique matching node IDs found. Returns None on file error.
+        int: The total number of matching nodes found. Returns -1 on file error.
     """
-    matching_nodes = set()
+    match_count = 0
     line_num = 0
     try:
-        with open(txt_path, 'r') as f:
+        with open(tsv_path, 'r') as f:
             for line in f:
                 line_num += 1
-                node_id_str = line.strip()
+                # Skip header or empty lines
+                if not line.strip():
+                    continue
 
-                # Skip empty lines
-                if not node_id_str:
+                # Split by any whitespace to handle both tabs and spaces
+                parts = line.split()
+                # Based on the example, we need at least 7 columns.
+                if len(parts) < 7:
+                    print(f"Warning: Skipping malformed line {line_num}: not enough columns.", file=sys.stderr)
                     continue
 
                 try:
-                    # Convert the line to an integer and check for its existence
-                    node_id = int(node_id_str)
-                    if node_id in idx_nodes:
-                        matching_nodes.add(node_id)
+                    # **REVISED LOGIC START**
+                    # The alt_nodes are in the last column, potentially comma-separated.
+                    alt_nodes_str = parts[-1]
+
+                    # Split the string into individual node ID strings.
+                    node_id_list = alt_nodes_str.split(',')
+
+                    # Iterate through each potential node ID from the column.
+                    for node_id_str in node_id_list:
+                        # Skip if the part is empty (e.g., from a trailing comma).
+                        if not node_id_str:
+                            continue
+
+                        # Convert to integer and check if it's in our index.
+                        alt_node = int(node_id_str)
+                        if alt_node in idx_nodes:
+                            match_count += 1
+                    # **REVISED LOGIC END**
                 except ValueError:
-                    print(f"Warning: Skipping non-integer value on line {line_num}: '{node_id_str}'", file=sys.stderr)
+                    print(f"Warning: Skipping line {line_num} due to non-integer value in alt_nodes: '{parts[-1]}'",
+                          file=sys.stderr)
                     continue
     except FileNotFoundError:
-        print(f"Error: TXT file not found at {txt_path}", file=sys.stderr)
-        return None  # Return None on error
+        print(f"Error: TSV file not found at {tsv_path}", file=sys.stderr)
+        return -1  # Return an error code
     except Exception as e:
-        print(f"An unexpected error occurred while reading TXT file {txt_path}: {e}", file=sys.stderr)
-        return None
+        print(f"An unexpected error occurred while reading TSV file {tsv_path}: {e}", file=sys.stderr)
+        return -1
 
-    return matching_nodes
+    return match_count
 
 
 def main():
     """
-    Main function to orchestrate the node finding process.
+    Main function to orchestrate the node counting process.
     """
     parser = argparse.ArgumentParser(
-        description="Find all unique node IDs from a text file that also exist in a binary .idx file."
+        description="Count how many 'alt_node(s)' entries (last column) from a TSV file exist in a binary .idx file."
     )
-    parser.add_argument("txt_file", help="Path to the input text file containing one node ID per line.")
+    parser.add_argument("tsv_file", help="Path to the input TSV file.")
     parser.add_argument("idx_file", help="Path to the .idx index file.")
     args = parser.parse_args()
 
@@ -129,23 +151,18 @@ def main():
         print("Could not load index file. Exiting.", file=sys.stderr)
         sys.exit(1)
 
+    # Get the keys (which are the node IDs) and convert to a set for O(1) lookups
     idx_nodes = set(index_data.keys())
     print(f"Loaded {len(idx_nodes)} unique nodes from the index.", file=sys.stderr)
 
-    # 2. Find all matching nodes in the text file
-    print(f"Finding all matching nodes from TXT file: {args.txt_file}...", file=sys.stderr)
-    found_nodes = find_matches_in_txt(args.txt_file, idx_nodes)
+    # 2. Count the matches in the TSV file
+    print(f"Comparing with alt_nodes from TSV file: {args.tsv_file}...", file=sys.stderr)
+    total_matches = count_matches(args.tsv_file, idx_nodes)
 
     # 3. Output the final result
-    if found_nodes is not None:
-        print("\n--- Matching Nodes Found ---")
-        if found_nodes:
-            # Sort the nodes for consistent output
-            for node in sorted(list(found_nodes)):
-                print(node)
-            print(f"\nTotal unique matching nodes: {len(found_nodes)}", file=sys.stderr)
-        else:
-            print("No matching nodes were found.")
+    if total_matches != -1:
+        print("\n--- Results ---")
+        print(f"Total matching alternate nodes found: {total_matches}")
 
 
 if __name__ == "__main__":
