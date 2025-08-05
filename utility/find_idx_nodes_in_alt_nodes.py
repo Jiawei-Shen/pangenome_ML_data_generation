@@ -87,7 +87,7 @@ def verify_variants_in_vcf(tsv_path, idx_nodes, vcf_path):
                 # Now, query the VCF by coordinate to find the variant
                 try:
                     # pysam is 0-based, VCF is 1-based. Fetching [pos-1, pos] gets records at that position.
-                    for rec in vcf_file.fetch(tsv_chrom, tsv_pos - 10, tsv_pos + 10):
+                    for rec in vcf_file.fetch(tsv_chrom, tsv_pos - 1, tsv_pos + len(tsv_alt)):
                         # We need an exact match on position, reference allele, and one of the alternate alleles
                         # if rec.pos == tsv_pos and rec.ref == tsv_ref and tsv_alt in rec.alts:
                         if rec:
