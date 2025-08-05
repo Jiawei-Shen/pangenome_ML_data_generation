@@ -131,7 +131,7 @@ if __name__ == "__main__":
         "-t", "--type",
         help="Type of variant to extract.",
         choices=["snp", "insertion", "both"],
-        default="insertion"
+        default="both"
     )
     args = ap.parse_args()
     main(args)
