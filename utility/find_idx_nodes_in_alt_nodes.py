@@ -102,9 +102,9 @@ def verify_variants_in_vcf(tsv_path, idx_nodes, vcf_path):
                     results["matches_in_vcf"] += 1
                 else:
                     results["mismatches_in_vcf"] += 1
-                    print(
-                        f"Mismatch: Variant {tsv_chrom}:{tsv_pos} {tsv_ref}>{tsv_alt} (from TSV line with valid node) not found in VCF.",
-                        file=sys.stderr)
+                    # print(
+                    #     f"Mismatch: Variant {tsv_chrom}:{tsv_pos} {tsv_ref}>{tsv_alt} (from TSV line with valid node) not found in VCF.",
+                    #     file=sys.stderr)
 
     except FileNotFoundError:
         print(f"Error: TSV file not found at {tsv_path}", file=sys.stderr)
