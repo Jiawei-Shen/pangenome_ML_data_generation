@@ -3,19 +3,7 @@
 import argparse
 import struct
 import sys
-import re
-from collections import defaultdict
 import pysam  # We need pysam to read VCF files
-
-# This regex helper is useful for parsing VCF AT tags
-_SPLIT = re.compile(r"[><]+")
-
-
-def split_nodes(trav_str):
-    """Parses a vg traversal string like '>1>2>3' into a list of ints."""
-    if not trav_str:
-        return []
-    return [int(tok) for tok in _SPLIT.split(trav_str) if tok]
 
 
 def load_index(idx_path):
@@ -29,13 +17,14 @@ def load_index(idx_path):
                 return {}
             blocks_num, = struct.unpack("<I", blocks_num_bytes)
             for i in range(blocks_num):
-                header_data = f.read(22)
+                # Read only the relevant parts of the header to get the block_id
+                header_data = f.read(22)  # Read the full header
                 if len(header_data) < 22:
                     break
                 block_id, _, _, _, metadata_len = struct.unpack("<I Q I I H", header_data)
                 if metadata_len > 0:
-                    f.read(metadata_len)
-                node_index[block_id] = True
+                    f.read(metadata_len)  # Skip metadata
+                node_index[block_id] = True  # We only care about the existence of the node ID
     except FileNotFoundError:
         print(f"Error: IDX file not found at {idx_path}", file=sys.stderr)
         return {}
@@ -45,63 +34,25 @@ def load_index(idx_path):
     return node_index
 
 
-def build_vcf_node_map(vcf_path):
+def verify_variants_in_vcf(tsv_path, idx_nodes, vcf_path):
     """
-    Scans a VCF file and builds a map from alternate node IDs to their variant info.
-
-    Returns:
-        A dictionary mapping {node_id: [(chrom, pos, ref, alt), ...]}
+    For variants in the TSV file whose nodes are in the index, verifies
+    they exist at the correct locus in a standard VCF file.
     """
-    print("Building map from VCF alternate nodes to variants...", file=sys.stderr)
-    node_map = defaultdict(list)
-    try:
-        vcf = pysam.VariantFile(vcf_path)
-        if "AT" not in vcf.header.info:
-            print("Error: VCF header lacks required INFO/AT tag.", file=sys.stderr)
-            return None
-    except FileNotFoundError:
-        print(f"Error: VCF file not found at {vcf_path}", file=sys.stderr)
-        return None
-    except ValueError as e:
-        print(f"Error: Could not parse VCF file {vcf_path}. It may be corrupted or not a valid VCF. Details: {e}",
-              file=sys.stderr)
-        return None
-
-    for rec in vcf:
-        if "AT" not in rec.info:
-            continue
-
-        ref_nodes = set(split_nodes(rec.info["AT"][0]))
-        for i, alt_allele in enumerate(rec.alts):
-            # The alt path in AT corresponds to the i-th alt allele
-            alt_path_str = rec.info["AT"][i + 1]
-            alt_nodes = set(split_nodes(alt_path_str))
-
-            # Find nodes unique to this alternate path
-            unique_alt_nodes = alt_nodes - ref_nodes
-
-            for node in unique_alt_nodes:
-                variant_info = (rec.contig, rec.pos, rec.ref, alt_allele)
-                node_map[node].append(variant_info)
-
-    print(f"Mapped {len(node_map)} unique nodes from VCF.", file=sys.stderr)
-    return node_map
-
-
-def verify_matches(tsv_path, idx_nodes, vcf_node_map):
-    """
-    Verifies that nodes from a TSV file exist in the index and correspond
-    to the correct variant and locus in the VCF file.
-    """
-    print("Verifying TSV records against index and VCF map...", file=sys.stderr)
+    print("Verifying TSV records against index and VCF...", file=sys.stderr)
     results = {
-        "total_nodes_in_tsv": 0,
-        "nodes_in_idx": 0,
-        "nodes_not_in_vcf_map": 0,
-        "locus_variant_matches": 0,
-        "locus_variant_mismatches": 0,
+        "variants_to_check": 0,
+        "matches_in_vcf": 0,
+        "mismatches_in_vcf": 0
     }
     line_num = 0
+
+    try:
+        # Open the VCF file. It must be indexed (e.g., .vcf.gz.tbi) for fetch to work.
+        vcf_file = pysam.VariantFile(vcf_path)
+    except Exception as e:
+        print(f"Error opening VCF file {vcf_path}. Is it a valid, indexed VCF? Details: {e}", file=sys.stderr)
+        return None
 
     try:
         with open(tsv_path, 'r') as f:
@@ -113,51 +64,46 @@ def verify_matches(tsv_path, idx_nodes, vcf_node_map):
 
                 parts = line.strip().split()
                 if len(parts) < 8:
-                    print(f"Warning: Skipping malformed line {line_num}: expected at least 8 columns.", file=sys.stderr)
                     continue
 
-                # Extract data from TSV based on the format from your other script
-                # CHROM, POS, ID, TYPE, REF_BASE, REF_NODE, ALT_STR, ALT_NODE(S)
+                # Extract variant data from the TSV line
                 tsv_chrom, tsv_pos, _, _, tsv_ref, _, tsv_alt, alt_nodes_str = parts[:8]
                 tsv_pos = int(tsv_pos)
 
+                # First, check if any node on this line is a "matching node" from the index
                 try:
                     node_ids = [int(n) for n in alt_nodes_str.split(',')]
+                    is_node_in_idx = any(nid in idx_nodes for nid in node_ids)
                 except ValueError:
-                    print(f"Warning: Non-integer node ID on line {line_num}: '{alt_nodes_str}'", file=sys.stderr)
+                    is_node_in_idx = False
+
+                # If no nodes from this line are in the index, we skip the VCF check for it.
+                if not is_node_in_idx:
                     continue
 
-                for node_id in node_ids:
-                    results["total_nodes_in_tsv"] += 1
+                results["variants_to_check"] += 1
+                is_variant_in_vcf = False
 
-                    # 1. Check if the node is in the index
-                    if node_id not in idx_nodes:
-                        continue
-                    results["nodes_in_idx"] += 1
+                # Now, query the VCF by coordinate to find the variant
+                try:
+                    # pysam is 0-based, VCF is 1-based. Fetching [pos-1, pos] gets records at that position.
+                    for rec in vcf_file.fetch(tsv_chrom, tsv_pos - 1, tsv_pos):
+                        # We need an exact match on position, reference allele, and one of the alternate alleles
+                        if rec.pos == tsv_pos and rec.ref == tsv_ref and tsv_alt in rec.alts:
+                            is_variant_in_vcf = True
+                            break  # Found it
+                except ValueError:
+                    # This error occurs if the chromosome from the TSV (e.g., "chr1") is not in the VCF header
+                    print(f"Warning: Chromosome '{tsv_chrom}' from TSV line {line_num} not found in VCF.",
+                          file=sys.stderr)
 
-                    # 2. Check if the node was found in the VCF AT tags
-                    if node_id not in vcf_node_map:
-                        results["nodes_not_in_vcf_map"] += 1
-                        print(f"Info: Node {node_id} (from TSV line {line_num}) is valid but not found in VCF AT tags.",
-                              file=sys.stderr)
-                        continue
-
-                    # 3. Verify locus and variant correspondence
-                    is_match_found = False
-                    for vcf_chrom, vcf_pos, vcf_ref, vcf_alt in vcf_node_map[node_id]:
-                        if (vcf_chrom == tsv_chrom and vcf_pos == tsv_pos and
-                                vcf_ref == tsv_ref and vcf_alt == tsv_alt):
-                            is_match_found = True
-                            break  # Found a perfect match
-
-                    if is_match_found:
-                        results["locus_variant_matches"] += 1
-                    else:
-                        results["locus_variant_mismatches"] += 1
-                        print(f"Mismatch: Node {node_id} (TSV line {line_num}) did not correspond to VCF entry.",
-                              file=sys.stderr)
-                        print(f"  - TSV says: {tsv_chrom}:{tsv_pos} {tsv_ref}>{tsv_alt}", file=sys.stderr)
-                        print(f"  - VCF has:  {vcf_node_map[node_id]}", file=sys.stderr)
+                if is_variant_in_vcf:
+                    results["matches_in_vcf"] += 1
+                else:
+                    results["mismatches_in_vcf"] += 1
+                    print(
+                        f"Mismatch: Variant {tsv_chrom}:{tsv_pos} {tsv_ref}>{tsv_alt} (from TSV line with valid node) not found in VCF.",
+                        file=sys.stderr)
 
     except FileNotFoundError:
         print(f"Error: TSV file not found at {tsv_path}", file=sys.stderr)
@@ -175,11 +121,11 @@ def main():
     Main function to orchestrate the node verification process.
     """
     parser = argparse.ArgumentParser(
-        description="Verify that alternate nodes from a TSV file exist in an index and correspond to variants in a VCF."
+        description="For TSV variants whose nodes are in an index, verify they exist in a standard VCF file."
     )
     parser.add_argument("tsv_file", help="Path to the input TSV file.")
     parser.add_argument("idx_file", help="Path to the .idx index file.")
-    parser.add_argument("vcf_file", help="Path to the VCF file with INFO/AT tags.")
+    parser.add_argument("vcf_file", help="Path to the standard, indexed VCF file (.vcf.gz).")
     args = parser.parse_args()
 
     # 1. Load node IDs from the index file
@@ -189,24 +135,15 @@ def main():
     idx_nodes = set(idx_data.keys())
     print(f"Loaded {len(idx_nodes)} unique nodes from the index.", file=sys.stderr)
 
-    # 2. Build the node-to-variant map from the VCF
-    vcf_node_map = build_vcf_node_map(args.vcf_file)
-    if vcf_node_map is None:
-        sys.exit(1)
+    # 2. Verify the relevant TSV records against the VCF
+    results = verify_variants_in_vcf(args.tsv_file, idx_nodes, args.vcf_file)
 
-    # 3. Verify TSV records and get results
-    results = verify_matches(args.tsv_file, idx_nodes, vcf_node_map)
-
-    # 4. Output the final summary
+    # 3. Output the final summary
     if results:
         print("\n--- Verification Summary ---")
-        print(f"Total alternate nodes processed from TSV: {results['total_nodes_in_tsv']}")
-        print(f"Nodes found in the .idx file:           {results['nodes_in_idx']}")
-        print(
-            f"  - Corresponding VCF entries found:      {results['locus_variant_matches'] + results['locus_variant_mismatches']}")
-        print(f"    - Perfect locus & variant matches:    {results['locus_variant_matches']}")
-        print(f"    - Mismatched locus or variant:      {results['locus_variant_mismatches']}")
-        print(f"  - No corresponding VCF entry found:     {results['nodes_not_in_vcf_map']}")
+        print(f"Total variants from TSV with nodes in index: {results['variants_to_check']}")
+        print(f"  - Variants found in VCF at correct locus:    {results['matches_in_vcf']}")
+        print(f"  - Variants NOT found in VCF:                 {results['mismatches_in_vcf']}")
 
 
 if __name__ == "__main__":
