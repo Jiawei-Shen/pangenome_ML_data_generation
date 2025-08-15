@@ -9,35 +9,31 @@ import numpy as np
 from collections import defaultdict
 import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
-import torch
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
 RECORD_STRUCT = struct.Struct("<h150s150s20shc")
 RECORD_SIZE = RECORD_STRUCT.size
 
-# Base to Index Mapping
 BASE_TO_INDEX = {
-    'A': 20, 'C': 30, 'G': 50, 'T': 70,  # Standard bases
-    'N': 10,  # Unknown or ambiguous base
-    '*': 90,  # Deletion character from CIGAR or gap
-    '_PADDING_': 0  # Representing padding, mapped to index 0
+    'A': 20, 'C': 30, 'G': 50, 'T': 70,
+    'N': 10,
+    '*': 90,
+    '_PADDING_': 0
 }
 PADDING_BASE_INDEX = 0
 
-# CIGAR Operation to Index Mapping
 CIGAR_OP_TO_INDEX = {
     'M': 10, 'N': 20, 'S': 30, 'I': 40, 'D': 50, 'H': 60, 'P': 70, '=': 80, 'X': 90,
     '_PADDING_': 0
 }
 CIGAR_PADDING_INDEX = 0
 
-# Index to Base Mapping for console visualization
 INDEX_TO_BASE_FOR_VIEW = {
     20: 'A', 30: 'C', 50: 'G', 70: 'T',
     10: 'N',
     90: '*',
-    0: '0'  # Padding is represented by '0'
+    0: '0'
 }
 
 TENSOR_WINDOW_SIZE = 100
@@ -50,6 +46,7 @@ MISMATCH_COMPARISON_PADDING_VALUE = -1
 # Globals for worker process state
 worker_dat_file = None
 worker_base_output_dir = None
+worker_need_view = False  # <-- gate view building
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -57,18 +54,12 @@ worker_base_output_dir = None
 # ─────────────────────────────────────────────────────────────────────────────
 
 def calculate_window_start(variant_pos, window_size):
-    """
-    Calculates the window's start position to place a variant at the center.
-    The returned start_pos can be negative, indicating left-side padding is needed.
-    """
     center_index = window_size // 2
     return variant_pos - center_index
-
 
 def reverse_complement(sequence):
     complement_map = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")
     return sequence.translate(complement_map)[::-1]
-
 
 def load_full_idx_data(idx_path):
     idx_data_map = {}
@@ -107,7 +98,6 @@ def load_full_idx_data(idx_path):
         sys.stderr.write(f"Error parsing full index file {idx_path}: {e}\n")
         return None
 
-
 def decode_cigar_to_int_ops(cigar_string):
     if not cigar_string or cigar_string == '*': return []
     try:
@@ -115,7 +105,6 @@ def decode_cigar_to_int_ops(cigar_string):
     except Exception as e:
         sys.stderr.write(f"Warning: Could not parse CIGAR string '{cigar_string}': {e}\n")
         return []
-
 
 def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_quality_values, read_cigar_ops_decoded,
                                      target_node_pos, node_sequence,
@@ -174,7 +163,6 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_qu
 
     return None, None
 
-
 def detect_variants_from_cigar(offset_on_node, cigar_ops_decoded, read_sequence, node_sequence):
     variants = []
     node_pos, read_pos = offset_on_node, 0
@@ -200,8 +188,7 @@ def detect_variants_from_cigar(offset_on_node, cigar_ops_decoded, read_sequence,
             variants.append((ref_anchor_pos, 'I', inserted_sequence, ref_base_at_anchor))
             read_pos += length
         elif op == 'D':
-            deleted_sequence_from_ref = node_sequence[
-                                        node_pos: node_pos + length].upper() if node_pos + length <= node_seq_len else ""
+            deleted_sequence_from_ref = node_sequence[node_pos: node_pos + length].upper() if node_pos + length <= node_seq_len else ""
             if deleted_sequence_from_ref:
                 variants.append((node_pos, 'D', "*", deleted_sequence_from_ref))
             node_pos += length
@@ -210,7 +197,6 @@ def detect_variants_from_cigar(offset_on_node, cigar_ops_decoded, read_sequence,
         elif op == 'N':
             node_pos += length
     return variants
-
 
 def get_read_representation_in_window_for_view(segment_cigar_ops, segment_offset_on_node, segment_read_sequence,
                                                window_start_node, window_size, node_len):
@@ -241,7 +227,6 @@ def get_read_representation_in_window_for_view(segment_cigar_ops, segment_offset
         if node_pos >= window_start_node + window_size and read_pos > 0: break
         if read_pos >= read_seq_len: break
     return window_chars
-
 
 def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
                                    segment_read_sequence, segment_quality_values,
@@ -295,11 +280,12 @@ def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
 # Worker Process Initialization and Target Function
 # ─────────────────────────────────────────────────────────────────────────────
 
-def init_worker(dat_file_path_for_worker, base_output_dir_for_worker):
-    global worker_dat_file, worker_base_output_dir
+def init_worker(dat_file_path_for_worker, base_output_dir_for_worker, need_view_flag):
+    global worker_dat_file, worker_base_output_dir, worker_need_view
     try:
         worker_dat_file = open(dat_file_path_for_worker, 'rb')
         worker_base_output_dir = base_output_dir_for_worker
+        worker_need_view = bool(need_view_flag)
     except FileNotFoundError:
         sys.stderr.write(f"Error [Worker {os.getpid()}]: DAT file not found.\n")
         sys.exit(1)
@@ -309,8 +295,11 @@ def init_worker(dat_file_path_for_worker, base_output_dir_for_worker):
 
 
 def process_single_node_for_pileup(task_args):
-    node_id, dat_file_offset, n_records, node_sequence, genomead_af_list, min_af_threshold, min_variants_threshold, min_allele_bq_threshold, variant_type_to_process = task_args
-    global worker_dat_file, worker_base_output_dir
+    (node_id, dat_file_offset, n_records, node_sequence, genomead_af_list,
+     min_af_threshold, min_variants_threshold, min_allele_bq_threshold,
+     variant_type_to_process) = task_args
+
+    global worker_dat_file, worker_base_output_dir, worker_need_view
 
     tensor_files_generated_for_node = 0
     if worker_dat_file is None or worker_base_output_dir is None:
@@ -318,19 +307,21 @@ def process_single_node_for_pileup(task_args):
     if not node_sequence:
         return node_id, {}, tensor_files_generated_for_node
 
-    node_specific_output_dir = os.path.join(worker_base_output_dir, str(node_id))
-    os.makedirs(node_specific_output_dir, exist_ok=True)
-
     node_len = len(node_sequence)
     aligned_read_segments = []
-    try:
-        worker_dat_file.seek(dat_file_offset + 10)
-        for _ in range(n_records):
-            data = worker_dat_file.read(RECORD_SIZE)
-            if len(data) < RECORD_SIZE: break
 
-            off_from_file, raw_seq, raw_qual, raw_cigar, mapq_val, strand_byte = RECORD_STRUCT.unpack(data)
-            if mapq_val < 10: continue
+    try:
+        # Bulk read all records for this node and iter-unpack (fast!)
+        worker_dat_file.seek(dat_file_offset + 10)
+        bulk = worker_dat_file.read(n_records * RECORD_SIZE)
+        if len(bulk) < n_records * RECORD_SIZE:
+            # fall back gracefully on partial reads
+            n_records = len(bulk) // RECORD_SIZE
+            bulk = bulk[: n_records * RECORD_SIZE]
+
+        for (off_from_file, raw_seq, raw_qual, raw_cigar, mapq_val, strand_byte) in RECORD_STRUCT.iter_unpack(bulk):
+            if mapq_val < 10:
+                continue
 
             try:
                 seq = raw_seq.rstrip(b'\0').decode('ascii', 'replace')
@@ -340,10 +331,12 @@ def process_single_node_for_pileup(task_args):
             except UnicodeDecodeError:
                 continue
 
-            if not seq or len(seq) != len(qual_values): continue
+            if not seq or len(seq) != len(qual_values):
+                continue
 
             original_decoded_cigar_ops = decode_cigar_to_int_ops(cigar_str_original)
-            if not original_decoded_cigar_ops and cigar_str_original != '*': continue
+            if not original_decoded_cigar_ops and cigar_str_original != '*':
+                continue
 
             current_read_sequence = seq
             current_quality_values = qual_values
@@ -353,9 +346,7 @@ def process_single_node_for_pileup(task_args):
             if strand_char == '-':
                 current_read_sequence = reverse_complement(seq)
                 current_quality_values = qual_values[::-1]
-                current_decoded_cigar_ops = [op for op in
-                                             reversed(original_decoded_cigar_ops)] if original_decoded_cigar_ops else []
-
+                current_decoded_cigar_ops = [op for op in reversed(original_decoded_cigar_ops)] if original_decoded_cigar_ops else []
                 alignment_span_on_node = len(current_read_sequence)
                 current_offset_on_node = node_len - alignment_span_on_node - off_from_file
                 if current_offset_on_node < 0:
@@ -383,16 +374,17 @@ def process_single_node_for_pileup(task_args):
                 seg["offset_on_node"], seg["cigar_ops"], seg["read_sequence"], node_sequence):
             candidate_variants[(v_pos, v_type, v_ref, v_alt)] += 1
 
+    # Only allocate/build view data if requested
+    view_oriented_variant_data = {} if worker_need_view else None
     variant_headers_for_summary = []
-    view_oriented_variant_data = {}
 
     for (v_pos, v_type, v_ref_from_cigar, v_alt_from_cigar), _ in candidate_variants.items():
         if variant_type_to_process == 'snp' and v_type != 'X':
             continue
-        if variant_type_to_process == 'indel' and v_type not in ('I', 'D'):
+        if variant_type_to_process == 'indel' and (v_type not in ('I', 'D')):
             continue
 
-        alt_allele_count, ref_allele_count, other_allele_count, locus_coverage = 0, 0, 0, 0
+        alt_allele_count = ref_allele_count = other_allele_count = locus_coverage = 0
         alt_allele_base_qualities = []
 
         expected_ref_for_af = v_ref_from_cigar
@@ -404,10 +396,7 @@ def process_single_node_for_pileup(task_args):
             if 0 <= v_pos < node_len: expected_ref_for_af = node_sequence[v_pos]
             ref_allele_for_indel_context = v_ref_from_cigar
         elif v_type == 'I':
-            if 0 <= v_pos < node_len:
-                expected_ref_for_af = node_sequence[v_pos]
-            else:
-                expected_ref_for_af = "*"
+            expected_ref_for_af = node_sequence[v_pos] if 0 <= v_pos < node_len else "*"
             ref_allele_for_indel_context = expected_ref_for_af
 
         for seg in aligned_read_segments:
@@ -433,57 +422,54 @@ def process_single_node_for_pileup(task_args):
             current_alt_freq = alt_allele_count / locus_coverage if locus_coverage > 0 else 0.0
             if current_alt_freq < min_af_threshold:
                 continue
-            mean_alt_bq = sum(alt_allele_base_qualities) / len(
-                alt_allele_base_qualities) if alt_allele_base_qualities else 0.0
+            mean_alt_bq = sum(alt_allele_base_qualities) / len(alt_allele_base_qualities) if alt_allele_base_qualities else 0.0
             if mean_alt_bq < min_allele_bq_threshold:
                 continue
 
         current_alt_freq = alt_allele_count / locus_coverage if locus_coverage > 0 else 0.0
-        mean_alt_bq = sum(alt_allele_base_qualities) / len(
-            alt_allele_base_qualities) if alt_allele_base_qualities else 0.0
+        mean_alt_bq = sum(alt_allele_base_qualities) / len(alt_allele_base_qualities) if alt_allele_base_qualities else 0.0
 
         variant_key_string = f"{v_pos}_{v_type}_{v_ref_from_cigar}_{v_alt_from_cigar}"
         window_center_pos = v_pos + 1 if v_type == 'I' else v_pos
         window_start_pos = calculate_window_start(window_center_pos, TENSOR_WINDOW_SIZE)
 
-        pileup_data_for_view_json = []
-        for read_segment_idx, seg_data in enumerate(aligned_read_segments):
-            if read_segment_idx >= TENSOR_MAX_READ_ROWS + 50: break
-            row_chars_for_view = get_read_representation_in_window_for_view(
-                seg_data["cigar_ops"], seg_data["offset_on_node"], seg_data["read_sequence"],
-                window_start_pos, TENSOR_WINDOW_SIZE, node_len)
-            if any(char != ' ' for char in row_chars_for_view):
-                bases_for_view = [
-                    (PADDING_BASE_INDEX if char == ' ' else BASE_TO_INDEX.get(char.upper(), BASE_TO_INDEX['N'])) for
-                    char in row_chars_for_view]
-                pileup_data_for_view_json.append({
-                    "bases": bases_for_view,
-                    "offset": seg_data["offset_on_node"],
-                    "strand": seg_data["strand"],
-                    "cigar": seg_data["original_cigar_str"]
-                })
-        view_oriented_variant_data[variant_key_string] = {
-            "pileup_reads_data": pileup_data_for_view_json[:TENSOR_MAX_READ_ROWS],
-            "alt_allele_count": alt_allele_count, "ref_allele_count_at_locus": ref_allele_count,
-            "other_allele_count_at_locus": other_allele_count, "coverage_at_locus": locus_coverage,
-            "alt_allele_frequency": round(current_alt_freq, 4),
-            "mean_alt_allele_base_quality": round(mean_alt_bq, 2)
-        }
+        # View data (gated)
+        if worker_need_view:
+            pileup_data_for_view_json = []
+            for read_segment_idx, seg_data in enumerate(aligned_read_segments[: TENSOR_MAX_READ_ROWS + 50]):
+                row_chars_for_view = get_read_representation_in_window_for_view(
+                    seg_data["cigar_ops"], seg_data["offset_on_node"], seg_data["read_sequence"],
+                    window_start_pos, TENSOR_WINDOW_SIZE, node_len)
+                if any(char != ' ' for char in row_chars_for_view):
+                    bases_for_view = [
+                        (PADDING_BASE_INDEX if char == ' ' else BASE_TO_INDEX.get(char.upper(), BASE_TO_INDEX['N']))
+                        for char in row_chars_for_view
+                    ]
+                    pileup_data_for_view_json.append({
+                        "bases": bases_for_view,
+                        "offset": seg_data["offset_on_node"],
+                        "strand": seg_data["strand"],
+                        "cigar": seg_data["original_cigar_str"]
+                    })
+            view_oriented_variant_data[variant_key_string] = {
+                "pileup_reads_data": pileup_data_for_view_json[:TENSOR_MAX_READ_ROWS],
+                "alt_allele_count": alt_allele_count, "ref_allele_count_at_locus": ref_allele_count,
+                "other_allele_count_at_locus": other_allele_count, "coverage_at_locus": locus_coverage,
+                "alt_allele_frequency": round(current_alt_freq, 4),
+                "mean_alt_allele_base_quality": round(mean_alt_bq, 2)
+            }
 
-        ch1_list, ch2_list, ch3_list, ch4_list, ch5_list, ch6_list = [], [], [], [], [], []
-
+        # Build channels
         ref_base_indices_row = [PADDING_BASE_INDEX] * TENSOR_WINDOW_SIZE
         for i, node_pos_in_window in enumerate(range(window_start_pos, window_start_pos + TENSOR_WINDOW_SIZE)):
             if 0 <= node_pos_in_window < node_len:
-                ref_base_indices_row[i] = BASE_TO_INDEX.get(node_sequence[node_pos_in_window].upper(),
-                                                            BASE_TO_INDEX['N'])
+                ref_base_indices_row[i] = BASE_TO_INDEX.get(node_sequence[node_pos_in_window].upper(), BASE_TO_INDEX['N'])
 
         genomead_af_row = [0] * TENSOR_WINDOW_SIZE
         if genomead_af_list:
             for i, node_pos_in_window in enumerate(range(window_start_pos, window_start_pos + TENSOR_WINDOW_SIZE)):
                 if 0 <= node_pos_in_window < node_len:
                     af_value = genomead_af_list[node_pos_in_window]
-
                     if af_value == 0.0:
                         scaled_af = 0
                     else:
@@ -492,17 +478,30 @@ def process_single_node_for_pileup(task_args):
                         scaled_af = max(1, min(int(inverted_phred), 127))
                     genomead_af_row[i] = scaled_af
 
-        ch1_list.append(ref_base_indices_row)
-        ch2_list.append([DEFAULT_QUALITY_PADDING] * TENSOR_WINDOW_SIZE)
-        ch3_list.append([MISMATCH_CHANNEL_REF_ROW_VALUE] * TENSOR_WINDOW_SIZE)
-        ch4_list.append([DEFAULT_MAPPING_QUALITY_PADDING] * TENSOR_WINDOW_SIZE)
-        ch5_list.append([CIGAR_PADDING_INDEX] * TENSOR_WINDOW_SIZE)
-        ch6_list.append(genomead_af_row)
+        # Pre-allocate numpy arrays for speed (drop Torch)
+        H = 1 + TENSOR_MAX_READ_ROWS
+        W = TENSOR_WINDOW_SIZE
+        ch1 = np.full((H, W), PADDING_BASE_INDEX, dtype=np.int8)
+        ch2 = np.full((H, W), DEFAULT_QUALITY_PADDING, dtype=np.int8)
+        ch3 = np.full((H, W), MISMATCH_COMPARISON_PADDING_VALUE, dtype=np.int8)
+        ch4 = np.full((H, W), DEFAULT_MAPPING_QUALITY_PADDING, dtype=np.int8)
+        ch5 = np.full((H, W), CIGAR_PADDING_INDEX, dtype=np.int8)
+        ch6 = np.zeros((H, W), dtype=np.int8)
 
+        # Row 0: reference/context rows
+        ch1[0, :] = np.asarray(ref_base_indices_row, dtype=np.int8)
+        ch2[0, :] = DEFAULT_QUALITY_PADDING
+        ch3[0, :] = MISMATCH_CHANNEL_REF_ROW_VALUE
+        ch4[0, :] = DEFAULT_MAPPING_QUALITY_PADDING
+        ch5[0, :] = CIGAR_PADDING_INDEX
+        ch6[0, :] = np.asarray(genomead_af_row, dtype=np.int8)
+
+        # Reads
         reads_added = 0
+        variant_window_index = v_pos - window_start_pos
         for seg_data in aligned_read_segments:
-            if reads_added >= TENSOR_MAX_READ_ROWS: break
-
+            if reads_added >= TENSOR_MAX_READ_ROWS:
+                break
             mapq = max(0, min(int(seg_data["mapping_quality"]), 127))
             base_idx_row, quality_score_row, mapq_row, cigar_op_row = get_read_tensor_rows_in_window(
                 seg_data["cigar_ops"], seg_data["offset_on_node"],
@@ -511,46 +510,35 @@ def process_single_node_for_pileup(task_args):
                 window_start_pos, TENSOR_WINDOW_SIZE, node_len)
 
             if any(b != PADDING_BASE_INDEX for b in base_idx_row):
-                ch1_list.append(base_idx_row)
-                ch2_list.append(quality_score_row)
-
-                variant_window_index = v_pos - window_start_pos
-                mismatch_flags_row = []
-                for i in range(TENSOR_WINDOW_SIZE):
-                    read_base_idx = base_idx_row[i]
-                    ref_base_idx = ref_base_indices_row[i]
-
-                    if read_base_idx == PADDING_BASE_INDEX or ref_base_idx == PADDING_BASE_INDEX:
-                        mismatch_flags_row.append(MISMATCH_COMPARISON_PADDING_VALUE)
-                    elif read_base_idx == ref_base_idx:
-                        mismatch_flags_row.append(0)
-                    else:
-                        if i == variant_window_index:
-                            mismatch_flags_row.append(5)
-                        else:
-                            mismatch_flags_row.append(1)
-
-                ch3_list.append(mismatch_flags_row)
-                ch4_list.append(mapq_row)
-                ch5_list.append(cigar_op_row)
-                ch6_list.append(genomead_af_row)
+                r = 1 + reads_added
+                ch1[r, :] = np.asarray(base_idx_row, dtype=np.int8)
+                ch2[r, :] = np.asarray(quality_score_row, dtype=np.int8)
+                # mismatch flags
+                # (vectorized-ish without heavy Python loops)
+                ref_row = ch1[0, :].astype(np.int16)
+                read_row = ch1[r, :].astype(np.int16)
+                flags = np.full(W, MISMATCH_COMPARISON_PADDING_VALUE, dtype=np.int8)
+                mask_valid = (read_row != PADDING_BASE_INDEX) & (ref_row != PADDING_BASE_INDEX)
+                flags[mask_valid] = (read_row[mask_valid] != ref_row[mask_valid]).astype(np.int8)
+                if 0 <= variant_window_index < W and mask_valid[variant_window_index] and flags[variant_window_index] == 1:
+                    flags[variant_window_index] = 5  # highlight focal mismatch
+                ch3[r, :] = flags
+                ch4[r, :] = np.asarray(mapq_row, dtype=np.int8)
+                ch5[r, :] = np.asarray(cigar_op_row, dtype=np.int8)
+                ch6[r, :] = ch6[0, :]  # reuse AF row
                 reads_added += 1
 
-        for _ in range(TENSOR_MAX_READ_ROWS - reads_added):
-            ch1_list.append([PADDING_BASE_INDEX] * TENSOR_WINDOW_SIZE)
-            ch2_list.append([DEFAULT_QUALITY_PADDING] * TENSOR_WINDOW_SIZE)
-            ch3_list.append([MISMATCH_COMPARISON_PADDING_VALUE] * TENSOR_WINDOW_SIZE)
-            ch4_list.append([DEFAULT_MAPPING_QUALITY_PADDING] * TENSOR_WINDOW_SIZE)
-            ch5_list.append([CIGAR_PADDING_INDEX] * TENSOR_WINDOW_SIZE)
-            ch6_list.append([0] * TENSOR_WINDOW_SIZE)
+        # Save .npy directly (NumPy only)
+        tensor = np.stack([ch1, ch2, ch3, ch4, ch5, ch6], axis=0)  # (6, H, W), int8
 
+        # Lazily create directory only if we’re actually saving
+        node_specific_output_dir = os.path.join(worker_base_output_dir, str(node_id))
+        os.makedirs(node_specific_output_dir, exist_ok=True)
+
+        tensor_filename_npy = f"{variant_key_string}.npy"
+        tensor_filepath_npy = os.path.join(node_specific_output_dir, tensor_filename_npy)
         try:
-            tensor_chw = torch.tensor([ch1_list, ch2_list, ch3_list, ch4_list, ch5_list, ch6_list], dtype=torch.int8)
-            numpy_array_to_save = tensor_chw.numpy()
-            tensor_filename_npy = f"{variant_key_string}.npy"
-            tensor_filepath_npy = os.path.join(node_specific_output_dir, tensor_filename_npy)
-            np.save(tensor_filepath_npy, numpy_array_to_save)
-
+            np.save(tensor_filepath_npy, tensor)
             variant_headers_for_summary.append({
                 "variant_key": variant_key_string, "tensor_file": tensor_filename_npy,
                 "alt_allele_count": alt_allele_count, "ref_allele_count_at_locus": ref_allele_count,
@@ -563,12 +551,12 @@ def process_single_node_for_pileup(task_args):
             sys.stderr.write(f"Error creating/saving tensor for {variant_key_string}: {e}\n")
 
     if variant_headers_for_summary:
-        summary_path = os.path.join(node_specific_output_dir, "variant_summary.json")
+        summary_path = os.path.join(worker_base_output_dir, str(node_id), "variant_summary.json")
         with open(summary_path, 'w') as f:
             json.dump({"node_id": node_id, "node_length": node_len,
                        "variants_passing_af_filter": variant_headers_for_summary}, f, indent=2)
 
-    return node_id, view_oriented_variant_data, tensor_files_generated_for_node
+    return node_id, (view_oriented_variant_data or {}), tensor_files_generated_for_node
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -638,28 +626,26 @@ def main():
     parser.add_argument("dat", help=".dat alignment file")
     parser.add_argument("idx", help=".idx index file")
     parser.add_argument("output", help="Base output directory")
-
     parser.add_argument("candidate_variants_json",
                         help="JSON file containing nodes and their sequences to process.")
-
     parser.add_argument("--num_workers", type=int, default=os.cpu_count(), help="Number of worker processes")
     parser.add_argument("--view", nargs='?', const=-1, default=None, type=int, metavar='N',
                         help="Print pileups for top N variants per node (-1 for all)")
     parser.add_argument("--max_view_reads", type=int, default=20, help="Max reads to show per pileup in view mode")
-
     parser.add_argument("--min_af", type=float, default=0.1, help="Minimum allele frequency to process a variant")
     parser.add_argument("--min_variants", type=int, default=3, help="Alternate allele count must be >= this value")
     parser.add_argument("--min_allele_bq", type=float, default=10.0,
                         help="Minimum mean base quality of allele-supporting bases")
-
     parser.add_argument("--variant_type", type=str, default='all', choices=['snp', 'indel', 'all'],
                         help="Type of variants to output tensors for: 'snp', 'indel', or 'all'.")
-
     args = parser.parse_args()
 
     if not all([os.path.isfile(args.dat), os.path.isfile(args.idx), os.path.isfile(args.candidate_variants_json)]):
         sys.exit("Error: One or more input files (dat, idx, or json) were not found.")
     os.makedirs(args.output, exist_ok=True)
+
+    # Gate view-building in workers
+    need_view = args.view is not None
 
     node_sequences = {}
     node_af_data = {}
@@ -702,6 +688,9 @@ def main():
     if not tasks:
         sys.exit("No valid tasks to run after processing JSON and index file.")
 
+    # Sort by DAT offset → streaming I/O instead of random seeks
+    tasks.sort(key=lambda t: t[1])
+
     print(f"\nSubmitting {len(tasks)} tasks to {args.num_workers} workers...")
     total_tensors = 0
     nodes_processed_since_last_report = 0
@@ -709,7 +698,7 @@ def main():
     batch_start_time = time.time()
 
     with ProcessPoolExecutor(max_workers=args.num_workers, initializer=init_worker,
-                             initargs=(args.dat, args.output)) as executor:
+                             initargs=(args.dat, args.output, need_view)) as executor:
         future_to_node = {executor.submit(process_single_node_for_pileup, task): task[0] for task in tasks}
 
         for i, future in enumerate(as_completed(future_to_node)):
@@ -720,7 +709,7 @@ def main():
                 total_tensors += tensor_count
                 tensors_since_last_report += tensor_count
 
-                if args.view is not None and view_data:
+                if need_view and view_data:
                     node_sequence_for_view = node_sequences.get(node_id, "")
                     display_pileup_data(view_data, str(node_id), node_sequence_for_view, args.max_view_reads,
                                         args.view if args.view != -1 else float('inf'))
