@@ -10,6 +10,7 @@ from collections import defaultdict
 import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import torch
+import shutil, sys
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -37,6 +38,11 @@ worker_base_output_dir = None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
+def _print_progress(s: str):
+    # Clear the current line then write new status. Works on most terminals.
+    sys.stdout.write("\r\033[K" + s)
+    sys.stdout.flush()
+
 def calculate_window_start(variant_pos, window_size):
     return variant_pos - (window_size // 2)
 
@@ -606,12 +612,9 @@ def main():
 
     print(f"\nSubmitting {len(tasks)} tasks to {args.num_workers} workers...")
     total_tensors = 0
-    total_nodes_done = 0
-    milestone_step = 10_000
+    milestone_step = 10_000  # change if you want a different cadence
     next_milestone = milestone_step
-
-    t0 = time.time()
-    last_update = t0
+    start_time = time.time()
 
     with ProcessPoolExecutor(max_workers=args.num_workers, initializer=init_worker,
                              initargs=(args.dat, args.output)) as executor:
@@ -624,34 +627,41 @@ def main():
                 total_tensors += tensor_count
 
                 if args.view is not None and view_data:
-                    node_sequence_for_view = node_sequences.get(node_id, "")
+                    node_seq_for_view = (node_sequences.get(node_id) or
+                                         node_sequences_fallback.get(node_id,
+                                                                     "")) if 'node_sequences_fallback' in locals() else node_sequences.get(
+                        node_id, "")
                     display_pileup_data(
-                        view_data, str(node_id), node_sequence_for_view,
-                        args.max_view_reads, (args.view if args.view != -1 else float('inf')),
+                        view_data, str(node_id), node_seq_for_view,
+                        args.max_view_reads,
+                        (args.view if args.view != -1 else float('inf')),
                         show_empty_info=args.show_empty_info
                     )
             except Exception as e:
-                print(f"\nError processing node {node_id}: {e}", file=sys.stderr)
+                # break the flashing line cleanly, log error on its own line
+                sys.stdout.write("\n")
+                print(f"Error processing node {node_id}: {e}", file=sys.stderr)
 
-            # progress accounting
-            total_nodes_done = i
-            now = time.time()
-            elapsed = max(now - t0, 1e-6)
-            rate = total_nodes_done / elapsed
+            elapsed = max(time.time() - start_time, 1e-9)
+            rate = i / elapsed
+            status = (f"Processed {i:,}/{len(tasks):,} nodes  |  {rate:,.1f} nodes/s  "
+                      f"|  tensors: {total_tensors:,}  |  elapsed: {elapsed:,.1f}s")
 
-            # live status line (overwrites itself)
-            print(f"\rProcessed {total_nodes_done}/{len(tasks)} nodes | "
-                  f"{rate:,.1f} nodes/s | tensors: {total_tensors} | elapsed: {elapsed:,.1f}s",
-                  end='', flush=True)
+            # <<< flashing single line
+            _print_progress(status)
 
-            # milestone every 10,000 nodes (persistent line)
-            if total_nodes_done >= next_milestone:
-                print(f"\n[Milestone] {total_nodes_done:,} nodes processed "
-                      f"({rate:,.1f} nodes/s). Total tensors: {total_tensors}. Elapsed: {elapsed:,.1f}s.")
+            # milestone (persistent line), then resume flashing
+            if i >= next_milestone:
+                sys.stdout.write("\n")  # finalize the flashing line
+                print(f"[Milestone] {i:,} nodes processed  ({rate:,.1f} nodes/s).  "
+                      f"Total tensors: {total_tensors:,}.  Elapsed: {elapsed:,.1f}s.")
                 next_milestone += milestone_step
+                # immediately re-render the flashing line (so it keeps updating)
+                _print_progress(status)
 
-    # final newline so the prompt isn't stuck at end of the status line
-    print("\n\nProcessing complete. Total tensors generated:", total_tensors)
+    # end-of-run: finalize with a newline so the shell prompt isn’t stuck on the status line
+    sys.stdout.write("\n")
+    print(f"Processing complete. Total tensors generated: {total_tensors:,}.")
 
 
 if __name__ == '__main__':
