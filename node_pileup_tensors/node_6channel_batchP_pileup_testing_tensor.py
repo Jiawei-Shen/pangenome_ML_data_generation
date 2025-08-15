@@ -489,8 +489,13 @@ def process_single_node_for_pileup(task_args):
             ch6_list.append([0] * TENSOR_WINDOW_SIZE)
 
         # Save tensor directly via NumPy (faster than torch->numpy)
+        # Save tensor directly with NumPy (no torch)
         try:
-            H = len(ch1_list)
+            H = len(ch1_list)  # 1 ref row + up to TENSOR_MAX_READ_ROWS + padding rows
+            tensor_filename_npy = f"{variant_key_string}.npy"
+            tensor_filepath_npy = os.path.join(node_specific_output_dir, tensor_filename_npy)
+
+            # Preallocate and fill (C, H, W)
             arr = np.empty((6, H, TENSOR_WINDOW_SIZE), dtype=np.int8)
             arr[0] = np.asarray(ch1_list, dtype=np.int8)
             arr[1] = np.asarray(ch2_list, dtype=np.int8)
@@ -498,10 +503,11 @@ def process_single_node_for_pileup(task_args):
             arr[3] = np.asarray(ch4_list, dtype=np.int8)
             arr[4] = np.asarray(ch5_list, dtype=np.int8)
             arr[5] = np.asarray(ch6_list, dtype=np.int8)
-            np.save(os.path.join(node_specific_output_dir, f"{variant_key_string}.npy"), arr)
+
+            np.save(tensor_filepath_npy, arr)
 
             variant_headers_for_summary.append({
-                "variant_key": variant_key_string, "tensor_file": f"{variant_key_string}.npy",
+                "variant_key": variant_key_string, "tensor_file": tensor_filename_npy,
                 "alt_allele_count": alt_allele_count, "ref_allele_count_at_locus": ref_allele_count,
                 "other_allele_count_at_locus": other_allele_count, "coverage_at_locus": locus_coverage,
                 "alt_allele_frequency": round(current_alt_freq, 4),
