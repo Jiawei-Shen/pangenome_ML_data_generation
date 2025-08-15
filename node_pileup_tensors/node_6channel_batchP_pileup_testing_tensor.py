@@ -587,4 +587,49 @@ def main():
                 continue
             af_list = []  # ← channel 6 zeros for non-primary nodes
             matched_fallback += 1
-        tas
+        tasks.append((node_id, offset, n_records, seq, af_list,
+                      args.min_af, args.min_variants, args.min_allele_bq, args.variant_type))
+
+    if not tasks:
+        sys.exit("No valid tasks to run: could not find sequences for any index nodes.")
+
+    print(f"Matched {matched_primary} nodes with AF (from primary JSON) and {matched_fallback} nodes without AF (ch6=0).")
+    if skipped_no_seq:
+        print(f"Warning: {skipped_no_seq} index nodes were skipped due to missing sequence in both JSONs.", file=sys.stderr)
+
+    print(f"\nSubmitting {len(tasks)} tasks to {args.num_workers} workers...")
+    total_tensors = 0
+    nodes_processed_since_last_report = 0
+    tensors_since_last_report = 0
+    batch_start_time = time.time()
+
+    with ProcessPoolExecutor(max_workers=args.num_workers, initializer=init_worker,
+                             initargs=(args.dat, args.output)) as executor:
+        fut2node = {executor.submit(process_single_node_for_pileup, t): t[0] for t in tasks}
+        for i, fut in enumerate(as_completed(fut2node)):
+            node_id = fut2node[fut]
+            nodes_processed_since_last_report += 1
+            try:
+                _, view_data, tensor_count = fut.result()
+                total_tensors += tensor_count
+                tensors_since_last_report += tensor_count
+                if args.view is not None and view_data:
+                    node_seq_for_view = (node_sequences_primary.get(node_id) or node_sequences_fallback.get(node_id) or "")
+                    display_pileup_data(view_data, str(node_id), node_seq_for_view, args.max_view_reads,
+                                        args.view if args.view != -1 else float('inf'))
+            except Exception as e:
+                print(f"Error processing node {node_id}: {e}", file=sys.stderr)
+
+            if nodes_processed_since_last_report >= 1000 or (i + 1) == len(tasks):
+                elapsed = time.time() - batch_start_time
+                rate = nodes_processed_since_last_report / elapsed if elapsed > 0 else 0
+                print(f"  Processed batch of {nodes_processed_since_last_report} nodes (total: {i+1}/{len(tasks)}) in {elapsed:.2f}s "
+                      f"({rate:.1f} nodes/sec). Tensors in batch: {tensors_since_last_report}. Total tensors: {total_tensors}.")
+                nodes_processed_since_last_report = 0
+                tensors_since_last_report = 0
+                batch_start_time = time.time()
+
+    print(f"\nProcessing complete. Total tensors generated: {total_tensors}.")
+
+if __name__ == '__main__':
+    main()
