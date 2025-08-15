@@ -281,14 +281,13 @@ def process_single_node_for_pileup(task_args):
         # Position to start of this node's records; "+10" as in your original code
         worker_dat_file.seek(dat_file_offset + 10)
         buf = worker_dat_file.read(RECORD_SIZE * n_records)
-        # Bulk decode of records
+        # Bulk decode of records using iter_unpack
         for off_from_file, raw_seq, raw_qual, raw_cigar, mapq_val, strand_byte in RECORD_STRUCT.iter_unpack(buf):
             if mapq_val < 10:
                 continue
             try:
                 seq = raw_seq.rstrip(b'\0').decode('ascii', 'replace')
-                # Keep as list for simplicity; (can switch to np.frombuffer for more speed)
-                qual_values = list(raw_qual.rstrip(b'\0'))
+                qual_values = list(raw_qual.rstrip(b'\0'))  # could swap to np.frombuffer for extra speed
                 cigar_str_original = raw_cigar.rstrip(b'\0').decode('ascii', 'replace')
                 strand_char = strand_byte.decode('ascii')
             except UnicodeDecodeError:
@@ -512,7 +511,6 @@ def process_single_node_for_pileup(task_args):
         except Exception as e:
             sys.stderr.write(f"Error creating/saving tensor for {variant_key_string}: {e}\n")
 
-    # Optional per-node summary (kept on; add a --no_summary if you want to skip)
     if variant_headers_for_summary:
         with open(os.path.join(node_specific_output_dir, "variant_summary.json"), 'w') as f:
             json.dump({"node_id": node_id, "node_length": node_len,
@@ -664,7 +662,6 @@ def main():
     matched_primary = matched_fallback = skipped_no_seq = 0
     need_view = (args.view is not None)
 
-    # Sort tasks by DAT offset for more sequential I/O
     for node_id, (offset, n_records) in full_idx_data.items():
         if node_id in node_sequences_primary:
             seq = node_sequences_primary[node_id]
@@ -684,7 +681,7 @@ def main():
     if not tasks:
         sys.exit("No valid tasks to run: could not find sequences for any index nodes.")
 
-    tasks.sort(key=lambda t: t[1])  # sort by dat_file_offset
+    tasks.sort(key=lambda t: t[1])  # sort by dat_file_offset for sequential I/O
 
     print(f"Matched {matched_primary} nodes with AF (primary JSON) and {matched_fallback} nodes without AF (ch6=0).")
     if skipped_no_seq:
@@ -693,8 +690,6 @@ def main():
     print(f"\nSubmitting {len(tasks)} tasks to {args.num_workers} workers...")
 
     total_tensors = 0
-    milestone_step = 10_000
-    next_milestone = milestone_step
     start_time = time.time()
 
     with ProcessPoolExecutor(max_workers=args.num_workers, initializer=init_worker,
@@ -724,14 +719,7 @@ def main():
             status = (f"Processed {i:,}/{len(tasks):,} nodes  |  {rate:,.1f} nodes/s  "
                       f"|  tensors: {total_tensors:,}  |  elapsed: {elapsed:,.1f}s")
 
-            _print_progress(status)  # flashing one-liner
-
-            if i >= next_milestone:
-                sys.stdout.write("\n")
-                print(f"[Milestone] {i:,} nodes processed  ({rate:,.1f} nodes/s).  "
-                      f"Total tensors: {total_tensors:,}.  Elapsed: {elapsed:,.1f}s.")
-                next_milestone += milestone_step
-                _print_progress(status)
+            _print_progress(status)  # flashing one-liner only (no milestone lines)
 
     sys.stdout.write("\n")
     print(f"Processing complete. Total tensors generated: {total_tensors:,}.")
