@@ -1,215 +1,240 @@
 #!/usr/bin/env python3
-import argparse
-import json
-import os
-import shutil
-import sys
-import time
-import random
+import argparse, json, os, shutil, sys, time, random
 from multiprocessing import Pool, cpu_count
+from typing import Dict, Iterable, List, Set, Tuple
 import pysam
 
-node_positions = {}
+# ----------------------- worker globals (set via initializer) -----------------
+G_VCF = None              # pysam.VariantFile handle
+G_CHR = None              # chromosome string
+G_NODE_POS: Dict[str,int] = {}
+G_TRUE_DIR = None
+G_FALSE_DIR = None
+G_USE_SYMLINKS = False
 
-def format_time(seconds):
+def _init_worker(vcf_path: str, chrom: str, node_pos: Dict[str,int],
+                 true_dir: str, false_dir: str, use_symlinks: bool):
+    """Called once per worker; avoids pickling huge objects per task."""
+    global G_VCF, G_CHR, G_NODE_POS, G_TRUE_DIR, G_FALSE_DIR, G_USE_SYMLINKS
+    G_VCF = pysam.VariantFile(vcf_path)
+    G_CHR = chrom
+    G_NODE_POS = node_pos
+    G_TRUE_DIR = true_dir
+    G_FALSE_DIR = false_dir
+    G_USE_SYMLINKS = use_symlinks
+# ------------------------------------------------------------------------------
+
+def format_time(seconds: float) -> str:
     seconds = int(seconds)
-    hours, remainder = divmod(seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    return f"{hours:02}:{minutes:02}:{seconds:02}"
+    h, r = divmod(seconds, 3600); m, s = divmod(r, 60)
+    return f"{h:02}:{m:02}:{s:02}"
 
-def get_variant_count(vcf_file_path, chromosome):
-    print(f"Counting variants in {os.path.basename(vcf_file_path)} for {chromosome}...")
-    count = 0
-    try:
-        with pysam.VariantFile(vcf_file_path) as vcf_in:
-            for record in vcf_in.fetch(chromosome):
-                if record.alts:
-                    count += len(record.alts)
-        return count
-    except Exception as e:
-        print(f"Error loading VCF: {e}", file=sys.stderr)
-        return -1
+def list_node_dirs(base: str) -> Iterable[str]:
+    for e in os.scandir(base):
+        if e.is_dir():
+            yield e.path
 
-def query_vcf_for_chromosome(vcf_file_path, chromosome):
-    local_variants = set()
+def load_needed_node_positions(json_path: str, needed_ids: Set[str]) -> Dict[str,int]:
+    """Only keep node_ids that exist in the tensor folder."""
+    # Try streaming if ijson is available
     try:
-        with pysam.VariantFile(vcf_file_path) as vcf_in:
-            for record in vcf_in.fetch(chromosome):
-                pos = record.pos
-                ref = record.ref.upper()
-                if record.alts:
-                    for alt in record.alts:
-                        local_variants.add((pos, ref, alt.upper()))
-        return local_variants
-    except Exception as e:
-        print(f"Failed to read VCF: {e}", file=sys.stderr)
-        return set()
-
-def load_node_positions(json_path):
-    try:
+        import ijson  # type: ignore
+        pos: Dict[str,int] = {}
+        with open(json_path, "rb") as f:
+            for node in ijson.items(f, "nodes.item"):
+                nid = str(node.get("node_id"))
+                if nid in needed_ids:
+                    p = node.get("grch38_position_start")
+                    if isinstance(p, int):
+                        pos[nid] = p
+        return pos
+    except Exception:
+        # Fallback: load once, then filter (uses more RAM)
         with open(json_path) as f:
             data = json.load(f)
-        return {
-            str(node.get("node_id")): node.get("grch38_position_start")
-            for node in data.get("nodes", [])
-            if node.get("node_id") and isinstance(node.get("grch38_position_start"), int)
-        }
-    except Exception:
-        return {}
+        pos = {}
+        for node in data.get("nodes", []):
+            nid = str(node.get("node_id"))
+            if nid in needed_ids:
+                p = node.get("grch38_position_start")
+                if isinstance(p, int):
+                    pos[nid] = p
+        return pos
 
-def process_node_directory(args):
-    node_dir, true_dir, false_dir, use_symlinks, vcf_variants = args
+def _vcf_subset_for_positions(positions: Set[int]) -> Set[Tuple[int,str,str]]:
+    """Fetch a small window from the VCF and build a tiny membership set."""
+    if not positions:
+        return set()
+    mn, mx = min(positions), max(positions)
+    out: Set[Tuple[int,str,str]] = set()
+    # pysam fetch uses 0-based start, half-open end; rec.pos is 1-based
+    for rec in G_VCF.fetch(G_CHR, max(0, mn-1), mx+1):
+        if rec.pos in positions and rec.alts:
+            r = rec.ref.upper()
+            for a in rec.alts:
+                out.add((rec.pos, r, a.upper()))
+    return out
+
+def _classify_node(node_dir: str):
+    """Worker task: classify one node directory; returns (records, true, false)."""
     node_id = os.path.basename(node_dir)
-    summary_path = os.path.join(node_dir, "variant_summary.json")
-    if not os.path.isfile(summary_path):
-        return [], 0, 0
-
-    start_pos = node_positions.get(node_id)
+    start_pos = G_NODE_POS.get(node_id)
     if start_pos is None:
         return [], 0, 0
 
-    local_true_count = 0
-    local_false_count = 0
-    summary_records = []
-
+    summary_path = os.path.join(node_dir, "variant_summary.json")
     try:
         with open(summary_path) as f:
             summary = json.load(f)
-    except (IOError, json.JSONDecodeError):
+    except Exception:
         return [], 0, 0
 
-    for variant in summary.get("variants_passing_af_filter", []):
-        tensor_file = variant.get("tensor_file")
-        variant_key = variant.get("variant_key")
-        if not all([tensor_file, variant_key, tensor_file.endswith(".npy")]):
+    variants = summary.get("variants_passing_af_filter", [])
+    if not variants:
+        return [], 0, 0
+
+    # First pass: collect needed genomic positions & parse items we’ll output
+    items = []  # (tensor_path, tensor_file, pos, ref, alt)
+    pos_needed: Set[int] = set()
+    for v in variants:
+        tf = v.get("tensor_file"); vk = v.get("variant_key")
+        if not tf or not vk or not tf.endswith(".npy"):
             continue
-        tensor_path = os.path.join(node_dir, tensor_file)
-        if not os.path.isfile(tensor_path):
+        tpath = os.path.join(node_dir, tf)
+        if not os.path.isfile(tpath):
             continue
         try:
-            parts = variant_key.split("_")
-            offset, ref, alt = int(parts[0]), parts[2].upper(), parts[3].upper()
-        except (ValueError, IndexError):
+            off, ref, alt = _parse_key(vk)
+        except Exception:
             continue
-        grch38_pos = start_pos + offset
-        is_match = (grch38_pos, ref, alt) in vcf_variants
-        dest_dir = true_dir if is_match else false_dir
-        if is_match:
-            local_true_count += 1
-        else:
-            local_false_count += 1
-        destination_path = os.path.join(dest_dir, f"{node_id}_{tensor_file}")
+        pos = start_pos + off
+        items.append((tpath, tf, pos, ref, alt))
+        pos_needed.add(pos)
+
+    if not items:
+        return [], 0, 0
+
+    # Build a small, node-local VCF membership set
+    local_vcf = _vcf_subset_for_positions(pos_needed)
+
+    recs = []
+    t = f = 0
+    for tpath, tf, pos, ref, alt in items:
+        is_match = (pos, ref, alt) in local_vcf
+        dest = G_TRUE_DIR if is_match else G_FALSE_DIR
+        if is_match: t += 1
+        else:        f += 1
+
+        dst = os.path.join(dest, f"{node_id}_{tf}")
         try:
-            if use_symlinks:
-                os.symlink(os.path.abspath(tensor_path), destination_path)
+            if G_USE_SYMLINKS:
+                if not os.path.lexists(dst):
+                    os.symlink(os.path.abspath(tpath), dst)
             else:
-                shutil.copyfile(tensor_path, destination_path)
-        except (FileExistsError, OSError):
+                if not os.path.exists(dst):
+                    shutil.copyfile(tpath, dst)
+        except OSError:
             pass
-        summary_records.append({
-            "node_id": node_id, "tensor_file": tensor_file,
-            "variant_key": variant_key, "genomic_position": grch38_pos,
-            "ref": ref, "alt": alt,
-            "classification": "true" if is_match else "false"
+
+        recs.append({
+            "node_id": node_id, "tensor_file": tf, "genomic_position": pos,
+            "ref": ref, "alt": alt, "classification": "true" if is_match else "false"
         })
-    return summary_records, local_true_count, local_false_count
+
+    return recs, t, f
+
+def _parse_key(variant_key: str) -> Tuple[int,str,str]:
+    # variant_key looks like "OFFSET_x_REF_ALT_..." — adapt if needed
+    parts = variant_key.split("_")
+    offset = int(parts[0])
+    ref = parts[2].upper()
+    alt = parts[3].upper()
+    return offset, ref, alt
 
 def organize_classified_data(base_dir, ratios, seed=None):
     if seed is not None:
         random.seed(seed)
-    assert len(ratios) == 3 and abs(sum(ratios) - 1.0) < 1e-6, "Ratios must be three numbers summing to 1.0"
-    for label in ["true", "false"]:
-        src_dir = os.path.join(base_dir, label)
-        if not os.path.isdir(src_dir):
-            continue
-        files = sorted(os.listdir(src_dir))
-        random.shuffle(files)
-        n = len(files)
-        n_train = int(n * ratios[0])
-        n_val = int(n * ratios[1])
-        n_test = n - n_train - n_val
-        split_map = {
-            "train": files[:n_train],
-            "val": files[n_train:n_train+n_val],
-            "test": files[n_train+n_val:]
-        }
-        for split, split_files in split_map.items():
-            split_dir = os.path.join(base_dir, split, label)
-            os.makedirs(split_dir, exist_ok=True)
-            for f in split_files:
-                shutil.move(os.path.join(src_dir, f), os.path.join(split_dir, f))
-        shutil.rmtree(src_dir)
+    assert len(ratios) == 3 and abs(sum(ratios) - 1.0) < 1e-6
+    for label in ("true", "false"):
+        src = os.path.join(base_dir, label)
+        if not os.path.isdir(src): continue
+        files = sorted(os.listdir(src)); random.shuffle(files)
+        n = len(files); n_tr = int(n*ratios[0]); n_va = int(n*ratios[1]); n_te = n-n_tr-n_va
+        splits = {"train": files[:n_tr], "val": files[n_tr:n_tr+n_va], "test": files[n_tr+n_va:]}
+        for sp, lst in splits.items():
+            outd = os.path.join(base_dir, sp, label); os.makedirs(outd, exist_ok=True)
+            for f in lst: shutil.move(os.path.join(src, f), os.path.join(outd, f))
+        shutil.rmtree(src)
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("tensor_folder_path")
-    parser.add_argument("vcf_file")
-    parser.add_argument("node_pos_json")
-    parser.add_argument("--output_folder", default="./classification_results")
-    parser.add_argument("--chr", default="chr1")
-    parser.add_argument("--use-symlinks", action="store_true")
-    parser.add_argument("-j", "--workers", type=int, default=cpu_count())
-    parser.add_argument("--organize", nargs=3, type=float, metavar=('TRAIN', 'VAL', 'TEST'), default=None)
-    parser.add_argument("--seed", type=int, default=None)
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("tensor_folder_path")
+    ap.add_argument("vcf_file")
+    ap.add_argument("node_pos_json")
+    ap.add_argument("--output_folder", default="./classification_results")
+    ap.add_argument("--chr", default="chr1")
+    ap.add_argument("--use-symlinks", action="store_true")
+    ap.add_argument("-j","--workers", type=int, default=max(1, min(8, cpu_count())))
+    ap.add_argument("--chunksize", type=int, default=32)
+    ap.add_argument("--maxtasksperchild", type=int, default=500)
+    ap.add_argument("--organize", nargs=3, type=float, metavar=("TRAIN","VAL","TEST"))
+    ap.add_argument("--seed", type=int)
+    args = ap.parse_args()
 
     os.makedirs(args.output_folder, exist_ok=True)
-    true_dir = os.path.join(args.output_folder, "true")
+    true_dir  = os.path.join(args.output_folder, "true")
     false_dir = os.path.join(args.output_folder, "false")
-    os.makedirs(true_dir, exist_ok=True)
-    os.makedirs(false_dir, exist_ok=True)
+    os.makedirs(true_dir, exist_ok=True); os.makedirs(false_dir, exist_ok=True)
 
-    vcf_variants = query_vcf_for_chromosome(args.vcf_file, args.chr)
-    global node_positions
-    node_positions = load_node_positions(args.node_pos_json)
+    # Node dirs and the set of IDs we actually need
+    node_dirs = list(list_node_dirs(args.tensor_folder_path))
+    need_ids = {os.path.basename(p) for p in node_dirs}
+    print(f"Found {len(node_dirs):,} node dirs.")
 
-    total_variants = len(vcf_variants)
-    print(f"Found a total of {total_variants:,} variants in VCF for {args.chr}.")
+    # Load ONLY the positions we need (streaming if possible)
+    node_pos = load_needed_node_positions(args.node_pos_json, need_ids)
+    print(f"Loaded positions for {len(node_pos):,} nodes from JSON.")
 
-    node_dirs = [d.path for d in os.scandir(args.tensor_folder_path) if d.is_dir()]
-    total_nodes = len(node_dirs)
-    print(f"Found {total_nodes} nodes. Processing with {args.workers} workers...\n")
+    # Stream summary to NDJSON to avoid big in-RAM arrays
+    summary_path = os.path.join(args.output_folder, "classification_summary.ndjson")
+    summary_f = open(summary_path, "w")
 
-    start_time = time.monotonic()
-    tasks = [
-        (node_dir, true_dir, false_dir, args.use_symlinks, vcf_variants)
-        for node_dir in node_dirs
-    ]
-    all_summary_records = []
-    total_true = 0
-    total_false = 0
+    total_nodes = len(node_dirs); total_true = total_false = 0
+    start = time.monotonic()
 
-    with Pool(processes=args.workers) as pool:
-        for i, result in enumerate(pool.imap_unordered(process_node_directory, tasks)):
-            records, true_c, false_c = result
-            all_summary_records.extend(records)
-            total_true += true_c
-            total_false += false_c
-            processed_count = i + 1
-            elapsed_time = time.monotonic() - start_time
-            rate = processed_count / elapsed_time if elapsed_time > 0 else 0
-            eta_str = format_time((total_nodes - processed_count) / rate) if rate > 0 else "..."
-            elapsed_str = format_time(elapsed_time)
-            print(
-                f"\rProgress: {processed_count}/{total_nodes} ({processed_count/total_nodes:.1%}) | "
-                f"Elapsed: {elapsed_str} | ETA: {eta_str} | Rate: {rate:.2f} nodes/s  ", end=""
-            )
+    with Pool(processes=args.workers,
+              initializer=_init_worker,
+              initargs=(args.vcf_file, args.chr, node_pos,
+                        true_dir, false_dir, args.use_symlinks),
+              maxtasksperchild=args.maxtasksperchild) as pool:
 
-    print("\n\nProcessing complete.")
-    summary_path = os.path.join(args.output_folder, "classification_summary.json")
-    with open(summary_path, 'w') as f:
-        json.dump({"chromosome": args.chr, "results": all_summary_records}, f, indent=2)
+        for i, (records, t_cnt, f_cnt) in enumerate(
+            pool.imap_unordered(_classify_node, node_dirs, chunksize=args.chunksize)
+        ):
+            if records:
+                for rec in records:
+                    summary_f.write(json.dumps(rec) + "\n")
 
-    print("\n--- Summary ---")
-    print(f"Total nodes: {total_nodes}")
-    print(f"Total tensors: {total_true + total_false}")
-    print(f"True (in VCF): {total_true}")
-    print(f"False (not in VCF): {total_false}")
+            total_true  += t_cnt
+            total_false += f_cnt
+
+            done = i + 1
+            elapsed = time.monotonic() - start
+            rate = done / elapsed if elapsed > 0 else 0.0
+            eta = format_time((total_nodes - done)/rate) if rate > 0 else "..."
+            print(f"\rProgress {done}/{total_nodes} "
+                  f"({done/total_nodes:.1%})  true={total_true} false={total_false}  "
+                  f"{rate:.2f} nodes/s  ETA {eta}    ", end="")
+
+    summary_f.close()
+    print("\nDone.")
+    print(f"Summary written to: {summary_path}")
+    print(f"True: {total_true}  False: {total_false}")
 
     if args.organize:
-        print("Organizing tensors into train/val/test...")
+        print("Organizing into train/val/test …")
         organize_classified_data(args.output_folder, args.organize, seed=args.seed)
-        print("Done organizing.")
+        print("Organization complete.")
 
 if __name__ == "__main__":
     main()
