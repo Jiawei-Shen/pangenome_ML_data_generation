@@ -468,9 +468,13 @@ def process_single_node_for_pileup(task_args):
 # ─────────────────────────────────────────────────────────────────────────────
 # View
 def display_pileup_data(node_data_for_display_view, node_id_str_for_display, full_node_sequence,
-                        max_reads_to_display_per_variant, max_variants_to_display=float('inf')):
-    if max_variants_to_display == 0 or not node_data_for_display_view:
-        print(f"Info: No pileup data for node {node_id_str_for_display} (no variants met all filters).")
+                        max_reads_to_display_per_variant, max_variants_to_display=float('inf'),
+                        show_empty_info=False):
+    if max_variants_to_display == 0:
+        return
+    if not node_data_for_display_view:
+        if show_empty_info:
+            print(f"Info: No pileup data for node {node_id_str_for_display} (no variants met all filters).")
         return
     print(f"\n=== Displaying Pileups for Node ID: {node_id_str_for_display} (Length: {len(full_node_sequence)}) ===")
     sorted_variant_keys = sorted(node_data_for_display_view.keys(),
@@ -519,6 +523,9 @@ def main():
     parser.add_argument("--min_allele_bq", type=float, default=10.0, help="Minimum mean base quality for alt alleles")
     parser.add_argument("--variant_type", type=str, default='all', choices=['snp', 'indel', 'all'],
                         help="Variant types to output tensors for.")
+    parser.add_argument("--show_empty_info", action="store_true",
+                        help="If set, print 'No pileup data' messages for nodes with no passing variants.")
+
     args = parser.parse_args()
 
     if not (os.path.isfile(args.dat) and os.path.isfile(args.idx) and os.path.isfile(args.candidate_variants_json)):
@@ -599,37 +606,53 @@ def main():
 
     print(f"\nSubmitting {len(tasks)} tasks to {args.num_workers} workers...")
     total_tensors = 0
-    nodes_processed_since_last_report = 0
-    tensors_since_last_report = 0
-    batch_start_time = time.time()
+    total_nodes_done = 0
+    milestone_step = 10_000
+    next_milestone = milestone_step
+
+    t0 = time.time()
+    last_update = t0
 
     with ProcessPoolExecutor(max_workers=args.num_workers, initializer=init_worker,
                              initargs=(args.dat, args.output)) as executor:
-        fut2node = {executor.submit(process_single_node_for_pileup, t): t[0] for t in tasks}
-        for i, fut in enumerate(as_completed(fut2node)):
-            node_id = fut2node[fut]
-            nodes_processed_since_last_report += 1
+        future_to_node = {executor.submit(process_single_node_for_pileup, task): task[0] for task in tasks}
+
+        for i, future in enumerate(as_completed(future_to_node), start=1):
+            node_id = future_to_node[future]
             try:
-                _, view_data, tensor_count = fut.result()
+                _, view_data, tensor_count = future.result()
                 total_tensors += tensor_count
-                tensors_since_last_report += tensor_count
+
                 if args.view is not None and view_data:
-                    node_seq_for_view = (node_sequences_primary.get(node_id) or node_sequences_fallback.get(node_id) or "")
-                    display_pileup_data(view_data, str(node_id), node_seq_for_view, args.max_view_reads,
-                                        args.view if args.view != -1 else float('inf'))
+                    node_sequence_for_view = node_sequences.get(node_id, "")
+                    display_pileup_data(
+                        view_data, str(node_id), node_sequence_for_view,
+                        args.max_view_reads, (args.view if args.view != -1 else float('inf')),
+                        show_empty_info=args.show_empty_info
+                    )
             except Exception as e:
-                print(f"Error processing node {node_id}: {e}", file=sys.stderr)
+                print(f"\nError processing node {node_id}: {e}", file=sys.stderr)
 
-            if nodes_processed_since_last_report >= 1000 or (i + 1) == len(tasks):
-                elapsed = time.time() - batch_start_time
-                rate = nodes_processed_since_last_report / elapsed if elapsed > 0 else 0
-                print(f"  Processed batch of {nodes_processed_since_last_report} nodes (total: {i+1}/{len(tasks)}) in {elapsed:.2f}s "
-                      f"({rate:.1f} nodes/sec). Tensors in batch: {tensors_since_last_report}. Total tensors: {total_tensors}.")
-                nodes_processed_since_last_report = 0
-                tensors_since_last_report = 0
-                batch_start_time = time.time()
+            # progress accounting
+            total_nodes_done = i
+            now = time.time()
+            elapsed = max(now - t0, 1e-6)
+            rate = total_nodes_done / elapsed
 
-    print(f"\nProcessing complete. Total tensors generated: {total_tensors}.")
+            # live status line (overwrites itself)
+            print(f"\rProcessed {total_nodes_done}/{len(tasks)} nodes | "
+                  f"{rate:,.1f} nodes/s | tensors: {total_tensors} | elapsed: {elapsed:,.1f}s",
+                  end='', flush=True)
+
+            # milestone every 10,000 nodes (persistent line)
+            if total_nodes_done >= next_milestone:
+                print(f"\n[Milestone] {total_nodes_done:,} nodes processed "
+                      f"({rate:,.1f} nodes/s). Total tensors: {total_tensors}. Elapsed: {elapsed:,.1f}s.")
+                next_milestone += milestone_step
+
+    # final newline so the prompt isn't stuck at end of the status line
+    print("\n\nProcessing complete. Total tensors generated:", total_tensors)
+
 
 if __name__ == '__main__':
     main()
