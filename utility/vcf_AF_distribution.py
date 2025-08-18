@@ -69,7 +69,6 @@ def main(args):
     out_prefix = Path(args.out_prefix)
 
     # Mode A: Streaming histogram (fast, memory-light)
-    if args.stream_historam if False else None
     if args.stream_hist:
         # Choose edges. For linear AF, [0,1] makes sense. If focusing on rare, trim via --max-af.
         hi = args.max_af if (args.max_af is not None and args.max_af > 0) else 1.0
