@@ -27,27 +27,48 @@ def parse_args():
                    help="Build histogram on the fly (lower memory, usually faster).")
     p.add_argument("--out-prefix", default="af_distribution",
                    help="Output file prefix (default: af_distribution)")
+    p.add_argument(
+        "--variant-type", choices=["snp", "indel", "all"], default="all",
+        help="Variant type to include: snp, indel, or all (default: all)"
+    )
+
     return p.parse_args()
 
 
-def af_iter(vf, field, pass_only, show_progress=False):
+def af_iter(vf, field, pass_only, variant_type="all", show_progress=False):
     it = vf.fetch()
     if show_progress:
-        # no total known, so tqdm shows rate + count
+        from tqdm import tqdm
         it = tqdm(it, unit="variants", mininterval=5, desc="Processing VCF")
 
     for rec in it:
+        # Filter by FILTER=PASS
         if pass_only and rec.filter.keys() not in (set(), {"PASS"}) and "PASS" not in rec.filter.keys():
             continue
+
+        # Determine variant type
+        is_snp = len(rec.ref) == 1 and all(len(alt) == 1 for alt in rec.alts or [])
+        is_indel = any(len(alt) != len(rec.ref) for alt in rec.alts or [])
+
+        if variant_type == "snp" and not is_snp:
+            continue
+        if variant_type == "indel" and not is_indel:
+            continue
+
+        # Extract AFs
         info_val = rec.info.get(field, None)
         if info_val is None:
             continue
-        if isinstance(info_val, (tuple, list)):
-            for v in info_val:
-                if v is not None:
-                    yield float(v)
-        else:
-            yield float(info_val)
+        vals = info_val if isinstance(info_val, (tuple, list)) else (info_val,)
+        for v in vals:
+            if v is None:
+                continue
+            try:
+                fv = float(v)
+            except Exception:
+                continue
+            yield fv
+
 
 def main(args):
     # Open once (pysam uses htslib BGZF; ensure the file is indexed if using --region)
@@ -63,7 +84,9 @@ def main(args):
             edges = np.linspace(0.0, hi, args.bins + 1, dtype=np.float64)
             counts = np.zeros(args.bins, dtype=np.int64)
             n_kept = 0
-            for fv in af_iter(vf, args.field, args.pass_only, show_progress=True):
+            for fv in af_iter(vf, args.field, args.pass_only,
+                              variant_type=args.variant_type,
+                              show_progress=args.show_progress):
                 if args.max_af is not None and fv > args.max_af:
                     continue
                 # place into bin; clip at edges[-1]
