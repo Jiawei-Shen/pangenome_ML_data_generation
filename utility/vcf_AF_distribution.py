@@ -1,152 +1,210 @@
 #!/usr/bin/env python3
 import argparse
-import csv
 import math
-import subprocess
-import sys
 from pathlib import Path
 
 import numpy as np
+import pysam
 import matplotlib.pyplot as plt
 
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Extract AF from VCF with bcftools and plot distribution."
+        description="Fast AF distribution from VCF/BCF using pysam (INFO/AF by default)."
     )
-    p.add_argument("vcf", help="Path to .vcf or .vcf.bgz")
+    p.add_argument("vcf", help="Path to .vcf.gz/.vcf.bgz or .bcf")
     p.add_argument("--field", default="AF", help="INFO field to use (default: AF)")
-    p.add_argument("--pass-only", action="store_true",
-                   help="Use only FILTER=PASS records")
+    p.add_argument("--pass-only", action="store_true", help="Keep only FILTER=PASS")
+    p.add_argument("--region", default=None,
+                   help="Region like 'chr1:1-100000' (requires index)")
     p.add_argument("--max-af", type=float, default=None,
-                   help="Keep AF <= this value (e.g., 0.05 to focus on rare variants)")
-    p.add_argument("--bins", type=int, default=100, help="Histogram bins (default: 100)")
+                   help="Keep AF <= value (e.g., 0.05 to focus on rare variants)")
+    p.add_argument("--bins", type=int, default=100, help="Histogram bins (default 100)")
     p.add_argument("--logx", action="store_true",
-                   help="Plot AF on log10 scale (for very small AFs)")
+                   help="Plot log10(AF). Zeros are omitted from log plot.")
+    p.add_argument("--stream-hist", action="store_true",
+                   help="Build histogram on the fly (lower memory, usually faster).")
     p.add_argument("--out-prefix", default="af_distribution",
-                   help="Output prefix for files (default: af_distribution)")
+                   help="Output file prefix (default: af_distribution)")
     return p.parse_args()
 
 
-def bcftools_command(vcf_path, field, pass_only):
-    # Build bcftools query command to stream AFs (one line per record).
-    # If PASS-only, we filter with bcftools view -f PASS first.
-    cmd = []
-    if pass_only:
-        cmd = ["bcftools", "view", "-f", "PASS", vcf_path]
-        query = ["bcftools", "query", "-f", f"%INFO/{field}\n", "-"]
-    else:
-        query = ["bcftools", "query", "-f", f"%INFO/{field}\n", vcf_path]
-    return cmd, query
+def af_iter(vf, field, pass_only):
+    """
+    Yield AF values (float) for each ALT allele.
+    Minimizes Python overhead: only INFO, no FORMAT/genotype decoding.
+    """
+    fetcher = vf.fetch(vf.header.contigs[0]) if False else None  # placeholder
+    it = vf.fetch(args.region) if args.region else vf.fetch()
 
-
-def stream_afs(vcf_path, field, pass_only):
-    # Returns a numpy array of AF values, flattened across multiallelic sites
-    view_cmd, query_cmd = bcftools_command(vcf_path, field, pass_only)
-
-    if view_cmd:
-        view = subprocess.Popen(view_cmd, stdout=subprocess.PIPE)
-        q = subprocess.Popen(query_cmd, stdin=view.stdout, stdout=subprocess.PIPE, text=True)
-        view.stdout.close()
-        stream = q.stdout
-    else:
-        q = subprocess.Popen(query_cmd, stdout=subprocess.PIPE, text=True)
-        stream = q.stdout
-
-    af_values = []
-    for line in stream:
-        s = line.strip()
-        if not s or s == ".":
+    for rec in it:
+        if pass_only and rec.filter.keys() not in (set(), {"PASS"}) and "PASS" not in rec.filter.keys():
+            # In pysam, rec.filter.keys() returns a set-like. PASS may be absent if it failed.
             continue
-        # Multi-allelic AFs are comma-separated: 0.01,0.002
-        for tok in s.split(","):
-            tok = tok.strip()
-            if not tok or tok == ".":
+        info_val = rec.info.get(field, None)
+        if info_val is None:
+            continue
+        # AF can be a tuple/list for multiallelic sites
+        if isinstance(info_val, (tuple, list)):
+            vals = info_val
+        else:
+            vals = (info_val,)
+        for v in vals:
+            # Some INFO fields can be missing (None) or nan-like
+            if v is None:
                 continue
             try:
-                val = float(tok)
-                if math.isfinite(val):
-                    af_values.append(val)
-            except ValueError:
-                # skip malformed
+                fv = float(v)
+            except Exception:
                 continue
+            if not math.isfinite(fv):
+                continue
+            yield fv
 
-    stream.close()
-    q.wait()
-    return np.array(af_values, dtype=float)
 
+def main(args):
+    # Open once (pysam uses htslib BGZF; ensure the file is indexed if using --region)
+    vf = pysam.VariantFile(args.vcf)
 
-def main():
-    args = parse_args()
-    vcf_path = args.vcf
     out_prefix = Path(args.out_prefix)
 
-    print(f"[info] Reading AFs from: {vcf_path}")
-    if args.pass_only:
-        print("[info] Keeping only FILTER=PASS records")
-    print(f"[info] INFO field: {args.field}")
+    # Mode A: Streaming histogram (fast, memory-light)
+    if args.stream_historam if False else None
+    if args.stream_hist:
+        # Choose edges. For linear AF, [0,1] makes sense. If focusing on rare, trim via --max-af.
+        hi = args.max_af if (args.max_af is not None and args.max_af > 0) else 1.0
+        if not args.logx:
+            edges = np.linspace(0.0, hi, args.bins + 1, dtype=np.float64)
+            counts = np.zeros(args.bins, dtype=np.int64)
+            n_kept = 0
+            for fv in af_iter(vf, args.field, args.pass_only):
+                if args.max_af is not None and fv > args.max_af:
+                    continue
+                # place into bin; clip at edges[-1]
+                if 0.0 <= fv <= hi:
+                    # np.searchsorted is ~ok; manual int calc faster for uniform bins
+                    bin_idx = int((fv / hi) * args.bins)
+                    if bin_idx == args.bins:  # fv==hi edge
+                        bin_idx -= 1
+                    counts[bin_idx] += 1
+                    n_kept += 1
+            # Save histogram counts & edges
+            np.save(out_prefix.with_suffix(".hist_counts.npy"), counts)
+            np.save(out_prefix.with_suffix(".hist_edges.npy"), edges)
 
-    af = stream_afs(vcf_path, args.field, args.pass_only)
-    if af.size == 0:
-        print("[warn] No AF values found. Check INFO field name and filters.", file=sys.stderr)
-        sys.exit(1)
+            # Plot
+            plt.figure()
+            # For linear scale, we can pass left edges and weights to bar
+            width = np.diff(edges)
+            plt.bar(edges[:-1], counts, width=width, align="edge")
+            plt.xlabel("Allele Frequency (AF)")
+            plt.ylabel("Count (ALT alleles)")
+            plt.title(f"AF Distribution (n={n_kept}, streaming)")
+            plt.tight_layout()
+            plt.savefig(out_prefix.with_suffix(".png"), dpi=180)
 
-    print(f"[info] Raw AF count (alleles): {af.size}")
+            # Save a CSV summary
+            mids = (edges[:-1] + edges[1:]) / 2
+            csvp = out_prefix.with_suffix(".histogram.csv")
+            with open(csvp, "w") as f:
+                f.write("bin_left,bin_right,bin_mid,count\n")
+                for l, r, m, c in zip(edges[:-1], edges[1:], mids, counts):
+                    f.write(f"{l},{r},{m},{int(c)}\n")
 
-    # Optional cap by AF
-    if args.max_af is not None:
-        keep = af <= args.max_af
-        print(f"[info] Applying AF <= {args.max_af}: kept {keep.sum()} / {af.size}")
-        af = af[keep]
+            print(f"[ok] Streaming hist saved: {csvp}, {out_prefix.with_suffix('.png')}")
+            return
 
-    # Save raw AFs (one per ALT allele)
-    csv_vals = out_prefix.with_suffix(".af_values.csv")
-    np.savetxt(csv_vals, af, delimiter=",", fmt="%.8g")
-    print(f"[ok] Saved AF values -> {csv_vals}")
+        else:
+            # log10 histogram streaming: define edges in log-space, ignore zeros
+            lo = -8  # 10^-8 lower bound for bins (adjust as needed)
+            hi_log = math.log10(args.max_af) if args.max_af else 0.0  # up to 1 => 0
+            edges = np.linspace(lo, hi_log, args.bins + 1, dtype=np.float64)
+            counts = np.zeros(args.bins, dtype=np.int64)
+            n_kept = 0
+            for fv in af_iter(vf, args.field, args.pass_only):
+                if fv <= 0.0:
+                    continue  # cannot log
+                if args.max_af is not None and fv > args.max_af:
+                    continue
+                x = math.log10(fv)
+                if edges[0] <= x <= edges[-1]:
+                    bin_idx = np.searchsorted(edges, x, side="right") - 1
+                    if 0 <= bin_idx < counts.size:
+                        counts[bin_idx] += 1
+                        n_kept += 1
+            # Save
+            np.save(out_prefix.with_suffix(".hist_counts.npy"), counts)
+            np.save(out_prefix.with_suffix(".hist_edges.npy"), edges)
 
-    # Summary stats
-    summary_path = out_prefix.with_suffix(".af_summary.csv")
+            # Plot
+            plt.figure()
+            width = np.diff(edges)
+            plt.bar(edges[:-1], counts, width=width, align="edge")
+            plt.xlabel("log10(AF)")
+            plt.ylabel("Count (ALT alleles)")
+            plt.title(f"AF Distribution (log10, n={n_kept}, streaming)")
+            plt.tight_layout()
+            plt.savefig(out_prefix.with_suffix(".png"), dpi=180)
+
+            csvp = out_prefix.with_suffix(".histogram.csv")
+            with open(csvp, "w") as f:
+                f.write("bin_left_log10,bin_right_log10,bin_mid_log10,count\n")
+                mids = (edges[:-1] + edges[1:]) / 2
+                for l, r, m, c in zip(edges[:-1], edges[1:], mids, counts):
+                    f.write(f"{l},{r},{m},{int(c)}\n")
+
+            print(f"[ok] Streaming log-hist saved: {csvp}, {out_prefix.with_suffix('.png')}")
+            return
+
+    # Mode B: Accumulate values (simpler; still fast for tens of millions of alleles)
+    af_vals = []
+    push = af_vals.append
+    kept = 0
+    for fv in af_iter(vf, args.field, args.pass_only):
+        if args.max_af is not None and fv > args.max_af:
+            continue
+        push(fv)
+        kept += 1
+
+    if not af_vals:
+        print("[warn] No AF values collected. Check field/filters/region.")
+        return
+
+    af = np.fromiter(af_vals, dtype=np.float64)
+    # Save raw values (optional, large)
+    np.savetxt(out_prefix.with_suffix(".af_values.csv"), af, delimiter=",", fmt="%.8g")
+
+    # Summary
     q = np.quantile(af, [0, 0.25, 0.5, 0.75, 0.95, 0.99, 1.0])
-    with open(summary_path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["count", af.size])
-        w.writerow(["mean", float(af.mean())])
-        w.writerow(["std", float(af.std(ddof=0))])
-        w.writerow(["min", float(q[0])])
-        w.writerow(["q25", float(q[1])])
-        w.writerow(["median", float(q[2])])
-        w.writerow(["q75", float(q[3])])
-        w.writerow(["q95", float(q[4])])
-        w.writerow(["q99", float(q[5])])
-        w.writerow(["max", float(q[6])])
-    print(f"[ok] Saved summary stats -> {summary_path}")
+    with open(out_prefix.with_suffix(".af_summary.csv"), "w") as f:
+        f.write(f"count,{af.size}\n")
+        f.write(f"mean,{float(af.mean())}\n")
+        f.write(f"std,{float(af.std(ddof=0))}\n")
+        f.write(f"min,{float(q[0])}\nq25,{float(q[1])}\nmedian,{float(q[2])}\n")
+        f.write(f"q75,{float(q[3])}\nq95,{float(q[4])}\nq99,{float(q[5])}\nmax,{float(q[6])}\n")
 
     # Plot
-    fig_path = out_prefix.with_suffix(".png")
-
     plt.figure()
     if args.logx:
-        # Avoid issues with zeros: keep strictly positive AFs for log scale
         af_pos = af[af > 0]
-        if af_pos.size == 0:
-            print("[warn] No positive AFs to plot on log scale; falling back to linear.")
-            data = af
-            xlabel = "Allele Frequency (AF)"
+        if af_pos.size:
+            plt.hist(np.log10(af_pos), bins=args.bins)
+            plt.xlabel("log10(AF)")
         else:
-            data = np.log10(af_pos)
-            xlabel = "log10(AF)"
-        plt.hist(data, bins=args.bins)
+            plt.hist(af, bins=args.bins)
+            plt.xlabel("Allele Frequency (AF)")
     else:
         plt.hist(af, bins=args.bins)
-        xlabel = "Allele Frequency (AF)"
+        plt.xlabel("Allele Frequency (AF)")
 
-    plt.xlabel(xlabel)
     plt.ylabel("Count (ALT alleles)")
-    plt.title("AF Distribution")
+    plt.title(f"AF Distribution (n={af.size})")
     plt.tight_layout()
-    plt.savefig(fig_path, dpi=180)
-    print(f"[ok] Saved histogram -> {fig_path}")
+    plt.savefig(out_prefix.with_suffix(".png"), dpi=180)
+    print(f"[ok] Saved: {out_prefix.with_suffix('.png')}, "
+          f"{out_prefix.with_suffix('.af_summary.csv')}")
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    main(args)
