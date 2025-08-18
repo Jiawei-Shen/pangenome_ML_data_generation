@@ -4,6 +4,7 @@ import math
 from pathlib import Path
 
 import numpy as np
+from tqdm import tqdm
 import pysam
 import matplotlib.pyplot as plt
 
@@ -29,38 +30,24 @@ def parse_args():
     return p.parse_args()
 
 
-def af_iter(vf, field, pass_only):
-    """
-    Yield AF values (float) for each ALT allele.
-    Minimizes Python overhead: only INFO, no FORMAT/genotype decoding.
-    """
-    fetcher = vf.fetch(vf.header.contigs[0]) if False else None  # placeholder
-    it = vf.fetch(args.region) if args.region else vf.fetch()
+def af_iter(vf, field, pass_only, show_progress=False):
+    it = vf.fetch()
+    if show_progress:
+        # no total known, so tqdm shows rate + count
+        it = tqdm(it, unit="variants", mininterval=5, desc="Processing VCF")
 
     for rec in it:
         if pass_only and rec.filter.keys() not in (set(), {"PASS"}) and "PASS" not in rec.filter.keys():
-            # In pysam, rec.filter.keys() returns a set-like. PASS may be absent if it failed.
             continue
         info_val = rec.info.get(field, None)
         if info_val is None:
             continue
-        # AF can be a tuple/list for multiallelic sites
         if isinstance(info_val, (tuple, list)):
-            vals = info_val
+            for v in info_val:
+                if v is not None:
+                    yield float(v)
         else:
-            vals = (info_val,)
-        for v in vals:
-            # Some INFO fields can be missing (None) or nan-like
-            if v is None:
-                continue
-            try:
-                fv = float(v)
-            except Exception:
-                continue
-            if not math.isfinite(fv):
-                continue
-            yield fv
-
+            yield float(info_val)
 
 def main(args):
     # Open once (pysam uses htslib BGZF; ensure the file is indexed if using --region)
@@ -76,7 +63,7 @@ def main(args):
             edges = np.linspace(0.0, hi, args.bins + 1, dtype=np.float64)
             counts = np.zeros(args.bins, dtype=np.int64)
             n_kept = 0
-            for fv in af_iter(vf, args.field, args.pass_only):
+            for fv in af_iter(vf, args.field, args.pass_only, show_progress=True):
                 if args.max_af is not None and fv > args.max_af:
                     continue
                 # place into bin; clip at edges[-1]
