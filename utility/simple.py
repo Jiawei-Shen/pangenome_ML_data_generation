@@ -1,66 +1,68 @@
 #!/usr/bin/env python3
-"""
-collect_nodes_from_vcf.py
--------------------------------------------------
-Collect ALL node IDs that appear in a vg-deconstructed VCF:
-
-  • ID field  (e.g.  >1745>1742  ➟ 1745, 1742)
-  • AT= tag   (e.g.  >1745>1743>1742  ➟ 1745, 1743, 1742)
-
-Output: one node ID per line, unsorted or (optionally) sorted numerically.
-
-Usage
------
-    python collect_nodes_from_vcf.py  input.vcf[.gz]  nodes.txt          # unsorted
-    python collect_nodes_from_vcf.py  -s input.vcf.gz nodes.txt          # sorted
-
-Dependencies:  pysam  (pip install pysam)
-"""
-
 import argparse
-import re
-import sys
-import pysam
+import numpy as np
+import glob, os, csv
 
-# matches every run of digits, ignoring orientation symbols >  <
-_DIGIT_RE = re.compile(r"\d+")
+# Pre-defined AF bins
+AF_BINS = [0, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 0.1, 0.5, 1.0]
+AF_LABELS = [
+    "0-1e-6",
+    "1e-6-1e-5",
+    "1e-5-1e-4",
+    "1e-4-1e-3",
+    "1e-3-1e-2",
+    "1e-2-0.1",
+    "0.1-0.5",
+    "0.5-1.0"
+]
 
-def extract_ids_from_string(s: str):
-    """Yield every integer found in a traversal or ID string."""
-    for m in _DIGIT_RE.finditer(s):
-        yield int(m.group())
+def classify_bins(edges, counts):
+    """
+    Map fine-grained histogram bins into pre-defined super-bins.
+    """
+    out_counts = {lab: 0 for lab in AF_LABELS}
+    mids = (edges[:-1] + edges[1:]) / 2
+    for mid, c in zip(mids, counts):
+        if c == 0:
+            continue
+        for i in range(len(AF_BINS)-1):
+            if AF_BINS[i] < mid <= AF_BINS[i+1]:
+                out_counts[AF_LABELS[i]] += int(c)
+                break
+    return out_counts
 
-def main(vcf_path: str, out_path: str, do_sort: bool):
-    seen = set()
-    vcf = pysam.VariantFile(vcf_path)
+def main():
+    ap = argparse.ArgumentParser(description="Re-bin AF histograms into 8 AF classes")
+    ap.add_argument("--indir", required=True, help="Folder with *.hist_edges.npy and *.hist_counts.npy")
+    ap.add_argument("--out", default="af_classes_summary.csv", help="Output CSV")
+    args = ap.parse_args()
 
-    # -- iterate through records ------------------------------------------------
-    for rec in vcf:
-        # 1.  ID field  (might be '.')
-        if rec.id and rec.id != ".":
-            seen.update(extract_ids_from_string(rec.id))
+    total_counts = {lab: 0 for lab in AF_LABELS}
 
-        # 2.  AT tag: list[str] like ['>1745>1743>1742', ...]
-        at_vals = rec.info.get("AT")
-        if at_vals:
-            for trav in at_vals:
-                seen.update(extract_ids_from_string(trav))
+    for edge_file in glob.glob(os.path.join(args.indir, "*.hist_edges.npy")):
+        base = edge_file.replace(".hist_edges.npy", "")
+        count_file = base + ".hist_counts.npy"
+        if not os.path.exists(count_file):
+            continue
 
-    # -- write output -----------------------------------------------------------
-    with open(out_path, "w") as fout:
-        ids = sorted(seen) if do_sort else seen
-        for nid in ids:
-            fout.write(f"{nid}\n")
+        edges = np.load(edge_file)
+        counts = np.load(count_file)
 
-    sys.stderr.write(f"Wrote {len(seen):,} unique node IDs ➟ {out_path}\n")
+        chr_counts = classify_bins(edges, counts)
+        for lab in AF_LABELS:
+            total_counts[lab] += chr_counts[lab]
+
+    grand_total = sum(total_counts.values())
+
+    with open(args.out, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["AF_Class","Count","Proportion"])
+        for lab in AF_LABELS:
+            cnt = total_counts[lab]
+            prop = cnt / grand_total if grand_total > 0 else 0
+            writer.writerow([lab, cnt, f"{prop:.6f}"])
+
+    print(f"[ok] Wrote summary -> {args.out}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Collect all node IDs referenced in a vg-deconstructed VCF."
-    )
-    parser.add_argument("vcf",  help="Input VCF (.vcf or .vcf.gz)")
-    parser.add_argument("out",  help="Output text file (one node ID per line)")
-    parser.add_argument("-s", "--sort", action="store_true",
-                        help="sort node IDs numerically before writing")
-    args = parser.parse_args()
-    main(args.vcf, args.out, args.sort)
+    main()

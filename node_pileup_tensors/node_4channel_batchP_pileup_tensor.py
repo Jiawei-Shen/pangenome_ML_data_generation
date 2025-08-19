@@ -8,7 +8,7 @@ import time
 import numpy as np
 from collections import defaultdict
 import re
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -46,8 +46,11 @@ MISMATCH_COMPARISON_PADDING_VALUE = -1
 # Globals for worker process state
 worker_dat_file = None
 worker_base_output_dir = None
-worker_need_view = False  # <-- gate view building
+worker_need_view = False  # gate view building
 
+# Read-only globals (filled before pool creation; inherited by workers via fork COW)
+GLOBAL_NODE_SEQS = {}
+GLOBAL_NODE_AF = {}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper Functions
@@ -76,9 +79,12 @@ def load_full_idx_data(idx_path):
                 return None
             num_nodes_in_idx = struct.unpack('<I', num_nodes_bytes)[0]
             print(f"  Index file reports {num_nodes_in_idx} total node entries. Reading all entries...")
-            if num_nodes_in_idx == 0: return idx_data_map
+            if num_nodes_in_idx == 0:
+                print("Successfully loaded 0 distinct node entries.")
+                return idx_data_map
 
             processed_entries = 0
+            # Each record: <I Q I I H> = 4 + 8 + 4 + 4 + 2 = 22 bytes
             for i in range(num_nodes_in_idx):
                 record_bytes = f.read(22)
                 if len(record_bytes) < 22:
@@ -99,7 +105,8 @@ def load_full_idx_data(idx_path):
         return None
 
 def decode_cigar_to_int_ops(cigar_string):
-    if not cigar_string or cigar_string == '*': return []
+    if not cigar_string or cigar_string == '*':
+        return []
     try:
         return [(int(length), op) for length, op in re.findall(r'(\d+)([MIDNSHPX=])', cigar_string)]
     except Exception as e:
@@ -140,7 +147,8 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_qu
 
         elif op == 'D':
             if current_node_pos <= target_node_pos < current_node_pos + length:
-                if expected_var_type == 'I': return "OTHER_FOR_INDEL", None
+                if expected_var_type == 'I':
+                    return "OTHER_FOR_INDEL", None
                 if expected_var_type == 'D':
                     if 0 <= current_node_pos < len(node_sequence) and current_node_pos + length <= len(node_sequence):
                         deleted_seq_in_ref_context = node_sequence[current_node_pos: current_node_pos + length]
@@ -224,8 +232,10 @@ def get_read_representation_in_window_for_view(segment_cigar_ops, segment_offset
         elif op in ('I', 'S'):
             read_pos += L
 
-        if node_pos >= window_start_node + window_size and read_pos > 0: break
-        if read_pos >= read_seq_len: break
+        if node_pos >= window_start_node + window_size and read_pos > 0:
+            break
+        if read_pos >= read_seq_len:
+            break
     return window_chars
 
 def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
@@ -243,7 +253,8 @@ def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
 
     for L, op in segment_cigar_ops:
         op_idx = CIGAR_OP_TO_INDEX.get(op, CIGAR_PADDING_INDEX)
-        if node_pos >= window_start_node + tensor_win_size and read_pos > 0: break
+        if node_pos >= window_start_node + tensor_win_size and read_pos > 0:
+            break
 
         if op in ('M', '=', 'X'):
             for i in range(L):
@@ -272,9 +283,9 @@ def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
         elif op in ('I', 'S'):
             read_pos += L
 
-        if read_pos >= read_seq_len: break
+        if read_pos >= read_seq_len:
+            break
     return bases, quals, mapqs, cigar_ops_indices
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Worker Process Initialization and Target Function
@@ -293,29 +304,31 @@ def init_worker(dat_file_path_for_worker, base_output_dir_for_worker, need_view_
         sys.stderr.write(f"Error [Worker {os.getpid()}] opening DAT file: {e}\n")
         sys.exit(1)
 
-
 def process_single_node_for_pileup(task_args):
-    (node_id, dat_file_offset, n_records, node_sequence, genomead_af_list,
+    (node_id, dat_file_offset, n_records,
      min_af_threshold, min_variants_threshold, min_allele_bq_threshold,
      variant_type_to_process) = task_args
 
     global worker_dat_file, worker_base_output_dir, worker_need_view
+    global GLOBAL_NODE_SEQS, GLOBAL_NODE_AF
 
     tensor_files_generated_for_node = 0
     if worker_dat_file is None or worker_base_output_dir is None:
         return node_id, None, tensor_files_generated_for_node
+
+    node_sequence = GLOBAL_NODE_SEQS.get(node_id, "")
     if not node_sequence:
         return node_id, {}, tensor_files_generated_for_node
+    genomead_af_list = GLOBAL_NODE_AF.get(node_id, [])
 
     node_len = len(node_sequence)
     aligned_read_segments = []
 
     try:
-        # Bulk read all records for this node and iter-unpack (fast!)
-        worker_dat_file.seek(dat_file_offset + 10)
+        # Bulk read all records for this node and iter-unpack (fast)
+        worker_dat_file.seek(dat_file_offset + 10)  # skip 10-byte header per-record set if any (kept as in original)
         bulk = worker_dat_file.read(n_records * RECORD_SIZE)
         if len(bulk) < n_records * RECORD_SIZE:
-            # fall back gracefully on partial reads
             n_records = len(bulk) // RECORD_SIZE
             bulk = bulk[: n_records * RECORD_SIZE]
 
@@ -374,7 +387,6 @@ def process_single_node_for_pileup(task_args):
                 seg["offset_on_node"], seg["cigar_ops"], seg["read_sequence"], node_sequence):
             candidate_variants[(v_pos, v_type, v_ref, v_alt)] += 1
 
-    # Only allocate/build view data if requested
     view_oriented_variant_data = {} if worker_need_view else None
     variant_headers_for_summary = []
 
@@ -393,7 +405,8 @@ def process_single_node_for_pileup(task_args):
 
         if v_type == 'D':
             expected_alt_for_af = "*"
-            if 0 <= v_pos < node_len: expected_ref_for_af = node_sequence[v_pos]
+            if 0 <= v_pos < node_len:
+                expected_ref_for_af = node_sequence[v_pos]
             ref_allele_for_indel_context = v_ref_from_cigar
         elif v_type == 'I':
             expected_ref_for_af = node_sequence[v_pos] if 0 <= v_pos < node_len else "*"
@@ -408,7 +421,8 @@ def process_single_node_for_pileup(task_args):
                 locus_coverage += 1
                 if allele_observed == expected_alt_for_af:
                     alt_allele_count += 1
-                    if bq is not None: alt_allele_base_qualities.append(bq)
+                    if bq is not None:
+                        alt_allele_base_qualities.append(bq)
                 elif allele_observed == expected_ref_for_af or (
                         v_type in ('I', 'D') and allele_observed == "REF_STATE_FOR_INDEL"):
                     ref_allele_count += 1
@@ -419,11 +433,11 @@ def process_single_node_for_pileup(task_args):
             continue
 
         if v_type == 'X':
-            current_alt_freq = alt_allele_count / locus_coverage if locus_coverage > 0 else 0.0
-            if current_alt_freq < min_af_threshold:
+            current_alt_freq_tmp = alt_allele_count / locus_coverage if locus_coverage > 0 else 0.0
+            if current_alt_freq_tmp < min_af_threshold:
                 continue
-            mean_alt_bq = sum(alt_allele_base_qualities) / len(alt_allele_base_qualities) if alt_allele_base_qualities else 0.0
-            if mean_alt_bq < min_allele_bq_threshold:
+            mean_alt_bq_tmp = sum(alt_allele_base_qualities) / len(alt_allele_base_qualities) if alt_allele_base_qualities else 0.0
+            if mean_alt_bq_tmp < min_allele_bq_threshold:
                 continue
 
         current_alt_freq = alt_allele_count / locus_coverage if locus_coverage > 0 else 0.0
@@ -514,7 +528,6 @@ def process_single_node_for_pileup(task_args):
                 ch1[r, :] = np.asarray(base_idx_row, dtype=np.int8)
                 ch2[r, :] = np.asarray(quality_score_row, dtype=np.int8)
                 # mismatch flags
-                # (vectorized-ish without heavy Python loops)
                 ref_row = ch1[0, :].astype(np.int16)
                 read_row = ch1[r, :].astype(np.int16)
                 flags = np.full(W, MISMATCH_COMPARISON_PADDING_VALUE, dtype=np.int8)
@@ -558,13 +571,13 @@ def process_single_node_for_pileup(task_args):
 
     return node_id, (view_oriented_variant_data or {}), tensor_files_generated_for_node
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Pileup Viewing Function
 # ─────────────────────────────────────────────────────────────────────────────
 def display_pileup_data(node_data_for_display_view, node_id_str_for_display, full_node_sequence,
                         max_reads_to_display_per_variant, max_variants_to_display=float('inf')):
-    if max_variants_to_display == 0: return
+    if max_variants_to_display == 0:
+        return
     if not node_data_for_display_view:
         print(f"Info: No pileup data for node {node_id_str_for_display} (no variants met all filters).")
         return
@@ -615,7 +628,6 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
 
     print()
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Main function
 # ─────────────────────────────────────────────────────────────────────────────
@@ -629,6 +641,7 @@ def main():
     parser.add_argument("candidate_variants_json",
                         help="JSON file containing nodes and their sequences to process.")
     parser.add_argument("--num_workers", type=int, default=os.cpu_count(), help="Number of worker processes")
+    parser.add_argument("--chunksize", type=int, default=512, help="Task chunksize for executor.map()")
     parser.add_argument("--view", nargs='?', const=-1, default=None, type=int, metavar='N',
                         help="Print pileups for top N variants per node (-1 for all)")
     parser.add_argument("--max_view_reads", type=int, default=20, help="Max reads to show per pileup in view mode")
@@ -647,6 +660,7 @@ def main():
     # Gate view-building in workers
     need_view = args.view is not None
 
+    # Load candidate nodes (sequence + AF) into read-only globals
     node_sequences = {}
     node_af_data = {}
     node_ids_to_process = set()
@@ -672,62 +686,69 @@ def main():
     print(f"Found {len(node_sequences)} nodes with integer-compatible IDs to process.")
 
     full_idx_data = load_full_idx_data(args.idx)
-    if not full_idx_data: sys.exit("Failed to load index data.")
+    if not full_idx_data:
+        sys.exit("Failed to load index data.")
 
+    # Prepare tiny tasks: do NOT include sequences/AF (workers read from globals)
     tasks = []
+    missing = 0
     for node_id in node_ids_to_process:
         if node_id in full_idx_data:
             offset, n_records = full_idx_data[node_id]
-            sequence = node_sequences[node_id]
-            af_list = node_af_data.get(node_id, [])
-            tasks.append((node_id, offset, n_records, sequence, af_list, args.min_af, args.min_variants,
+            tasks.append((node_id, offset, n_records, args.min_af, args.min_variants,
                           args.min_allele_bq, args.variant_type))
         else:
-            print(f"Warning: Node ID {node_id} from JSON was not found in the index file and will be skipped.")
-
+            missing += 1
+    if missing:
+        print(f"Warning: {missing} node IDs from JSON were not found in the index file and will be skipped.")
     if not tasks:
         sys.exit("No valid tasks to run after processing JSON and index file.")
 
     # Sort by DAT offset → streaming I/O instead of random seeks
     tasks.sort(key=lambda t: t[1])
 
-    print(f"\nSubmitting {len(tasks)} tasks to {args.num_workers} workers...")
+    # Publish read-only globals for workers (copy-on-write under fork)
+    global GLOBAL_NODE_SEQS, GLOBAL_NODE_AF
+    GLOBAL_NODE_SEQS = node_sequences
+    GLOBAL_NODE_AF = node_af_data
+
+    total_tasks = len(tasks)
+    print(f"\nSubmitting {total_tasks} tasks to {args.num_workers} workers...")
+
     total_tensors = 0
-    nodes_processed_since_last_report = 0
+    processed = 0
+    nodes_since_last_report = 0
     tensors_since_last_report = 0
     batch_start_time = time.time()
 
-    with ProcessPoolExecutor(max_workers=args.num_workers, initializer=init_worker,
+    # Use executor.map to avoid flooding with 300k futures; tune chunksize
+    with ProcessPoolExecutor(max_workers=args.num_workers,
+                             initializer=init_worker,
                              initargs=(args.dat, args.output, need_view)) as executor:
-        future_to_node = {executor.submit(process_single_node_for_pileup, task): task[0] for task in tasks}
+        for node_id, view_data, tensor_count in executor.map(
+                process_single_node_for_pileup, tasks, chunksize=max(1, args.chunksize)):
+            processed += 1
+            nodes_since_last_report += 1
+            total_tensors += tensor_count
+            tensors_since_last_report += tensor_count
 
-        for i, future in enumerate(as_completed(future_to_node)):
-            node_id = future_to_node[future]
-            nodes_processed_since_last_report += 1
-            try:
-                _, view_data, tensor_count = future.result()
-                total_tensors += tensor_count
-                tensors_since_last_report += tensor_count
+            if need_view and view_data:
+                node_sequence_for_view = GLOBAL_NODE_SEQS.get(node_id, "")
+                display_pileup_data(view_data, str(node_id), node_sequence_for_view,
+                                    args.max_view_reads,
+                                    args.view if args.view != -1 else float('inf'))
 
-                if need_view and view_data:
-                    node_sequence_for_view = node_sequences.get(node_id, "")
-                    display_pileup_data(view_data, str(node_id), node_sequence_for_view, args.max_view_reads,
-                                        args.view if args.view != -1 else float('inf'))
-            except Exception as e:
-                print(f"Error processing node {node_id}: {e}", file=sys.stderr)
-
-            if nodes_processed_since_last_report >= 1000 or (i + 1) == len(tasks):
+            if nodes_since_last_report >= 1000 or processed == total_tasks:
                 elapsed_time = time.time() - batch_start_time
-                rate = nodes_processed_since_last_report / elapsed_time if elapsed_time > 0 else 0
+                rate = nodes_since_last_report / elapsed_time if elapsed_time > 0 else 0.0
                 print(
-                    f"  Processed batch of {nodes_processed_since_last_report} nodes (total: {i + 1}/{len(tasks)}) in {elapsed_time:.2f}s "
+                    f"  Processed batch of {nodes_since_last_report} nodes (total: {processed}/{total_tasks}) in {elapsed_time:.2f}s "
                     f"({rate:.1f} nodes/sec). Tensors in batch: {tensors_since_last_report}. Total tensors: {total_tensors}.")
-                nodes_processed_since_last_report = 0
+                nodes_since_last_report = 0
                 tensors_since_last_report = 0
                 batch_start_time = time.time()
 
     print(f"\nProcessing complete. Total tensors generated: {total_tensors}.")
-
 
 if __name__ == '__main__':
     main()
