@@ -8,6 +8,54 @@ import logging
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', stream=sys.stderr)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# AF → 8-level mapper (returns 1..8; 0 still means “missing AF”)
+# If af >= 1.0, assume it may already be pre-converted (e.g., 1–8) and return as-is.
+# ─────────────────────────────────────────────────────────────────────────────
+LEVEL_BOUNDS = [
+    (0.0, 1e-6),
+    (1e-6, 1e-5),
+    (1e-5, 1e-4),
+    (1e-4, 1e-3),
+    (1e-3, 1e-2),
+    (1e-2, 0.1),
+    (0.1, 0.5),
+    (0.5, 1.0),
+]
+
+def af_to_level(af: float) -> int:
+    """
+    Convert raw AF (0.0–1.0) into discrete level 1–8.
+    Return 0 if missing.
+    If af >= 1.0, assume it may already be pre-converted (1–8) and return as-is (int).
+    """
+    if af is None:
+        return 0
+
+    # Pass through if already looks like a level (e.g., 1..8)
+    if af >= 1.0:
+        try:
+            return int(af)
+        except Exception:
+            # fall back to binning if it isn't actually an integer
+            pass
+
+    # Clamp to [0, 1] for binning
+    if af < 0.0:
+        af = 0.0
+    if af > 1.0:
+        af = 1.0
+
+    for idx, (lo, hi) in enumerate(LEVEL_BOUNDS, start=1):
+        if idx < 8:
+            if lo <= af < hi:
+                return idx
+        else:
+            # last bin inclusive of upper bound
+            if lo <= af <= hi:
+                return idx
+    return 0
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper Functions
@@ -146,14 +194,15 @@ def extract_path_info_from_gfa(gfa_file_path, user_grep_pattern, af_data_map=Non
             for i in range(node_data['len']):
                 genomic_pos = node_start_pos + i
                 if genomic_pos in af_data_map:
-                    node_af_list[i] = af_data_map[genomic_pos]
+                    # Convert AF to 8-level code (or pass-through if already ≥ 1.0)
+                    node_af_list[i] = af_to_level(af_data_map[genomic_pos])
 
         output_nodes.append({
             "node_id": seg_id,
             "grch38_position_start": node_start_pos,
             "strand_in_path": seg_info['strand'],
             "length": node_data['len'],
-            "genomead_af": node_af_list,  # Renamed this key
+            "genomead_af": node_af_list,  # Contains 0 (missing) or 1..8 levels
             "sequence": node_data['seq']
         })
         current_cumulative_pos += node_data['len']
