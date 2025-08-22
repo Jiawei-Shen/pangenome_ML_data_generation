@@ -10,6 +10,7 @@ from collections import defaultdict
 import re
 from concurrent.futures import ProcessPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
+import gzip
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -60,6 +61,9 @@ GLOBAL_NODE_AF_BINS: Dict[int, Optional[List[int]]] = {}
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper Functions
 # ─────────────────────────────────────────────────────────────────────────────
+
+def open_maybe_gzip(path, mode="rt"):
+    return gzip.open(path, mode) if path.endswith(".gz") else open(path, mode)
 
 def calculate_window_start(variant_pos, window_size):
     center_index = window_size // 2
@@ -695,23 +699,31 @@ def main():
 
     print(f"Loading nodes from {args.candidate_variants_json}...")
     try:
-        with open(args.candidate_variants_json, 'r') as f:
+        with open_maybe_gzip(args.candidate_variants_json, "rt") as f:
             data = json.load(f)
-            for node_obj in data.get('nodes', []):
-                node_id_str = node_obj.get('node_id')
-                sequence = node_obj.get('sequence')
-                af_field = node_obj.get('genomead_af', None)  # may be missing / None / list / string
 
-                if node_id_str and sequence:
-                    try:
-                        node_id_int = int(node_id_str)
-                    except ValueError:
-                        continue
-                    seqU = str(sequence).upper()
-                    node_sequences[node_id_int] = seqU
-                    # Normalize AF to bin8 or None (missing)
-                    node_af_bins_data[node_id_int] = normalize_af_to_bin8(af_field, len(seqU))
-                    node_ids_to_process.add(node_id_int)
+        # Accept either {"nodes":[...]} or just [...]
+        nodes_list = data.get("nodes") if isinstance(data, dict) else data
+        if not isinstance(nodes_list, list):
+            sys.exit("Error: candidate_variants_json must be a list of node objects or a dict with key 'nodes'.")
+
+        for node_obj in nodes_list:
+            if not isinstance(node_obj, dict):
+                continue
+            node_id_str = node_obj.get("node_id")
+            sequence = node_obj.get("sequence")
+            af_field = node_obj.get("genomead_af", None)  # may be missing / None / list / string
+
+            if node_id_str and sequence:
+                try:
+                    node_id_int = int(node_id_str)
+                except ValueError:
+                    continue
+                seqU = str(sequence).upper()
+                node_sequences[node_id_int] = seqU
+                # Normalize AF to bin8 list (0..7) or None if truly missing
+                node_af_bins_data[node_id_int] = normalize_af_to_bin8(af_field, len(seqU))
+                node_ids_to_process.add(node_id_int)
     except Exception as e:
         sys.exit(f"Error reading or parsing JSON file: {e}")
 
