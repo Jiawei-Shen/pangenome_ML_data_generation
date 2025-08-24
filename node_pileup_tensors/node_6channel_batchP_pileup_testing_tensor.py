@@ -555,7 +555,6 @@ def process_single_node_for_pileup(task_args):
         with open(os.path.join(worker_base_output_dir, str(node_id), "variant_summary.json"), 'w') as f:
             json.dump({"node_id": node_id, "node_length": len(node_sequence),
                        "variants_passing_af_filter": variant_headers_for_summary}, f, indent=2)
-    print('done')
     return node_id, (view_oriented_variant_data or {}), tensor_files_generated_for_node
 
 # ─────────────────────────────────────────────────────────────────────────────
