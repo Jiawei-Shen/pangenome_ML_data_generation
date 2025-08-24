@@ -364,9 +364,7 @@ def process_single_node_for_pileup(task_args):
 
     af_bins = GLOBAL_NODE_AF_BINS.get(node_id, None)
 
-    print(node_id, af_bins)
     aligned_read_segments = []
-
     try:
         worker_dat_file.seek(dat_file_offset + 10)
         bulk = worker_dat_file.read(n_records * RECORD_SIZE)
@@ -418,7 +416,12 @@ def process_single_node_for_pileup(task_args):
 
     if not aligned_read_segments:
         return node_id, {}, tensor_files_generated_for_node
+
     candidate_variants = defaultdict(int)
+    if aligned_read_segments > 5000:
+        print(f"Alert!! Node {node_id} has {aligned_read_segments} on it, drop this node.")
+        return node_id, None, tensor_files_generated_for_node
+
     for seg in aligned_read_segments:
         for v_pos, v_type, v_alt, v_ref in detect_variants_from_cigar(
                 seg["offset_on_node"], seg["cigar_ops"], seg["read_sequence"], node_sequence):
