@@ -350,7 +350,6 @@ def process_single_node_for_pileup(task_args):
     (node_id, dat_file_offset, n_records,
      min_af_threshold, min_variants_threshold, min_allele_bq_threshold,
      variant_type_to_process) = task_args
-    print(node_id)
     global worker_dat_file, worker_base_output_dir, worker_need_view
     global GLOBAL_NODE_SEQS, GLOBAL_NODE_AF_BINS
     tensor_files_generated_for_node = 0
@@ -424,7 +423,7 @@ def process_single_node_for_pileup(task_args):
             candidate_variants[(v_pos, v_type, v_ref, v_alt)] += 1
     view_oriented_variant_data = {} if worker_need_view else None
     variant_headers_for_summary = []
-
+    print(node_id)
     for (v_pos, v_type, v_ref_from_cigar, v_alt_from_cigar), _ in candidate_variants.items():
         if variant_type_to_process == 'snp' and v_type != 'X':
             continue
