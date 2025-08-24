@@ -6,6 +6,7 @@ import os
 import sys
 import time
 import math
+import gzip
 import numpy as np
 from collections import defaultdict
 import re
@@ -31,7 +32,7 @@ DEFAULT_MAPPING_QUALITY_PADDING = -1
 MISMATCH_CHANNEL_REF_ROW_VALUE = 0
 MISMATCH_COMPARISON_PADDING_VALUE = -1
 
-# Globals for worker process state (used only with ProcessPoolExecutor)
+# Globals for worker process state (ProcessPool only)
 worker_dat_file = None
 worker_base_output_dir = None
 
@@ -41,6 +42,9 @@ _CIGAR_CACHE = {}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
+def open_maybe_gzip(path, mode="rt"):
+    return gzip.open(path, mode) if path.endswith(".gz") else open(path, mode)
+
 def _print_progress(s: str):
     sys.stdout.write("\r\033[K" + s)
     sys.stdout.flush()
@@ -239,7 +243,7 @@ def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
     return bases, quals, mapqs, cigar_ops_indices
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AF compaction (float/list → uint8 0..127)
+# AF compaction (float list → uint8 1..127; string digits → 0..7)
 def _af_float_to_u8(x: float) -> int:
     try:
         xf = float(x)
@@ -247,18 +251,37 @@ def _af_float_to_u8(x: float) -> int:
         return 0
     if xf <= 0.0:
         return 0
-    val = int(127.0 - (10.0 * math.log10(xf)))  # ~PHRED inverted, clamped to 1..127
+    # Inverted PHRED-like scaling into 1..127
+    val = int(127.0 - (10.0 * math.log10(xf)))
     if val < 1: val = 1
     if val > 127: val = 127
     return val
 
-def af_list_to_u8_array(af_list, expected_len):
+def af_field_to_u8_array(af_field, expected_len):
+    """
+    af_field may be:
+      - list of floats -> convert to 1..127
+      - string of digits '0'..'7' -> copy digits (0..7)
+      - None / empty -> zeros
+    """
     out = np.zeros(expected_len, dtype=np.uint8)
-    if not af_list:
+    if af_field is None:
         return out
-    m = min(expected_len, len(af_list))
-    for i in range(m):
-        out[i] = _af_float_to_u8(af_list[i])
+    if isinstance(af_field, list):
+        m = min(expected_len, len(af_field))
+        for i in range(m):
+            out[i] = _af_float_to_u8(af_field[i])
+        return out
+    if isinstance(af_field, str):
+        m = min(expected_len, len(af_field))
+        for i in range(m):
+            ch = af_field[i]
+            if '0' <= ch <= '9':
+                v = ord(ch) - 48
+                if v < 0: v = 0
+                if v > 7: v = 7
+                out[i] = v
+        return out
     return out
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -283,7 +306,6 @@ def process_single_node_for_pileup(task_args):
      need_view, use_process, dat_path_thr, base_out_thr) = task_args
 
     global worker_dat_file, worker_base_output_dir
-    # pick proper file/output handles
     if use_process:
         fdat = worker_dat_file
         base_out = worker_base_output_dir
@@ -473,14 +495,8 @@ def process_single_node_for_pileup(task_args):
                     ch6[r, :] = ch6[0, :]
                     reads_added += 1
 
-            # Save tensor
             arr = np.empty((6, H, W), dtype=np.int8)
-            arr[0] = ch1
-            arr[1] = ch2
-            arr[2] = ch3
-            arr[3] = ch4
-            arr[4] = ch5
-            arr[5] = ch6
+            arr[0] = ch1; arr[1] = ch2; arr[2] = ch3; arr[3] = ch4; arr[4] = ch5; arr[5] = ch6
             np.save(os.path.join(node_specific_output_dir, f"{variant_key_string}.npy"), arr, allow_pickle=False)
 
             variant_headers_for_summary.append({
@@ -502,13 +518,11 @@ def process_single_node_for_pileup(task_args):
         return node_id, view_oriented_variant_data, tensor_files_generated_for_node
     finally:
         if not use_process and fdat is not None:
-            try:
-                fdat.close()
-            except Exception:
-                pass
+            try: fdat.close()
+            except Exception: pass
 
 # ─────────────────────────────────────────────────────────────────────────────
-# View (unchanged)
+# View
 def display_pileup_data(node_data_for_display_view, node_id_str_for_display, full_node_sequence,
                         max_reads_to_display_per_variant, max_variants_to_display=float('inf'),
                         show_empty_info=False):
@@ -552,6 +566,18 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
     print()
 
 # ─────────────────────────────────────────────────────────────────────────────
+# JSON loader that accepts list or {"nodes":[...]} (and .gz)
+def load_nodes_json(path):
+    with open_maybe_gzip(path, "rt") as f:
+        data = json.load(f)
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        if "nodes" in data and isinstance(data["nodes"], list):
+            return data["nodes"]
+    raise ValueError("JSON must be a list or a dict with key 'nodes' (list).")
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 def main():
     parser = argparse.ArgumentParser(
@@ -562,9 +588,9 @@ def main():
     parser.add_argument("idx", help=".idx index file")
     parser.add_argument("output", help="Base output directory")
     parser.add_argument("candidate_variants_json",
-                        help="Primary JSON with nodes (subset) including sequences and optional genomead_af.")
+                        help="Primary JSON with nodes (subset) including sequences and optional genomead_af (.gz ok).")
     parser.add_argument("--all_nodes_json", default=None,
-                        help="Optional JSON with sequences for ALL nodes (node_id, sequence) to process nodes not in primary JSON (their ch6 will be zeros).")
+                        help="Optional JSON with sequences for ALL nodes (node_id, sequence) to process nodes not in primary JSON (their ch6 will be zeros). .gz ok.")
     parser.add_argument("--num_workers", type=int, default=os.cpu_count(), help="Number of workers")
     parser.add_argument("--executor", choices=["process", "thread"], default="process",
                         help="Use process (default) or thread pool. Thread saves RAM (no pickling).")
@@ -588,24 +614,25 @@ def main():
         sys.exit(f"Error: --all_nodes_json file not found: {args.all_nodes_json}")
     os.makedirs(args.output, exist_ok=True)
 
-    # Load primary JSON (sequence + compact AF)
+    # Load primary JSON (list or dict-with-nodes)
     node_sequences_primary, node_af_u8_primary = {}, {}
     print(f"Loading nodes from {args.candidate_variants_json}...")
     try:
-        with open(args.candidate_variants_json, 'r') as f:
-            data = json.load(f)
-        for node_obj in data.get('nodes', []):
-            node_id_str = node_obj.get('node_id')
+        nodes = load_nodes_json(args.candidate_variants_json)
+        for node_obj in nodes:
+            # accept 'node_id' or 'id'
+            node_id_val = node_obj.get('node_id', node_obj.get('id'))
             sequence = node_obj.get('sequence')
-            af_list = node_obj.get('genomead_af', [])
-            if node_id_str and sequence:
-                try:
-                    nid = int(node_id_str)
-                    seq_up = sequence.upper()
-                    node_sequences_primary[nid] = seq_up
-                    node_af_u8_primary[nid] = af_list_to_u8_array(af_list, len(seq_up))
-                except ValueError:
-                    pass
+            af_field = node_obj.get('genomead_af', None)
+            if node_id_val is None or sequence is None:
+                continue
+            try:
+                nid = int(str(node_id_val))
+            except Exception:
+                continue
+            seq_up = str(sequence).upper()
+            node_sequences_primary[nid] = seq_up
+            node_af_u8_primary[nid] = af_field_to_u8_array(af_field, len(seq_up))
     except Exception as e:
         sys.exit(f"Error reading or parsing JSON file: {e}")
     print(f"Primary JSON provides sequences for {len(node_sequences_primary)} node IDs.")
@@ -615,18 +642,18 @@ def main():
     if args.all_nodes_json:
         print(f"Loading fallback sequences from {args.all_nodes_json}...")
         try:
-            with open(args.all_nodes_json, 'r') as f:
-                data_f = json.load(f)
-            for node_obj in data_f.get('nodes', []):
-                node_id_str = node_obj.get('node_id')
+            nodes_f = load_nodes_json(args.all_nodes_json)
+            for node_obj in nodes_f:
+                node_id_val = node_obj.get('node_id', node_obj.get('id'))
                 sequence = node_obj.get('sequence')
-                if node_id_str and sequence:
-                    try:
-                        nid = int(node_id_str)
-                        if nid not in node_sequences_primary:
-                            node_sequences_fallback[nid] = sequence.upper()
-                    except ValueError:
-                        pass
+                if node_id_val is None or sequence is None:
+                    continue
+                try:
+                    nid = int(str(node_id_val))
+                except Exception:
+                    continue
+                if nid not in node_sequences_primary:
+                    node_sequences_fallback[nid] = str(sequence).upper()
             print(f"Fallback JSON provides sequences for {len(node_sequences_fallback)} node IDs.")
         except Exception as e:
             sys.exit(f"Error reading or parsing --all_nodes_json: {e}")
@@ -636,17 +663,16 @@ def main():
     node_seq_map.update(node_sequences_fallback)
     node_seq_map.update(node_sequences_primary)
 
-    # Prepare executor
+    # Executor selection
     use_process = (args.executor == "process")
     Pool = ProcessPoolExecutor if use_process else ThreadPoolExecutor
+    init_kw = {}
+    if use_process:
+        init_kw = dict(initializer=init_worker, initargs=(args.dat, args.output))
 
     total_tensors = 0
     processed_nodes = 0
     start_time = time.time()
-
-    init_kw = {}
-    if use_process:
-        init_kw = dict(initializer=init_worker, initargs=(args.dat, args.output))
 
     print(f"\nSubmitting tasks in waves of {args.wave_size} to {args.num_workers} {args.executor}(s)...")
     idx_stream = iter_idx_entries(args.idx)
@@ -667,7 +693,7 @@ def main():
 
     with Pool(max_workers=args.num_workers, **init_kw) as ex:
         futures = []
-        # Fill up the first wave
+        # prime first wave
         for node_id, offset, n_records in idx_stream:
             task = make_task(node_id, offset, n_records)
             if task is None:
@@ -676,7 +702,7 @@ def main():
             if len(futures) >= args.wave_size:
                 break
 
-        # Process waves
+        # process waves
         while futures:
             for fut in as_completed(futures):
                 try:
@@ -700,7 +726,7 @@ def main():
                 rate = processed_nodes / elapsed
                 _print_progress(f"Processed {processed_nodes:,} nodes | {rate:,.1f} nodes/s | tensors: {total_tensors:,} | elapsed: {elapsed:,.1f}s")
 
-                # As one finishes, try to top up the wave by submitting one more task
+                # top up the wave
                 try:
                     node_id, offset, n_records = next(idx_stream)
                     task = make_task(node_id, offset, n_records)
@@ -709,7 +735,6 @@ def main():
                 except StopIteration:
                     pass
 
-                # Remove the completed future from the list
                 futures.remove(fut)
 
     sys.stdout.write("\n")
