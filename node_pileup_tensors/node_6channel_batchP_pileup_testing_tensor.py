@@ -670,7 +670,6 @@ def main():
             batch_nodes = 0
             batch_tensors = 0
             t0 = time.time()
-            print(wave_tasks[:10])
             for node_id, view_data, tensor_count in ex.map(
                     process_single_node_for_pileup, wave_tasks, chunksize=max(1, args.chunksize)):
                 total_processed += 1
@@ -679,7 +678,7 @@ def main():
                 total_tensors += tensor_count
                 wave_tensors += tensor_count
                 batch_tensors += tensor_count
-
+                print(total_processed)
                 if need_view and view_data:
                     display_pileup_data(view_data, str(node_id), GLOBAL_NODE_SEQS.get(node_id, ""),
                                         args.max_view_reads,
