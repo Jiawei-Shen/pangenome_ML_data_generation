@@ -361,7 +361,7 @@ def process_single_node_for_pileup(task_args):
     if not node_sequence:
         return node_id, {}, tensor_files_generated_for_node
     node_len = len(node_sequence)
-
+    print(node_id, node_sequence)
     af_bins = GLOBAL_NODE_AF_BINS.get(node_id, None)
 
     aligned_read_segments = []
@@ -417,8 +417,6 @@ def process_single_node_for_pileup(task_args):
     if not aligned_read_segments:
         return node_id, {}, tensor_files_generated_for_node
 
-    candidate_variants = defaultdict(int)
-    print(node_id, len(aligned_read_segments))
     for seg in aligned_read_segments:
         for v_pos, v_type, v_alt, v_ref in detect_variants_from_cigar(
                 seg["offset_on_node"], seg["cigar_ops"], seg["read_sequence"], node_sequence):
