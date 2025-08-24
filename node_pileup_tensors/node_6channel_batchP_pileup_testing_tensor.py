@@ -1,24 +1,20 @@
 #!/usr/bin/env python3
 """
-Generate variant-centered tensors for ALL nodes present in .idx/.dat.
-Sequence + AF come from merged.json.
+Same as before, but submits work in waves (chunks) so we don't enqueue millions
+of tasks at once.
 
-Channel 6 policy:
-  - Always integers 0..7.
-  - If merged.json AF is a digit string '0'..'7' per base → use digits directly.
-  - If AF is a float list → bin into 8 levels:
-      0–1e-6→0, 1e-6–1e-5→1, 1e-5–1e-4→2, 1e-4–1e-3→3,
-      1e-3–1e-2→4, 1e-2–0.1→5, 0.1–0.5→6, 0.5–1.0→7
-  - If a node has NO AF in merged.json → set channel 6 to 0 everywhere,
-    and set ONLY the variant column to 3.
+New flag:
+  --wave_size  INT  (default: 100000)
 
-Usage:
-  python build_all_nodes_from_idx.py DAT.dat IDX.idx OUT_DIR merged.json[.gz]
+Example:
+  python build_all_nodes_from_idx.py DAT.dat IDX.idx OUT_DIR merged.json.gz \
+    --num_workers 32 --chunksize 512 --wave_size 100000
 """
 
 import argparse
 import gzip
 import json
+import math
 import os
 import re
 import struct
@@ -119,7 +115,6 @@ def load_full_idx_data(idx_path: str) -> Optional[Dict[int, Tuple[int, int]]]:
 # AF handling: bins 0..7
 
 def af_float_to_bin(x: float) -> int:
-    """Bin a float AF into 0..7 according to the 8 ranges."""
     try:
         x = float(x)
     except Exception:
@@ -132,15 +127,9 @@ def af_float_to_bin(x: float) -> int:
     if x < 1e-2:          return 4
     if x < 0.1:           return 5
     if x < 0.5:           return 6
-    return 7  # 0.5–1.0 (and any >1 clamps to 7)
+    return 7
 
 def normalize_af_to_bins(af_field: Any, expected_len: int) -> Optional[List[int]]:
-    """
-    Returns list[int] (0..7) length==expected_len, or None if AF truly missing.
-    - If list → bin floats into 0..7.
-    - If string → direct digits '0'..'7' (others become 0).
-    - Empty/None/missing → return None (signals "no AF" special behavior).
-    """
     if af_field is None:
         return None
     if isinstance(af_field, list):
@@ -158,7 +147,6 @@ def normalize_af_to_bins(af_field: Any, expected_len: int) -> Optional[List[int]
         if len(vals) < expected_len:
             vals.extend([0] * (expected_len - len(vals)))
         return vals
-    # Unknown type → treat as missing
     return None
 
 def load_sequences_and_af_bins(merged_path: str,
@@ -166,18 +154,12 @@ def load_sequences_and_af_bins(merged_path: str,
                                seq_key: str = "sequence",
                                af_key: str = "genomead_af"
                                ) -> Tuple[Dict[int, str], Dict[int, Optional[List[int]]]]:
-    """
-    Read merged.json (list or {'nodes': [...]}) and return:
-      seqs: {node_id:int -> sequence:str}
-      af_bins: {node_id:int -> list[int] 0..7} or None if AF missing
-    """
     log(f"Loading merged JSON: {merged_path}")
     with open_maybe_gzip(merged_path, "rt") as f:
         data = json.load(f)
     nodes = data.get("nodes") if isinstance(data, dict) else data
     if not isinstance(nodes, list):
         raise ValueError("Merged JSON must be a list or a dict with 'nodes'.")
-
     seqs: Dict[int, str] = {}
     af_bins: Dict[int, Optional[List[int]]] = {}
     skipped = 0
@@ -197,7 +179,7 @@ def load_sequences_and_af_bins(merged_path: str,
     return seqs, af_bins
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Variant calling helpers (unchanged logic)
+# Variant helpers (unchanged core)
 
 def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_quality_values, read_cigar_ops_decoded,
                                      target_node_pos, node_sequence,
@@ -381,13 +363,11 @@ def process_single_node_for_pileup(task_args):
         return node_id, {}, tensor_files_generated_for_node
     node_len = len(node_sequence)
 
-    # AF bins: list[int] 0..7 OR None (means "no AF")
     af_bins = GLOBAL_NODE_AF_BINS.get(node_id, None)
 
-    # Read all records for this node
     aligned_read_segments = []
     try:
-        worker_dat_file.seek(dat_file_offset + 10)  # keep original header skip
+        worker_dat_file.seek(dat_file_offset + 10)
         bulk = worker_dat_file.read(n_records * RECORD_SIZE)
         if len(bulk) < n_records * RECORD_SIZE:
             n_records = len(bulk) // RECORD_SIZE
@@ -438,7 +418,6 @@ def process_single_node_for_pileup(task_args):
     if not aligned_read_segments:
         return node_id, {}, tensor_files_generated_for_node
 
-    # Collect candidate variants from CIGARs
     candidate_variants = defaultdict(int)
     for seg in aligned_read_segments:
         for v_pos, v_type, v_alt, v_ref in detect_variants_from_cigar(
@@ -503,7 +482,6 @@ def process_single_node_for_pileup(task_args):
         window_center_pos = v_pos + 1 if v_type == 'I' else v_pos
         window_start_pos = calculate_window_start(window_center_pos, TENSOR_WINDOW_SIZE)
 
-        # Build reference row and channel 6 (AF bins)
         ref_base_indices_row = [PADDING_BASE_INDEX] * TENSOR_WINDOW_SIZE
         for i, pos in enumerate(range(window_start_pos, window_start_pos + TENSOR_WINDOW_SIZE)):
             if 0 <= pos < node_len:
@@ -511,17 +489,14 @@ def process_single_node_for_pileup(task_args):
 
         af_row_bins = [0] * TENSOR_WINDOW_SIZE
         if af_bins is not None:
-            # Use provided AF bins 0..7 from merged.json
             for i, pos in enumerate(range(window_start_pos, window_start_pos + TENSOR_WINDOW_SIZE)):
                 if 0 <= pos < node_len and pos < len(af_bins):
                     af_row_bins[i] = int(af_bins[pos])
         else:
-            # No AF for this node → set only the variant column to 3
             variant_window_index = v_pos - window_start_pos
             if 0 <= variant_window_index < TENSOR_WINDOW_SIZE:
                 af_row_bins[variant_window_index] = 3
 
-        # Allocate channels
         H, W = 1 + TENSOR_MAX_READ_ROWS, TENSOR_WINDOW_SIZE
         ch1 = np.full((H, W), PADDING_BASE_INDEX, dtype=np.int8)
         ch2 = np.full((H, W), DEFAULT_QUALITY_PADDING, dtype=np.int8)
@@ -533,7 +508,6 @@ def process_single_node_for_pileup(task_args):
         ch1[0, :] = np.asarray(ref_base_indices_row, dtype=np.int8)
         ch6[0, :] = np.asarray(af_row_bins, dtype=np.int8)
 
-        # Fill read rows
         reads_added = 0
         variant_window_index = v_pos - window_start_pos
         for seg in aligned_read_segments:
@@ -549,7 +523,6 @@ def process_single_node_for_pileup(task_args):
                 r = 1 + reads_added
                 ch1[r, :] = np.asarray(base_row, dtype=np.int8)
                 ch2[r, :] = np.asarray(qual_row, dtype=np.int8)
-                # mismatch flags
                 ref_row = ch1[0, :].astype(np.int16)
                 read_row = ch1[r, :].astype(np.int16)
                 flags = np.full(W, MISMATCH_COMPARISON_PADDING_VALUE, dtype=np.int8)
@@ -560,10 +533,10 @@ def process_single_node_for_pileup(task_args):
                 ch3[r, :] = flags
                 ch4[r, :] = np.asarray(mapq_row, dtype=np.int8)
                 ch5[r, :] = np.asarray(cigar_row, dtype=np.int8)
-                ch6[r, :] = ch6[0, :]  # replicate AF bins row
+                ch6[r, :] = ch6[0, :]
                 reads_added += 1
 
-        tensor = np.stack([ch1, ch2, ch3, ch4, ch5, ch6], axis=0)  # (6, H, W)
+        tensor = np.stack([ch1, ch2, ch3, ch4, ch5, ch6], axis=0)
         node_dir = os.path.join(worker_base_output_dir, str(node_id))
         os.makedirs(node_dir, exist_ok=True)
         npy_name = f"{variant_key_string}.npy"
@@ -620,7 +593,7 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Build tensors for ALL .idx nodes; channel 6 is AF bins (0..7), or 3 at variant if AF missing.",
+        description="Build tensors for ALL .idx nodes in waves; channel 6 is AF bins (0..7), or 3 at variant if AF missing.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument("dat", help=".dat alignment file")
     ap.add_argument("idx", help=".idx index file")
@@ -628,6 +601,7 @@ def main():
     ap.add_argument("merged_json", help="Merged node JSON with sequence and AF (list or {'nodes':[...]}); .gz ok")
     ap.add_argument("--num_workers", type=int, default=os.cpu_count(), help="Worker processes")
     ap.add_argument("--chunksize", type=int, default=512, help="executor.map chunksize")
+    ap.add_argument("--wave_size", type=int, default=100000, help="Max nodes to submit per wave")
     ap.add_argument("--view", nargs='?', const=-1, default=None, type=int, metavar='N',
                     help="Print pileups for top N variants per node (-1 for all)")
     ap.add_argument("--max_view_reads", type=int, default=20, help="Reads per pileup in view mode")
@@ -670,41 +644,63 @@ def main():
     GLOBAL_NODE_SEQS = seqs_map
     GLOBAL_NODE_AF_BINS = af_bins_map
 
-    log(f"Submitting {len(tasks):,} nodes (missing sequences in merged_json: {missing_seq:,})")
+    total_tasks = len(tasks)
+    wave_size = max(1, int(args.wave_size))
+    n_waves = math.ceil(total_tasks / wave_size)
+
+    log(f"Submitting {total_tasks:,} nodes in {n_waves} wave(s) of up to {wave_size:,} each "
+        f"(missing sequences in merged_json: {missing_seq:,})")
 
     total_tensors = 0
-    processed = 0
-    batch_nodes = 0
-    batch_tensors = 0
-    t0 = time.time()
+    total_processed = 0
 
+    # Reuse one pool across waves to reduce spawn overhead
     with ProcessPoolExecutor(max_workers=args.num_workers,
                              initializer=init_worker,
                              initargs=(args.dat, args.output, need_view)) as ex:
-        for node_id, view_data, tensor_count in ex.map(process_single_node_for_pileup, tasks,
-                                                       chunksize=max(1, args.chunksize)):
-            processed += 1
-            batch_nodes += 1
-            total_tensors += tensor_count
-            batch_tensors += tensor_count
 
-            if need_view and view_data:
-                display_pileup_data(view_data, str(node_id), GLOBAL_NODE_SEQS.get(node_id, ""),
-                                    args.max_view_reads,
-                                    args.view if args.view != -1 else float('inf'))
+        for w in range(n_waves):
+            start = w * wave_size
+            end = min(start + wave_size, total_tasks)
+            wave_tasks = tasks[start:end]
+            log(f"[Wave {w+1}/{n_waves}] Submitting indices [{start}:{end}) — {len(wave_tasks):,} nodes")
 
-            if batch_nodes >= 1000 or processed == len(tasks):
-                dt = time.time() - t0
-                rate = batch_nodes / dt if dt > 0 else 0.0
-                log(f"Processed {processed:,}/{len(tasks):,}  "
-                    f"batch_nodes={batch_nodes:,}  tensors={batch_tensors:,}  "
-                    f"in {dt:.2f}s ({rate:.1f} nodes/s)")
-                batch_nodes = 0
-                batch_tensors = 0
-                t0 = time.time()
+            wave_processed = 0
+            wave_tensors = 0
+            batch_nodes = 0
+            batch_tensors = 0
+            t0 = time.time()
 
-    log(f"Done. Nodes processed: {processed:,}; tensors: {total_tensors:,}; "
-        f"nodes without sequence in merged_json: {missing_seq:,}")
+            for node_id, view_data, tensor_count in ex.map(
+                    process_single_node_for_pileup, wave_tasks, chunksize=max(1, args.chunksize)):
+                total_processed += 1
+                wave_processed += 1
+                batch_nodes += 1
+                total_tensors += tensor_count
+                wave_tensors += tensor_count
+                batch_tensors += tensor_count
+
+                if need_view and view_data:
+                    display_pileup_data(view_data, str(node_id), GLOBAL_NODE_SEQS.get(node_id, ""),
+                                        args.max_view_reads,
+                                        args.view if args.view != -1 else float('inf'))
+
+                if batch_nodes >= 1000 or total_processed == total_tasks:
+                    dt = time.time() - t0
+                    rate = batch_nodes / dt if dt > 0 else 0.0
+                    log(f"[Wave {w+1}/{n_waves}] "
+                        f"processed {wave_processed:,}/{len(wave_tasks):,} "
+                        f"(global {total_processed:,}/{total_tasks:,})  "
+                        f"batch_nodes={batch_nodes:,} tensors_in_batch={batch_tensors:,}  "
+                        f"in {dt:.2f}s ({rate:.1f} nodes/s)")
+                    batch_nodes = 0
+                    batch_tensors = 0
+                    t0 = time.time()
+
+            log(f"[Wave {w+1}/{n_waves}] DONE — nodes:{wave_processed:,}, tensors:{wave_tensors:,}")
+
+    log(f"ALL WAVES DONE. Nodes processed: {total_processed:,}/{total_tasks:,}; "
+        f"total tensors: {total_tensors:,}; nodes without sequence in merged_json: {missing_seq:,}")
 
 if __name__ == "__main__":
     main()
