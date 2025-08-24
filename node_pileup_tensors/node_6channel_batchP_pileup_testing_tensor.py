@@ -26,9 +26,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from test_new_dataformat.read_df import print_node_ids
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # I/O + logging
 
@@ -353,6 +350,7 @@ def process_single_node_for_pileup(task_args):
     (node_id, dat_file_offset, n_records,
      min_af_threshold, min_variants_threshold, min_allele_bq_threshold,
      variant_type_to_process) = task_args
+
     global worker_dat_file, worker_base_output_dir, worker_need_view
     global GLOBAL_NODE_SEQS, GLOBAL_NODE_AF_BINS
     tensor_files_generated_for_node = 0
@@ -558,8 +556,6 @@ def process_single_node_for_pileup(task_args):
         with open(os.path.join(worker_base_output_dir, str(node_id), "variant_summary.json"), 'w') as f:
             json.dump({"node_id": node_id, "node_length": len(node_sequence),
                        "variants_passing_af_filter": variant_headers_for_summary}, f, indent=2)
-
-    print(node_id)
     return node_id, (view_oriented_variant_data or {}), tensor_files_generated_for_node
 
 # ─────────────────────────────────────────────────────────────────────────────
