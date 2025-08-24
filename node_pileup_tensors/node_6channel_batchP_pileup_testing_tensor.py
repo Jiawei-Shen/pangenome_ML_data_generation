@@ -347,13 +347,13 @@ def init_worker(dat_file_path_for_worker, base_output_dir_for_worker, need_view_
     worker_need_view = bool(need_view_flag)
 
 def process_single_node_for_pileup(task_args):
+    print(task_args)
     (node_id, dat_file_offset, n_records,
      min_af_threshold, min_variants_threshold, min_allele_bq_threshold,
      variant_type_to_process) = task_args
 
     global worker_dat_file, worker_base_output_dir, worker_need_view
     global GLOBAL_NODE_SEQS, GLOBAL_NODE_AF_BINS
-
     tensor_files_generated_for_node = 0
     if worker_dat_file is None or worker_base_output_dir is None:
         return node_id, None, tensor_files_generated_for_node
