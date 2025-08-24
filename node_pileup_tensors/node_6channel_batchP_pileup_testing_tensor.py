@@ -26,6 +26,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from test_new_dataformat.read_df import print_node_ids
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # I/O + logging
 
@@ -361,9 +364,8 @@ def process_single_node_for_pileup(task_args):
     if not node_sequence:
         return node_id, {}, tensor_files_generated_for_node
     node_len = len(node_sequence)
-    print(node_id, node_sequence)
     af_bins = GLOBAL_NODE_AF_BINS.get(node_id, None)
-
+    print(node_id, af_bins)
     aligned_read_segments = []
     try:
         worker_dat_file.seek(dat_file_offset + 10)
@@ -416,9 +418,7 @@ def process_single_node_for_pileup(task_args):
 
     if not aligned_read_segments:
         return node_id, {}, tensor_files_generated_for_node
-
     candidate_variants = defaultdict(int)
-
     for seg in aligned_read_segments:
         for v_pos, v_type, v_alt, v_ref in detect_variants_from_cigar(
                 seg["offset_on_node"], seg["cigar_ops"], seg["read_sequence"], node_sequence):
