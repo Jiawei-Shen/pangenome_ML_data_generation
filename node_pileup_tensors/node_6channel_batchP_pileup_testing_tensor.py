@@ -418,6 +418,7 @@ def process_single_node_for_pileup(task_args):
         return node_id, {}, tensor_files_generated_for_node
 
     candidate_variants = defaultdict(int)
+    print(node_id, len(aligned_read_segments))
     for seg in aligned_read_segments:
         for v_pos, v_type, v_alt, v_ref in detect_variants_from_cigar(
                 seg["offset_on_node"], seg["cigar_ops"], seg["read_sequence"], node_sequence):
@@ -425,9 +426,7 @@ def process_single_node_for_pileup(task_args):
     view_oriented_variant_data = {} if worker_need_view else None
     variant_headers_for_summary = []
 
-    print(node_id, len(candidate_variants))
-    # if node_id == 57652374:
-        # print(candidate_variants)
+    # print(node_id, len(candidate_variants))
 
     for (v_pos, v_type, v_ref_from_cigar, v_alt_from_cigar), _ in candidate_variants.items():
         if variant_type_to_process == 'snp' and v_type != 'X':
