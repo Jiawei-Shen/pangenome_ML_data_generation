@@ -418,7 +418,7 @@ def process_single_node_for_pileup(task_args):
         return node_id, {}, tensor_files_generated_for_node
 
     candidate_variants = defaultdict(int)
-    if len(aligned_read_segments) > 5000:
+    if len(aligned_read_segments) > 10000:
         print(f"Alert!! Node {node_id} has {len(aligned_read_segments)} on it while Node Length is {node_len} and AF is {af_bins}, drop this node.")
         return node_id, None, tensor_files_generated_for_node
 
