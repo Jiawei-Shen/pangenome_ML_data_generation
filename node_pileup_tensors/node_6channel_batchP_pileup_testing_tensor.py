@@ -423,7 +423,7 @@ def process_single_node_for_pileup(task_args):
             candidate_variants[(v_pos, v_type, v_ref, v_alt)] += 1
     view_oriented_variant_data = {} if worker_need_view else None
     variant_headers_for_summary = []
-    print(node_id)
+
     for (v_pos, v_type, v_ref_from_cigar, v_alt_from_cigar), _ in candidate_variants.items():
         if variant_type_to_process == 'snp' and v_type != 'X':
             continue
@@ -549,7 +549,7 @@ def process_single_node_for_pileup(task_args):
             "mean_alt_allele_base_quality": round(mean_alt_bq, 2)
         })
         tensor_files_generated_for_node += 1
-
+    print(node_id, "done")
     if variant_headers_for_summary:
         with open(os.path.join(worker_base_output_dir, str(node_id), "variant_summary.json"), 'w') as f:
             json.dump({"node_id": node_id, "node_length": len(node_sequence),
