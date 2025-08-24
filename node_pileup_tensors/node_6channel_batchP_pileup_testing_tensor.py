@@ -594,7 +594,7 @@ def main():
     parser.add_argument("--num_workers", type=int, default=os.cpu_count(), help="Number of workers")
     parser.add_argument("--executor", choices=["process", "thread"], default="process",
                         help="Use process (default) or thread pool. Thread saves RAM (no pickling).")
-    parser.add_argument("--wave_size", type=int, default=100000,
+    parser.add_argument("--wave_size", type=int, default=1000000,
                         help="Maximum number of in-flight tasks (futures) at a time.")
     parser.add_argument("--view", nargs='?', const=-1, default=None, type=int, metavar='N',
                         help="Print pileups for top N variants per node (-1 for all). Omit for speed.")
