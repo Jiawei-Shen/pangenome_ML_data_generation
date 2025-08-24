@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
 """
-Same as before, but submits work in waves (chunks) so we don't enqueue millions
-of tasks at once.
+Build tensors for .idx/.dat nodes in memory-safe waves.
 
-New flag:
-  --wave_size  INT  (default: 100000)
+Key memory fixes:
+  • Stream the .idx file into waves; don't build an all-nodes dict.
+  • For each wave, stream merged_json and pick only needed node records.
+  • Publish only wave-scoped GLOBAL_NODE_SEQS / GLOBAL_NODE_AF_BINS before forking.
 
-Example:
-  python build_all_nodes_from_idx.py DAT.dat IDX.idx OUT_DIR merged.json.gz \
-    --num_workers 32 --chunksize 512 --wave_size 100000
+Channel 6 policy (AF):
+  - Integer bins 0..7 per base.
+  - If merged.json AF is digit string '0'..'7' per base -> use digits as bins.
+  - If AF is a float list -> bin into 8 levels:
+      0–1e-6→0, 1e-6–1e-5→1, 1e-5–1e-4→2, 1e-4–1e-3→3,
+      1e-3–1e-2→4, 1e-2–0.1→5, 0.1–0.5→6, 0.5–1.0→7
+  - If a node has NO AF -> channel 6 is 0 everywhere, except the variant column is 3.
+
+Usage example:
+  python build_all_nodes_from_idx_waves.py DAT.dat IDX.idx OUT_DIR merged.json[.gz] \
+    --num_workers 32 --chunksize 512 --wave_size 100000 --variant_type snp
 """
 
 import argparse
@@ -22,15 +31,12 @@ import sys
 import time
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Iterable, Set
 
 import numpy as np
 
 # ─────────────────────────────────────────────────────────────────────────────
-# I/O + logging
-
-def open_maybe_gzip(path: str, mode: str = "rt"):
-    return gzip.open(path, mode) if path.endswith(".gz") else open(path, mode)
+# Logging
 
 def ts() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
@@ -59,25 +65,25 @@ DEFAULT_MAPPING_QUALITY_PADDING = -1
 MISMATCH_CHANNEL_REF_ROW_VALUE = 0
 MISMATCH_COMPARISON_PADDING_VALUE = -1
 
-# Worker globals
+# Worker globals (wave-scoped)
 worker_dat_file = None
 worker_base_output_dir = None
 worker_need_view = False
 GLOBAL_NODE_SEQS: Dict[int, str] = {}
-GLOBAL_NODE_AF_BINS: Dict[int, Optional[List[int]]] = {}  # None means "no AF available"
+GLOBAL_NODE_AF_BINS: Dict[int, Optional[np.ndarray]] = {}  # None -> missing AF
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 
-def reverse_complement(sequence):
+def reverse_complement(sequence: str) -> str:
     complement_map = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")
     return sequence.translate(complement_map)[::-1]
 
-def calculate_window_start(variant_pos, window_size):
+def calculate_window_start(variant_pos: int, window_size: int) -> int:
     center_index = window_size // 2
     return variant_pos - center_index
 
-def decode_cigar_to_int_ops(cigar_string):
+def decode_cigar_to_int_ops(cigar_string: str) -> List[Tuple[int, str]]:
     if not cigar_string or cigar_string == '*':
         return []
     try:
@@ -86,33 +92,115 @@ def decode_cigar_to_int_ops(cigar_string):
         sys.stderr.write(f"Warning: Could not parse CIGAR '{cigar_string}': {e}\n")
         return []
 
-def load_full_idx_data(idx_path: str) -> Optional[Dict[int, Tuple[int, int]]]:
-    """Return {node_id: (offset, n_records)} for ALL nodes in the idx."""
-    idx_data_map: Dict[int, Tuple[int, int]] = {}
-    log(f"Loading index: {idx_path}")
-    try:
-        with open(idx_path, 'rb') as f:
-            if os.fstat(f.fileno()).st_size < 4:
-                log("Error: index too small")
-                return None
-            n = struct.unpack('<I', f.read(4))[0]
-            for i in range(n):
-                rec = f.read(22)
-                if len(rec) < 22:
-                    log(f"Error: premature end at record {i+1}")
-                    break
-                node_id, offset, _, n_records, _ = struct.unpack('<I Q I I H', rec)
-                idx_data_map[node_id] = (offset, n_records)
-                if (i+1) % 5_000_000 == 0:
-                    log(f"  loaded {i+1:,}/{n:,}")
-        log(f"Index loaded: {len(idx_data_map):,} entries")
-        return idx_data_map
-    except Exception as e:
-        log(f"Error reading idx: {e}")
-        return None
+# ─────────────────────────────────────────────────────────────────────────────
+# Stream the IDX in waves (no giant dict)
+
+def iter_idx_waves(idx_path: str, wave_size: int) -> Iterable[List[Tuple[int, int, int]]]:
+    """Yield lists of (node_id, offset, n_records) of size up to wave_size."""
+    with open(idx_path, 'rb') as f:
+        header = f.read(4)
+        if len(header) < 4:
+            raise RuntimeError("Index file too small")
+        n = struct.unpack('<I', header)[0]
+        wave: List[Tuple[int, int, int]] = []
+        for i in range(n):
+            rec = f.read(22)
+            if len(rec) < 22:
+                log(f"Index ended prematurely at record {i+1}")
+                break
+            node_id, offset, _, n_records, _ = struct.unpack('<I Q I I H', rec)
+            wave.append((node_id, offset, n_records))
+            if len(wave) == wave_size:
+                wave.sort(key=lambda t: t[1])  # by dat offset
+                yield wave
+                wave = []
+        if wave:
+            wave.sort(key=lambda t: t[1])
+            yield wave
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AF handling: bins 0..7
+# Streaming JSON reader: yield node dicts without loading whole file
+
+def _open_maybe_gzip(path: str, mode: str = "rt"):
+    return gzip.open(path, mode) if path.endswith(".gz") else open(path, mode)
+
+def iter_nodes_from_merged(merged_path: str) -> Iterable[dict]:
+    """
+    Stream node objects from merged JSON that is either:
+      • a top-level list: [ {node}, {node}, ... ]
+      • or a dict wrapper: {"nodes":[ {node}, ... ], ...}
+    We do a lightweight brace-tracking parse to extract each { ... } inside the first '[' array.
+    """
+    with _open_maybe_gzip(merged_path, "rt") as f:
+        buf = []
+        in_array = False
+        depth = 0
+        in_str = False
+        esc = False
+
+        # Scan to the first '['
+        while True:
+            ch = f.read(1)
+            if not ch:
+                return
+            if ch == '[':
+                in_array = True
+                break
+
+        # Now extract JSON objects delimited by balanced '{...}' up to matching ']'
+        while True:
+            ch = f.read(1)
+            if not ch:
+                break
+
+            if not in_array:
+                continue
+
+            # Skip whitespace and commas until an object starts
+            if depth == 0:
+                if ch.isspace() or ch == ',':
+                    continue
+                if ch == ']':
+                    break
+                if ch != '{':
+                    # Unexpected token; keep scanning
+                    continue
+                # Start of object
+                buf = ['{']
+                depth = 1
+                in_str = False
+                esc = False
+                continue
+
+            # We're inside an object
+            buf.append(ch)
+
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == '\\':
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        # end of object
+                        obj_str = ''.join(buf)
+                        try:
+                            yield json.loads(obj_str)
+                        except Exception as e:
+                            sys.stderr.write(f"Warning: failed to parse node object: {e}\n")
+                        buf = []
+    # done
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AF binning
 
 def af_float_to_bin(x: float) -> int:
     try:
@@ -129,57 +217,72 @@ def af_float_to_bin(x: float) -> int:
     if x < 0.5:           return 6
     return 7
 
-def normalize_af_to_bins(af_field: Any, expected_len: int) -> Optional[List[int]]:
+def normalize_af_to_bins_compact(af_field, expected_len: int) -> Optional[np.ndarray]:
+    """
+    Return np.uint8 array length==expected_len with values 0..7, or None if AF truly missing.
+    Accept list[float] or digit string "0".."7" per base.
+    """
     if af_field is None:
         return None
-    if isinstance(af_field, list):
-        out = [af_float_to_bin(x) for x in af_field[:expected_len]]
-        if len(out) < expected_len:
-            out.extend([0] * (expected_len - len(out)))
-        return out
     if isinstance(af_field, str):
         if not af_field:
             return None
-        vals = []
-        for ch in af_field[:expected_len]:
-            d = ord(ch) - 48  # '0'->0
-            vals.append(d if 0 <= d <= 7 else 0)
-        if len(vals) < expected_len:
-            vals.extend([0] * (expected_len - len(vals)))
-        return vals
+        # Map ascii '0'..'7' -> 0..7; other chars -> 0
+        a = np.frombuffer(af_field.encode('ascii'), dtype=np.uint8)
+        a = np.where((a >= ord('0')) & (a <= ord('7')), a - ord('0'), 0).astype(np.uint8)
+        if a.size < expected_len:
+            out = np.zeros(expected_len, dtype=np.uint8)
+            out[:a.size] = a
+            return out
+        return a[:expected_len].copy()
+    if isinstance(af_field, list):
+        # bin floats
+        out = np.zeros(expected_len, dtype=np.uint8)
+        upto = min(expected_len, len(af_field))
+        # vectorizing via list-comp for clarity
+        out[:upto] = np.fromiter((af_float_to_bin(v) for v in af_field[:upto]), count=upto, dtype=np.uint8)
+        return out
     return None
 
-def load_sequences_and_af_bins(merged_path: str,
-                               id_key: str = "node_id",
-                               seq_key: str = "sequence",
-                               af_key: str = "genomead_af"
-                               ) -> Tuple[Dict[int, str], Dict[int, Optional[List[int]]]]:
-    log(f"Loading merged JSON: {merged_path}")
-    with open_maybe_gzip(merged_path, "rt") as f:
-        data = json.load(f)
-    nodes = data.get("nodes") if isinstance(data, dict) else data
-    if not isinstance(nodes, list):
-        raise ValueError("Merged JSON must be a list or a dict with 'nodes'.")
+# ─────────────────────────────────────────────────────────────────────────────
+# Load only the current wave's sequences/AF from merged JSON (streaming)
+
+def load_wave_seqs_and_af_bins_stream(merged_path: str, wanted_ids: Set[int]) -> Tuple[Dict[int, str], Dict[int, Optional[np.ndarray]], int]:
     seqs: Dict[int, str] = {}
-    af_bins: Dict[int, Optional[List[int]]] = {}
-    skipped = 0
-    for n in nodes:
-        if not isinstance(n, dict) or id_key not in n or seq_key not in n:
-            skipped += 1
+    af_bins: Dict[int, Optional[np.ndarray]] = {}
+    missing = 0
+    wanted = set(wanted_ids)
+    found = 0
+
+    for rec in iter_nodes_from_merged(merged_path):
+        if not isinstance(rec, dict):
+            continue
+        if 'sequence' not in rec:
+            continue
+        nid_raw = rec.get('node_id')
+        if nid_raw is None:
+            # allow records that only have sequence but not node_id? skip
             continue
         try:
-            nid = int(str(n[id_key]))
+            nid = int(str(nid_raw))
         except Exception:
-            skipped += 1
             continue
-        seq = str(n[seq_key]).upper()
+        if nid not in wanted:
+            continue
+        seq = str(rec.get('sequence', '')).upper()
+        if not seq:
+            missing += 1
+            continue
         seqs[nid] = seq
-        af_bins[nid] = normalize_af_to_bins(n.get(af_key), len(seq))
-    log(f"Merged JSON parsed: sequences={len(seqs):,}, skipped={skipped:,}")
-    return seqs, af_bins
+        af_bins[nid] = normalize_af_to_bins_compact(rec.get('genomead_af'), len(seq))
+        found += 1
+        if found == len(wanted):
+            break
+
+    return seqs, af_bins, missing
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Variant helpers (unchanged core)
+# Variant helpers
 
 def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_quality_values, read_cigar_ops_decoded,
                                      target_node_pos, node_sequence,
@@ -353,6 +456,7 @@ def process_single_node_for_pileup(task_args):
 
     global worker_dat_file, worker_base_output_dir, worker_need_view
     global GLOBAL_NODE_SEQS, GLOBAL_NODE_AF_BINS
+
     tensor_files_generated_for_node = 0
     if worker_dat_file is None or worker_base_output_dir is None:
         return node_id, None, tensor_files_generated_for_node
@@ -417,15 +521,16 @@ def process_single_node_for_pileup(task_args):
     if not aligned_read_segments:
         return node_id, {}, tensor_files_generated_for_node
 
-    candidate_variants = defaultdict(int)
+    # guard pathological nodes
     if len(aligned_read_segments) > 10000:
-        # print(f"Alert!! Node {node_id} has {len(aligned_read_segments)} on it while Node Length is {node_len} and AF is {af_bins}, drop this node.")
         return node_id, None, tensor_files_generated_for_node
 
+    candidate_variants = defaultdict(int)
     for seg in aligned_read_segments:
         for v_pos, v_type, v_alt, v_ref in detect_variants_from_cigar(
                 seg["offset_on_node"], seg["cigar_ops"], seg["read_sequence"], node_sequence):
             candidate_variants[(v_pos, v_type, v_ref, v_alt)] += 1
+
     view_oriented_variant_data = {} if worker_need_view else None
     variant_headers_for_summary = []
 
@@ -484,21 +589,24 @@ def process_single_node_for_pileup(task_args):
         window_center_pos = v_pos + 1 if v_type == 'I' else v_pos
         window_start_pos = calculate_window_start(window_center_pos, TENSOR_WINDOW_SIZE)
 
+        # Reference row
         ref_base_indices_row = [PADDING_BASE_INDEX] * TENSOR_WINDOW_SIZE
         for i, pos in enumerate(range(window_start_pos, window_start_pos + TENSOR_WINDOW_SIZE)):
             if 0 <= pos < node_len:
                 ref_base_indices_row[i] = BASE_TO_INDEX.get(node_sequence[pos].upper(), BASE_TO_INDEX['N'])
 
-        af_row_bins = [0] * TENSOR_WINDOW_SIZE
+        # AF bins row
+        af_row_bins = np.zeros(TENSOR_WINDOW_SIZE, dtype=np.uint8)
         if af_bins is not None:
             for i, pos in enumerate(range(window_start_pos, window_start_pos + TENSOR_WINDOW_SIZE)):
-                if 0 <= pos < node_len and pos < len(af_bins):
-                    af_row_bins[i] = int(af_bins[pos])
+                if 0 <= pos < node_len and pos < af_bins.shape[0]:
+                    af_row_bins[i] = af_bins[pos]
         else:
             variant_window_index = v_pos - window_start_pos
             if 0 <= variant_window_index < TENSOR_WINDOW_SIZE:
                 af_row_bins[variant_window_index] = 3
 
+        # Allocate channels
         H, W = 1 + TENSOR_MAX_READ_ROWS, TENSOR_WINDOW_SIZE
         ch1 = np.full((H, W), PADDING_BASE_INDEX, dtype=np.int8)
         ch2 = np.full((H, W), DEFAULT_QUALITY_PADDING, dtype=np.int8)
@@ -508,7 +616,7 @@ def process_single_node_for_pileup(task_args):
         ch6 = np.zeros((H, W), dtype=np.int8)
 
         ch1[0, :] = np.asarray(ref_base_indices_row, dtype=np.int8)
-        ch6[0, :] = np.asarray(af_row_bins, dtype=np.int8)
+        ch6[0, :] = af_row_bins.astype(np.int8, copy=False)
 
         reads_added = 0
         variant_window_index = v_pos - window_start_pos
@@ -559,10 +667,11 @@ def process_single_node_for_pileup(task_args):
         with open(os.path.join(worker_base_output_dir, str(node_id), "variant_summary.json"), 'w') as f:
             json.dump({"node_id": node_id, "node_length": len(node_sequence),
                        "variants_passing_af_filter": variant_headers_for_summary}, f, indent=2)
+
     return node_id, (view_oriented_variant_data or {}), tensor_files_generated_for_node
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Optional pileup viewer (unchanged)
+# Optional pileup viewer
 
 def display_pileup_data(node_data_for_display_view, node_id_str_for_display, full_node_sequence,
                         max_reads_to_display_per_variant, max_variants_to_display=float('inf')):
@@ -594,7 +703,7 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Build tensors for ALL .idx nodes in waves; channel 6 is AF bins (0..7), or 3 at variant if AF missing.",
+        description="Build tensors for .idx nodes in waves; wave-scoped seq/AF loading to control memory.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument("dat", help=".dat alignment file")
     ap.add_argument("idx", help=".idx index file")
@@ -619,87 +728,86 @@ def main():
     os.makedirs(args.output, exist_ok=True)
 
     need_view = args.view is not None
-
-    idx_map = load_full_idx_data(args.idx)
-    if not idx_map:
-        sys.exit("Failed to load index data.")
-    all_node_ids = list(idx_map.keys())
-
-    seqs_map, af_bins_map = load_sequences_and_af_bins(args.merged_json)
-
-    tasks = []
-    missing_seq = 0
-    for node_id in all_node_ids:
-        if node_id in seqs_map:
-            offset, n_records = idx_map[node_id]
-            tasks.append((node_id, offset, n_records,
-                          args.min_af, args.min_variants, args.min_allele_bq, args.variant_type))
-        else:
-            missing_seq += 1
-    if not tasks:
-        sys.exit("No nodes to process: none have sequences in merged_json.")
-
-    tasks.sort(key=lambda t: t[1])  # by dat offset
-
-    global GLOBAL_NODE_SEQS, GLOBAL_NODE_AF_BINS
-    GLOBAL_NODE_SEQS = seqs_map
-    GLOBAL_NODE_AF_BINS = af_bins_map
-
-    total_tasks = len(tasks)
     wave_size = max(1, int(args.wave_size))
-    n_waves = math.ceil(total_tasks / wave_size)
 
-    log(f"Submitting {total_tasks:,} nodes in {n_waves} wave(s) of up to {wave_size:,} each "
-        f"(missing sequences in merged_json: {missing_seq:,})")
+    log(f"Streaming IDX in waves of {wave_size:,} and loading merged JSON per-wave.")
 
-    total_tensors = 0
+    total_tasks = 0
     total_processed = 0
+    total_tensors = 0
+    wave_num = 0
 
-    # Reuse one pool across waves to reduce spawn overhead
-    with ProcessPoolExecutor(max_workers=args.num_workers,
-                             initializer=init_worker,
-                             initargs=(args.dat, args.output, need_view)) as ex:
+    for wave in iter_idx_waves(args.idx, wave_size):
+        wave_num += 1
+        wave_ids = [nid for (nid, _, _) in wave]
+        wave_id_set = set(wave_ids)
 
-        for w in range(n_waves):
-            start = w * wave_size
-            end = min(start + wave_size, total_tasks)
-            wave_tasks = tasks[start:end]
-            log(f"[Wave {w+1}/{n_waves}] Submitting indices [{start}:{end}) — {len(wave_tasks):,} nodes")
+        # Load only this wave's seq/AF
+        t0 = time.time()
+        seqs_map, af_bins_map, missing_seq_recs = load_wave_seqs_and_af_bins_stream(args.merged_json, wave_id_set)
+        load_dt = time.time() - t0
 
-            wave_processed = 0
-            wave_tensors = 0
-            batch_nodes = 0
-            batch_tensors = 0
-            t0 = time.time()
+        # Build tasks for nodes present in merged_json
+        wave_tasks = []
+        for nid, off, nrec in wave:
+            if nid in seqs_map:
+                wave_tasks.append((nid, off, nrec, args.min_af, args.min_variants, args.min_allele_bq, args.variant_type))
+        if not wave_tasks:
+            log(f"[Wave {wave_num}] No nodes in this wave had sequences in merged_json; skipping.")
+            continue
+
+        # Publish wave-scoped globals BEFORE forking
+        GLOBAL_NODE_SEQS.clear()
+        GLOBAL_NODE_AF_BINS.clear()
+        GLOBAL_NODE_SEQS.update(seqs_map)
+        GLOBAL_NODE_AF_BINS.update(af_bins_map)
+
+        log(f"[Wave {wave_num}] Submitting {len(wave_tasks):,} nodes "
+            f"(wave JSON load {load_dt:.2f}s; missing-in-records={missing_seq_recs})")
+
+        processed = 0
+        tensors = 0
+        batch_nodes = 0
+        batch_tensors = 0
+        t_batch = time.time()
+
+        with ProcessPoolExecutor(max_workers=args.num_workers,
+                                 initializer=init_worker,
+                                 initargs=(args.dat, args.output, need_view)) as ex:
             for node_id, view_data, tensor_count in ex.map(
                     process_single_node_for_pileup, wave_tasks, chunksize=max(1, args.chunksize)):
                 total_processed += 1
-                wave_processed += 1
+                processed += 1
                 batch_nodes += 1
                 total_tensors += tensor_count
-                wave_tensors += tensor_count
+                tensors += tensor_count
                 batch_tensors += tensor_count
+
                 if need_view and view_data:
                     display_pileup_data(view_data, str(node_id), GLOBAL_NODE_SEQS.get(node_id, ""),
                                         args.max_view_reads,
                                         args.view if args.view != -1 else float('inf'))
 
-                if batch_nodes >= 1000 or total_processed == total_tasks:
-                    dt = time.time() - t0
+                if batch_nodes >= 1000 or processed == len(wave_tasks):
+                    dt = time.time() - t_batch
                     rate = batch_nodes / dt if dt > 0 else 0.0
-                    log(f"[Wave {w+1}/{n_waves}] "
-                        f"processed {wave_processed:,}/{len(wave_tasks):,} "
-                        f"(global {total_processed:,}/{total_tasks:,})  "
+                    log(f"[Wave {wave_num}] processed {processed:,}/{len(wave_tasks):,}  "
                         f"batch_nodes={batch_nodes:,} tensors_in_batch={batch_tensors:,}  "
                         f"in {dt:.2f}s ({rate:.1f} nodes/s)")
                     batch_nodes = 0
                     batch_tensors = 0
-                    t0 = time.time()
+                    t_batch = time.time()
 
-            log(f"[Wave {w+1}/{n_waves}] DONE — nodes:{wave_processed:,}, tensors:{wave_tensors:,}")
+        log(f"[Wave {wave_num}] DONE — nodes:{processed:,}, tensors:{tensors:,}")
 
-    log(f"ALL WAVES DONE. Nodes processed: {total_processed:,}/{total_tasks:,}; "
-        f"total tensors: {total_tensors:,}; nodes without sequence in merged_json: {missing_seq:,}")
+        # Free wave data
+        GLOBAL_NODE_SEQS.clear()
+        GLOBAL_NODE_AF_BINS.clear()
+        import gc; gc.collect()
+
+        total_tasks += len(wave_tasks)
+
+    log(f"ALL WAVES DONE. Nodes processed: {total_processed:,}/{total_tasks:,}; total tensors: {total_tensors:,}")
 
 if __name__ == "__main__":
     main()
