@@ -246,7 +246,7 @@ def main():
     with Pool(processes=args.workers,
               initializer=_init_worker,
               initargs=(args.vcf_file, args.chr, node_pos,
-                        true_dir, false_dir, args.use-symlinks),
+                        true_dir, false_dir, args.use_symlinks),
               maxtasksperchild=args.maxtasksperchild) as pool:
 
         for i, (records, t_cnt, f_cnt) in enumerate(
