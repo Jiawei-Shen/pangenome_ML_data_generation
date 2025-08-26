@@ -151,20 +151,59 @@ def _parse_key(variant_key: str) -> Tuple[int,str,str]:
     alt = parts[3].upper()
     return offset, ref, alt
 
-def organize_classified_data(base_dir, ratios, seed=None):
+def _copy_or_link(src: str, dst: str, use_symlinks: bool) -> None:
+    """Create dst as a symlink to src, or copy if symlinks not requested/possible."""
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    if use_symlinks:
+        if os.path.lexists(dst):
+            return
+        try:
+            os.symlink(os.path.abspath(src), dst)
+            return
+        except OSError:
+            # fall back to copy if symlink fails on this FS
+            pass
+    if not os.path.exists(dst):
+        shutil.copy2(src, dst)
+
+def organize_classified_data(base_dir: str, ratios, use_symlinks: bool, seed=None):
+    """
+    Populate base_dir/{train,val,test}/{true,false} by SYMLINKING (or copying) from
+    base_dir/{true,false}. Do NOT move or delete the source files.
+    """
     if seed is not None:
         random.seed(seed)
     assert len(ratios) == 3 and abs(sum(ratios) - 1.0) < 1e-6
+
     for label in ("true", "false"):
         src = os.path.join(base_dir, label)
-        if not os.path.isdir(src): continue
-        files = sorted(os.listdir(src)); random.shuffle(files)
-        n = len(files); n_tr = int(n*ratios[0]); n_va = int(n*ratios[1]); n_te = n-n_tr-n_va
-        splits = {"train": files[:n_tr], "val": files[n_tr:n_tr+n_va], "test": files[n_tr+n_va:]}
+        if not os.path.isdir(src):
+            continue
+
+        files = sorted(os.listdir(src))
+        random.shuffle(files)
+
+        n = len(files)
+        n_tr = int(n * ratios[0])
+        n_va = int(n * ratios[1])
+        n_te = n - n_tr - n_va
+
+        splits = {
+            "train": files[:n_tr],
+            "val":   files[n_tr:n_tr + n_va],
+            "test":  files[n_tr + n_va:]
+        }
+
+        # Create links/copies into split dirs; keep originals intact.
         for sp, lst in splits.items():
-            outd = os.path.join(base_dir, sp, label); os.makedirs(outd, exist_ok=True)
-            for f in lst: shutil.move(os.path.join(src, f), os.path.join(outd, f))
-        shutil.rmtree(src)
+            outd = os.path.join(base_dir, sp, label)
+            os.makedirs(outd, exist_ok=True)
+            for f in lst:
+                src_path = os.path.join(src, f)
+                dst_path = os.path.join(outd, f)
+                _copy_or_link(src_path, dst_path, use_symlinks)
+
+    # IMPORTANT: no deletion of source dirs, no moves.
 
 def main():
     ap = argparse.ArgumentParser()
@@ -173,11 +212,13 @@ def main():
     ap.add_argument("node_pos_json")
     ap.add_argument("--output_folder", default="./classification_results")
     ap.add_argument("--chr", default="chr1")
-    ap.add_argument("--use-symlinks", action="store_true")
+    ap.add_argument("--use-symlinks", action="store_true",
+                    help="Use symlinks instead of copying for both classification and organize steps.")
     ap.add_argument("-j","--workers", type=int, default=max(1, min(8, cpu_count())))
     ap.add_argument("--chunksize", type=int, default=32)
     ap.add_argument("--maxtasksperchild", type=int, default=500)
-    ap.add_argument("--organize", nargs=3, type=float, metavar=("TRAIN","VAL","TEST"))
+    ap.add_argument("--organize", nargs=3, type=float, metavar=("TRAIN","VAL","TEST"),
+                    help="Ratios for train/val/test (e.g., --organize 0.8 0.1 0.1).")
     ap.add_argument("--seed", type=int)
     args = ap.parse_args()
 
@@ -205,7 +246,7 @@ def main():
     with Pool(processes=args.workers,
               initializer=_init_worker,
               initargs=(args.vcf_file, args.chr, node_pos,
-                        true_dir, false_dir, args.use_symlinks),
+                        true_dir, false_dir, args.use-symlinks),
               maxtasksperchild=args.maxtasksperchild) as pool:
 
         for i, (records, t_cnt, f_cnt) in enumerate(
@@ -232,9 +273,9 @@ def main():
     print(f"True: {total_true}  False: {total_false}")
 
     if args.organize:
-        print("Organizing into train/val/test …")
-        organize_classified_data(args.output_folder, args.organize, seed=args.seed)
-        print("Organization complete.")
+        print("Organizing into train/val/test (non-destructive)…")
+        organize_classified_data(args.output_folder, args.organize, use_symlinks=args.use_symlinks, seed=args.seed)
+        print("Organization complete (sources kept in place).")
 
 if __name__ == "__main__":
     main()
