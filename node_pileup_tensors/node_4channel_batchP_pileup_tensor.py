@@ -758,7 +758,7 @@ def main():
             nodes_since_last_report += 1
             total_tensors += tensor_count
             tensors_since_last_report += tensor_count
-
+            processed(processed)
             if need_view and view_data:
                 node_sequence_for_view = GLOBAL_NODE_SEQS.get(node_id, "")
                 display_pileup_data(view_data, str(node_id), node_sequence_for_view,
