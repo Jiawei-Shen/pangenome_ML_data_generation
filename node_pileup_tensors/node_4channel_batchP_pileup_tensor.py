@@ -399,7 +399,7 @@ def process_single_node_for_pileup(task_args):
 
     if not aligned_read_segments:
         return node_id, {}, tensor_files_generated_for_node
-    print(node_id, len(aligned_read_segments))
+    # print(node_id, len(aligned_read_segments))
     if len(aligned_read_segments) > 100000:
         return node_id, None, tensor_files_generated_for_node
 
@@ -765,7 +765,7 @@ def main():
                                     args.max_view_reads,
                                     args.view if args.view != -1 else float('inf'))
 
-            if nodes_since_last_report >= 10000 or processed == total_tasks:
+            if nodes_since_last_report >= 100 or processed == total_tasks:
                 elapsed_time = time.time() - batch_start_time
                 rate = nodes_since_last_report / elapsed_time if elapsed_time > 0 else 0.0
                 print(
