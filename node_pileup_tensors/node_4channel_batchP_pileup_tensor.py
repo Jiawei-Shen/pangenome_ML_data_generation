@@ -338,11 +338,6 @@ def process_single_node_for_pileup(task_args):
     node_sequence = GLOBAL_NODE_SEQS.get(node_id, "")
     if not node_sequence:
         return node_id, {}, tensor_files_generated_for_node
-
-    print(node_id, len(aligned_read_segments))
-    if len(aligned_read_segments) > 100000:
-        return node_id, None, tensor_files_generated_for_node
-
     genomead_af_list = GLOBAL_NODE_AF.get(node_id, [])
 
     node_len = len(node_sequence)
@@ -404,6 +399,9 @@ def process_single_node_for_pileup(task_args):
 
     if not aligned_read_segments:
         return node_id, {}, tensor_files_generated_for_node
+    print(node_id, len(aligned_read_segments))
+    if len(aligned_read_segments) > 100000:
+        return node_id, None, tensor_files_generated_for_node
 
     candidate_variants = defaultdict(int)
     for seg in aligned_read_segments:
