@@ -595,7 +595,7 @@ def process_single_node_for_pileup(task_args):
         with open(summary_path, 'w') as f:
             json.dump({"node_id": node_id, "node_length": node_len,
                        "variants_passing_af_filter": variant_headers_for_summary}, f, indent=2)
-
+    print(node_id)
     return node_id, (view_oriented_variant_data or {}), tensor_files_generated_for_node
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -758,7 +758,7 @@ def main():
             nodes_since_last_report += 1
             total_tensors += tensor_count
             tensors_since_last_report += tensor_count
-            processed(processed)
+
             if need_view and view_data:
                 node_sequence_for_view = GLOBAL_NODE_SEQS.get(node_id, "")
                 display_pileup_data(view_data, str(node_id), node_sequence_for_view,
