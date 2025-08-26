@@ -338,6 +338,11 @@ def process_single_node_for_pileup(task_args):
     node_sequence = GLOBAL_NODE_SEQS.get(node_id, "")
     if not node_sequence:
         return node_id, {}, tensor_files_generated_for_node
+
+    print(node_id, len(aligned_read_segments))
+    if len(aligned_read_segments) > 100000:
+        return node_id, None, tensor_files_generated_for_node
+
     genomead_af_list = GLOBAL_NODE_AF.get(node_id, [])
 
     node_len = len(node_sequence)
@@ -593,7 +598,6 @@ def process_single_node_for_pileup(task_args):
             json.dump({"node_id": node_id, "node_length": node_len,
                        "variants_passing_af_filter": variant_headers_for_summary}, f, indent=2)
 
-    print(node_id)
     return node_id, (view_oriented_variant_data or {}), tensor_files_generated_for_node
 
 # ─────────────────────────────────────────────────────────────────────────────
