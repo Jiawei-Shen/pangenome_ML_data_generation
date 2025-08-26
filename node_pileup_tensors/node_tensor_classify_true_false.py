@@ -3,6 +3,7 @@ import argparse, json, os, shutil, sys, time, random
 from multiprocessing import Pool, cpu_count
 from typing import Dict, Iterable, List, Set, Tuple
 import pysam
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ----------------------- worker globals (set via initializer) -----------------
 G_VCF = None              # pysam.VariantFile handle
@@ -172,11 +173,33 @@ def _classify_node(node_dir: str):
 
     return recs, t, f
 
+def _parallel_place(tasks: List[Tuple[str, str, bool]], max_workers: int) -> None:
+    """
+    Run _copy_or_link over (src, dst, use_symlinks) tasks in parallel (threads).
+    """
+    total = len(tasks)
+    done = 0
+    start = time.monotonic()
+    # Use threads for I/O-bound copying/symlinking
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(_copy_or_link, src, dst, use_symlinks) for (src, dst, use_symlinks) in tasks]
+        for fut in as_completed(futures):
+            # propagate errors if any
+            _ = fut.result()
+            done += 1
+            if done % 500 == 0 or done == total:
+                elapsed = time.monotonic() - start
+                rate = done / elapsed if elapsed > 0 else 0.0
+                print(f"\rOrganizing: {done}/{total} ({done/total:.1%})  {rate:.1f} files/s", end="")
+    print()
+
 def organize_classified_data_from_summary(summary_ndjson: str, base_dir: str,
-                                          ratios, use_symlinks: bool, seed=None):
+                                          ratios, use_symlinks: bool,
+                                          seed=None, max_workers: int = 32):
     """
     Read records from NDJSON and populate base_dir/{train,val,test}/{true,false}
     by SYMLINKING (or copying) from tensor_path. No true/false roots are created.
+    Uses parallel I/O for placement.
     """
     if seed is not None:
         random.seed(seed)
@@ -196,15 +219,16 @@ def organize_classified_data_from_summary(summary_ndjson: str, base_dir: str,
             tf = rec.get("tensor_file")
             nid = rec.get("node_id")
             if label in grouped and tpath and tf and nid:
-                # Destination filename: keep node_id prefix for uniqueness
                 grouped[label].append((tpath, f"{nid}_{tf}"))
+
+    # Build placement tasks in bulk, then run in parallel
+    tasks: List[Tuple[str, str, bool]] = []
 
     for label, items in grouped.items():
         random.shuffle(items)
         n = len(items)
         n_tr = int(n * ratios[0])
         n_va = int(n * ratios[1])
-        # n_te = n - n_tr - n_va
         splits = {
             "train": items[:n_tr],
             "val":   items[n_tr:n_tr + n_va],
@@ -215,7 +239,10 @@ def organize_classified_data_from_summary(summary_ndjson: str, base_dir: str,
             os.makedirs(outd, exist_ok=True)
             for src_path, out_name in lst:
                 dst_path = os.path.join(outd, out_name)
-                _copy_or_link(src_path, dst_path, use_symlinks)
+                tasks.append((src_path, dst_path, use_symlinks))
+
+    if tasks:
+        _parallel_place(tasks, max_workers=max_workers)
 
 def main():
     ap = argparse.ArgumentParser()
@@ -231,6 +258,8 @@ def main():
     ap.add_argument("--maxtasksperchild", type=int, default=500)
     ap.add_argument("--organize", nargs=3, type=float, metavar=("TRAIN","VAL","TEST"),
                     help="If set, skip output_folder/true,false and directly fill train/val/test splits.")
+    ap.add_argument("--organize-workers", type=int, default=32,
+                    help="Parallel workers for the organize (I/O) step; threads are used.")
     ap.add_argument("--seed", type=int)
     args = ap.parse_args()
 
@@ -294,15 +323,16 @@ def main():
     print(f"Summary written to: {summary_path}")
     print(f"True: {total_true}  False: {total_false}")
 
-    # If organize mode, now read NDJSON and directly populate train/val/test
+    # If organize mode, now read NDJSON and directly populate train/val/test (in parallel)
     if organize_mode:
-        print("Organizing directly into train/val/test (no true/false roots)…")
+        print("Organizing directly into train/val/test (parallel, no true/false roots)…")
         organize_classified_data_from_summary(
             summary_ndjson=summary_path,
             base_dir=args.output_folder,
             ratios=tuple(map(float, args.organize)),
             use_symlinks=args.use_symlinks,
-            seed=args.seed
+            seed=args.seed,
+            max_workers=max(1, args.organize_workers),
         )
         print("Organization complete.")
 
