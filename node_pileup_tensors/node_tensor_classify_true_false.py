@@ -8,8 +8,8 @@ import pysam
 G_VCF = None              # pysam.VariantFile handle
 G_CHR = None              # chromosome string
 G_NODE_POS: Dict[str,int] = {}
-G_TRUE_DIR = None
-G_FALSE_DIR = None
+G_TRUE_DIR = None         # may be None when --organize is used (no direct output)
+G_FALSE_DIR = None        # may be None when --organize is used (no direct output)
 G_USE_SYMLINKS = False
 
 def _init_worker(vcf_path: str, chrom: str, node_pos: Dict[str,int],
@@ -75,74 +75,6 @@ def _vcf_subset_for_positions(positions: Set[int]) -> Set[Tuple[int,str,str]]:
                 out.add((rec.pos, r, a.upper()))
     return out
 
-def _classify_node(node_dir: str):
-    """Worker task: classify one node directory; returns (records, true, false)."""
-    node_id = os.path.basename(node_dir)
-    start_pos = G_NODE_POS.get(node_id)
-    if start_pos is None:
-        return [], 0, 0
-
-    summary_path = os.path.join(node_dir, "variant_summary.json")
-    try:
-        with open(summary_path) as f:
-            summary = json.load(f)
-    except Exception:
-        return [], 0, 0
-
-    variants = summary.get("variants_passing_af_filter", [])
-    if not variants:
-        return [], 0, 0
-
-    # First pass: collect needed genomic positions & parse items we’ll output
-    items = []  # (tensor_path, tensor_file, pos, ref, alt)
-    pos_needed: Set[int] = set()
-    for v in variants:
-        tf = v.get("tensor_file"); vk = v.get("variant_key")
-        if not tf or not vk or not tf.endswith(".npy"):
-            continue
-        tpath = os.path.join(node_dir, tf)
-        if not os.path.isfile(tpath):
-            continue
-        try:
-            off, ref, alt = _parse_key(vk)
-        except Exception:
-            continue
-        pos = start_pos + off
-        items.append((tpath, tf, pos, ref, alt))
-        pos_needed.add(pos)
-
-    if not items:
-        return [], 0, 0
-
-    # Build a small, node-local VCF membership set
-    local_vcf = _vcf_subset_for_positions(pos_needed)
-
-    recs = []
-    t = f = 0
-    for tpath, tf, pos, ref, alt in items:
-        is_match = (pos, ref, alt) in local_vcf
-        dest = G_TRUE_DIR if is_match else G_FALSE_DIR
-        if is_match: t += 1
-        else:        f += 1
-
-        dst = os.path.join(dest, f"{node_id}_{tf}")
-        try:
-            if G_USE_SYMLINKS:
-                if not os.path.lexists(dst):
-                    os.symlink(os.path.abspath(tpath), dst)
-            else:
-                if not os.path.exists(dst):
-                    shutil.copyfile(tpath, dst)
-        except OSError:
-            pass
-
-        recs.append({
-            "node_id": node_id, "tensor_file": tf, "genomic_position": pos,
-            "ref": ref, "alt": alt, "classification": "true" if is_match else "false"
-        })
-
-    return recs, t, f
-
 def _parse_key(variant_key: str) -> Tuple[int,str,str]:
     # variant_key looks like "OFFSET_x_REF_ALT_..." — adapt if needed
     parts = variant_key.split("_")
@@ -161,49 +93,129 @@ def _copy_or_link(src: str, dst: str, use_symlinks: bool) -> None:
             os.symlink(os.path.abspath(src), dst)
             return
         except OSError:
-            # fall back to copy if symlink fails on this FS
-            pass
+            pass  # fall back to copy if symlink fails
     if not os.path.exists(dst):
         shutil.copy2(src, dst)
 
-def organize_classified_data(base_dir: str, ratios, use_symlinks: bool, seed=None):
+def _classify_node(node_dir: str):
     """
-    Populate base_dir/{train,val,test}/{true,false} by SYMLINKING (or copying) from
-    base_dir/{true,false}. Do NOT move or delete the source files.
+    Worker task: classify one node directory.
+    Returns (records, t_cnt, f_cnt).
+    Each record includes absolute tensor_path and classification; if G_TRUE_DIR/G_FALSE_DIR
+    are set (no --organize), we also copy/link immediately into those dirs.
+    """
+    node_id = os.path.basename(node_dir)
+    start_pos = G_NODE_POS.get(node_id)
+    if start_pos is None:
+        return [], 0, 0
+
+    summary_path = os.path.join(node_dir, "variant_summary.json")
+    try:
+        with open(summary_path) as f:
+            summary = json.load(f)
+    except Exception:
+        return [], 0, 0
+
+    variants = summary.get("variants_passing_af_filter", [])
+    if not variants:
+        return [], 0, 0
+
+    items = []  # (tpath, tf, pos, ref, alt)
+    pos_needed: Set[int] = set()
+    for v in variants:
+        tf = v.get("tensor_file"); vk = v.get("variant_key")
+        if not tf or not vk or not tf.endswith(".npy"):
+            continue
+        tpath = os.path.join(node_dir, tf)
+        if not os.path.isfile(tpath):
+            continue
+        try:
+            off, ref, alt = _parse_key(vk)
+        except Exception:
+            continue
+        pos = start_pos + off
+        items.append((os.path.abspath(tpath), tf, pos, ref, alt))
+        pos_needed.add(pos)
+
+    if not items:
+        return [], 0, 0
+
+    # Build a small, node-local VCF membership set
+    local_vcf = _vcf_subset_for_positions(pos_needed)
+
+    recs = []
+    t = f = 0
+    for tpath, tf, pos, ref, alt in items:
+        is_match = (pos, ref, alt) in local_vcf
+        label = "true" if is_match else "false"
+        if is_match: t += 1
+        else:        f += 1
+
+        # If NOT organizing (i.e., G_TRUE_DIR/G_FALSE_DIR are set), place now.
+        if G_TRUE_DIR and G_FALSE_DIR:
+            dest_dir = G_TRUE_DIR if is_match else G_FALSE_DIR
+            dst = os.path.join(dest_dir, f"{node_id}_{tf}")
+            try:
+                _copy_or_link(tpath, dst, G_USE_SYMLINKS)
+            except OSError:
+                pass
+
+        recs.append({
+            "node_id": node_id,
+            "tensor_file": tf,
+            "tensor_path": tpath,     # absolute path
+            "genomic_position": pos,
+            "ref": ref,
+            "alt": alt,
+            "classification": label
+        })
+
+    return recs, t, f
+
+def organize_classified_data_from_summary(summary_ndjson: str, base_dir: str,
+                                          ratios, use_symlinks: bool, seed=None):
+    """
+    Read records from NDJSON and populate base_dir/{train,val,test}/{true,false}
+    by SYMLINKING (or copying) from tensor_path. No true/false roots are created.
     """
     if seed is not None:
         random.seed(seed)
     assert len(ratios) == 3 and abs(sum(ratios) - 1.0) < 1e-6
 
-    for label in ("true", "false"):
-        src = os.path.join(base_dir, label)
-        if not os.path.isdir(src):
-            continue
+    grouped = {"true": [], "false": []}
 
-        files = sorted(os.listdir(src))
-        random.shuffle(files)
+    with open(summary_ndjson, "r") as f:
+        for line in f:
+            if not line.strip(): continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            label = rec.get("classification")
+            tpath = rec.get("tensor_path")
+            tf = rec.get("tensor_file")
+            nid = rec.get("node_id")
+            if label in grouped and tpath and tf and nid:
+                # Destination filename: keep node_id prefix for uniqueness
+                grouped[label].append((tpath, f"{nid}_{tf}"))
 
-        n = len(files)
+    for label, items in grouped.items():
+        random.shuffle(items)
+        n = len(items)
         n_tr = int(n * ratios[0])
         n_va = int(n * ratios[1])
-        n_te = n - n_tr - n_va
-
+        # n_te = n - n_tr - n_va
         splits = {
-            "train": files[:n_tr],
-            "val":   files[n_tr:n_tr + n_va],
-            "test":  files[n_tr + n_va:]
+            "train": items[:n_tr],
+            "val":   items[n_tr:n_tr + n_va],
+            "test":  items[n_tr + n_va:],
         }
-
-        # Create links/copies into split dirs; keep originals intact.
         for sp, lst in splits.items():
             outd = os.path.join(base_dir, sp, label)
             os.makedirs(outd, exist_ok=True)
-            for f in lst:
-                src_path = os.path.join(src, f)
-                dst_path = os.path.join(outd, f)
+            for src_path, out_name in lst:
+                dst_path = os.path.join(outd, out_name)
                 _copy_or_link(src_path, dst_path, use_symlinks)
-
-    # IMPORTANT: no deletion of source dirs, no moves.
 
 def main():
     ap = argparse.ArgumentParser()
@@ -213,19 +225,29 @@ def main():
     ap.add_argument("--output_folder", default="./classification_results")
     ap.add_argument("--chr", default="chr1")
     ap.add_argument("--use-symlinks", action="store_true",
-                    help="Use symlinks instead of copying for both classification and organize steps.")
+                    help="Use symlinks instead of copying for output placement.")
     ap.add_argument("-j","--workers", type=int, default=max(1, min(8, cpu_count())))
     ap.add_argument("--chunksize", type=int, default=32)
     ap.add_argument("--maxtasksperchild", type=int, default=500)
     ap.add_argument("--organize", nargs=3, type=float, metavar=("TRAIN","VAL","TEST"),
-                    help="Ratios for train/val/test (e.g., --organize 0.8 0.1 0.1).")
+                    help="If set, skip output_folder/true,false and directly fill train/val/test splits.")
     ap.add_argument("--seed", type=int)
     args = ap.parse_args()
 
     os.makedirs(args.output_folder, exist_ok=True)
-    true_dir  = os.path.join(args.output_folder, "true")
-    false_dir = os.path.join(args.output_folder, "false")
-    os.makedirs(true_dir, exist_ok=True); os.makedirs(false_dir, exist_ok=True)
+
+    organize_mode = args.organize is not None
+
+    # In non-organize mode, we create true/false roots and place outputs there immediately.
+    if not organize_mode:
+        true_dir  = os.path.join(args.output_folder, "true")
+        false_dir = os.path.join(args.output_folder, "false")
+        os.makedirs(true_dir, exist_ok=True)
+        os.makedirs(false_dir, exist_ok=True)
+    else:
+        # In organize mode, skip creating true/false and do not place during classification.
+        true_dir = None
+        false_dir = None
 
     # Node dirs and the set of IDs we actually need
     node_dirs = list(list_node_dirs(args.tensor_folder_path))
@@ -272,10 +294,17 @@ def main():
     print(f"Summary written to: {summary_path}")
     print(f"True: {total_true}  False: {total_false}")
 
-    if args.organize:
-        print("Organizing into train/val/test (non-destructive)…")
-        organize_classified_data(args.output_folder, args.organize, use_symlinks=args.use_symlinks, seed=args.seed)
-        print("Organization complete (sources kept in place).")
+    # If organize mode, now read NDJSON and directly populate train/val/test
+    if organize_mode:
+        print("Organizing directly into train/val/test (no true/false roots)…")
+        organize_classified_data_from_summary(
+            summary_ndjson=summary_path,
+            base_dir=args.output_folder,
+            ratios=tuple(map(float, args.organize)),
+            use_symlinks=args.use_symlinks,
+            seed=args.seed
+        )
+        print("Organization complete.")
 
 if __name__ == "__main__":
     main()
