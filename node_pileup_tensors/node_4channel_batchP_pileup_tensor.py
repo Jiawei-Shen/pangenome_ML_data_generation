@@ -56,6 +56,25 @@ GLOBAL_NODE_AF = {}
 # Helper Functions
 # ─────────────────────────────────────────────────────────────────────────────
 
+def af_float_to_bin(x: float) -> int:
+    """Bin AF into 0..7:
+       0–1e-6→0, 1e-6–1e-5→1, 1e-5–1e-4→2, 1e-4–1e-3→3,
+       1e-3–1e-2→4, 1e-2–0.1→5, 0.1–0.5→6, 0.5–1.0→7"""
+    try:
+        x = float(x)
+    except Exception:
+        return 0
+    if x <= 0.0:          return 0
+    if x < 1e-6:          return 0
+    if x < 1e-5:          return 1
+    if x < 1e-4:          return 2
+    if x < 1e-3:          return 3
+    if x < 1e-2:          return 4
+    if x < 0.1:           return 5
+    if x < 0.5:           return 6
+    return 7
+
+
 def calculate_window_start(variant_pos, window_size):
     center_index = window_size // 2
     return variant_pos - center_index
@@ -380,6 +399,9 @@ def process_single_node_for_pileup(task_args):
 
     if not aligned_read_segments:
         return node_id, {}, tensor_files_generated_for_node
+    # print(node_id, len(aligned_read_segments))
+    if len(aligned_read_segments) > 100000:
+        return node_id, None, tensor_files_generated_for_node
 
     candidate_variants = defaultdict(int)
     for seg in aligned_read_segments:
@@ -483,14 +505,19 @@ def process_single_node_for_pileup(task_args):
         if genomead_af_list:
             for i, node_pos_in_window in enumerate(range(window_start_pos, window_start_pos + TENSOR_WINDOW_SIZE)):
                 if 0 <= node_pos_in_window < node_len:
-                    af_value = genomead_af_list[node_pos_in_window]
-                    if af_value == 0.0:
-                        scaled_af = 0
+                    v = genomead_af_list[node_pos_in_window]
+                    # Accept either digits-per-base string ('0'..'7') or float AFs
+                    if isinstance(v, str):
+                        if len(v) == 1 and '0' <= v <= '7':
+                            b = ord(v) - 48
+                        else:
+                            try:
+                                b = af_float_to_bin(float(v))
+                            except Exception:
+                                b = 0
                     else:
-                        phred_af = -10.0 * np.log10(af_value)
-                        inverted_phred = 127.0 - phred_af
-                        scaled_af = max(1, min(int(inverted_phred), 127))
-                    genomead_af_row[i] = scaled_af
+                        b = af_float_to_bin(v)
+                    genomead_af_row[i] = int(b)
 
         # Pre-allocate numpy arrays for speed (drop Torch)
         H = 1 + TENSOR_MAX_READ_ROWS
@@ -738,7 +765,7 @@ def main():
                                     args.max_view_reads,
                                     args.view if args.view != -1 else float('inf'))
 
-            if nodes_since_last_report >= 1000 or processed == total_tasks:
+            if nodes_since_last_report >= 10000 or processed == total_tasks:
                 elapsed_time = time.time() - batch_start_time
                 rate = nodes_since_last_report / elapsed_time if elapsed_time > 0 else 0.0
                 print(
