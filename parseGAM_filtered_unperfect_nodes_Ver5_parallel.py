@@ -359,7 +359,7 @@ def main():
     parser.add_argument("--chr", default="", help="Optional chromosome name to filter on")
     parser.add_argument("--workers", type=int, default=4, help="Number of worker processes")
     parser.add_argument("--batch", type=int, default=25000, help="GAM messages per worker task")
-    parser.add_argument("--buffer_segments", type=int, default=40_000_000,
+    parser.add_argument("--buffer_segments", type=int, default=10_000_000,
                         help="Flush threshold (#records) for writer buffers")
     parser.add_argument("--max_inflight", type=int, default=None,
                         help="Max number of in-flight worker tasks (default = 2*workers)")
