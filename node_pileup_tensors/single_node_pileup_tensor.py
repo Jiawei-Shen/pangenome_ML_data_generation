@@ -1,20 +1,10 @@
 #!/usr/bin/env python3
 """
-single_node_pileup.py
+single_node_pileup.py — ONE-node tensor builder with 6-channel text viewer.
 
-Build Pansoma-style 6-channel tensors for ONE node from .idx/.dat, using streamed
-sequence+AF from merged.json (or merged.json.gz).
-
-• Same encodings and tensor layout as your wave script.
-• Channel 6 (AF) policy:
-    - Accepts per-base digits "0".."7" (string) OR float array → binned into 8 levels:
-      0–1e-6→0, 1e-6–1e-5→1, 1e-5–1e-4→2, 1e-4–1e-3→3, 1e-3–1e-2→4, 1e-2–0.1→5, 0.1–0.5→6, 0.5–1.0→7
-    - If AF missing: zeros, except the variant column is set to 3
-• Outputs .npy files named: {pos}_{type}_{ref}_{alt}.npy  + variant_summary.json
-
-Usage:
-  python single_node_pileup.py DAT.dat IDX.idx merged.json[.gz] --node_id 12345 -o OUT_DIR \
-      --variant_type snp --min_af 0.1 --min_variants 3 --min_allele_bq 10 --view 10
+Viewer prints C1..C6 for ref and reads:
+  C1 Bases, C2 BaseQual (Sanger char), C3 Mismatch flags, C4 MAPQ (compact char),
+  C5 CIGAR op, C6 AF bin (0..7).
 """
 
 import argparse
@@ -40,7 +30,7 @@ def log(msg: str) -> None:
     print(f"[{ts()}] {msg}", file=sys.stderr, flush=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Formats / constants (kept identical to your multi-wave script)
+# Formats / constants (same tensor encodings as before)
 
 RECORD_STRUCT = struct.Struct("<h150s150s20shc")
 RECORD_SIZE = RECORD_STRUCT.size
@@ -50,14 +40,16 @@ PADDING_BASE_INDEX = 0
 
 CIGAR_OP_TO_INDEX = {'M': 10, 'N': 20, 'S': 30, 'I': 40, 'D': 50, 'H': 60, 'P': 70, '=': 80, 'X': 90, '_PADDING_': 0}
 CIGAR_PADDING_INDEX = 0
+# inverse for view
+INDEX_TO_CIGAR_OP = {v: k for k, v in CIGAR_OP_TO_INDEX.items()}
 
 INDEX_TO_BASE_FOR_VIEW = {20: 'A', 30: 'C', 50: 'G', 70: 'T', 10: 'N', 90: '*', 0: '0'}
 
 TENSOR_WINDOW_SIZE = 100
 TENSOR_MAX_READ_ROWS = 200
-DEFAULT_QUALITY_PADDING = 0
-DEFAULT_MAPPING_QUALITY_PADDING = -1
-MISMATCH_CHANNEL_REF_ROW_VALUE = 0
+DEFAULT_QUALITY_PADDING = 0          # C2
+DEFAULT_MAPPING_QUALITY_PADDING = -1 # C4
+MISMATCH_CHANNEL_REF_ROW_VALUE = 0   # C3
 MISMATCH_COMPARISON_PADDING_VALUE = -1
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -84,21 +76,15 @@ def _open_maybe_gzip(path: str, mode: str = "rt"):
     return gzip.open(path, mode) if path.endswith(".gz") else open(path, mode)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# IDX / JSON readers for a single node
+# IDX / JSON (single-node)
 
 def find_node_in_idx(idx_path: str, target_node_id: int) -> Optional[Tuple[int, int]]:
-    """
-    Return (dat_offset, n_records) for the node_id, or None if not found.
-    IDX layout assumed:
-      header: uint32 N
-      entries: struct '<I Q I I H' → (node_id, dat_offset, _, n_records, _)
-    """
     with open(idx_path, 'rb') as f:
         hdr = f.read(4)
         if len(hdr) < 4:
             raise RuntimeError("Index file too small")
         n = struct.unpack('<I', hdr)[0]
-        for i in range(n):
+        for _ in range(n):
             rec = f.read(22)
             if len(rec) < 22:
                 break
@@ -123,10 +109,6 @@ def af_float_to_bin(x: float) -> int:
     return 7
 
 def normalize_af_to_bins_compact(af_field, expected_len: int) -> Optional[np.ndarray]:
-    """
-    Return np.uint8 array length==expected_len with values 0..7, or None if AF truly missing.
-    Accept list[float] or digit string "0".."7" per base.
-    """
     if af_field is None:
         return None
     if isinstance(af_field, str):
@@ -147,86 +129,51 @@ def normalize_af_to_bins_compact(af_field, expected_len: int) -> Optional[np.nda
     return None
 
 def load_single_node_seq_and_af(merged_path: str, node_id: int) -> Tuple[Optional[str], Optional[np.ndarray]]:
-    """
-    Stream merged JSON to find the one node_id. Supports:
-      • [ {...}, {...}, ... ]
-      • {"nodes":[ {...}, ... ], ...}
-    Uses a light brace-tracking to avoid loading whole file.
-    """
     with _open_maybe_gzip(merged_path, "rt") as f:
-        # scan to first '['
+        # scan to '['
         while True:
             ch = f.read(1)
             if not ch:
                 return None, None
             if ch == '[':
                 break
-
-        buf = []
-        depth = 0
-        in_str = False
-        esc = False
-
-        def _emit_object(s: str):
-            try:
-                return json.loads(s)
-            except Exception:
-                return None
-
+        buf = []; depth=0; in_str=False; esc=False
+        def _emit(s):
+            try: return json.loads(s)
+            except: return None
         while True:
             ch = f.read(1)
-            if not ch:
-                break
-
+            if not ch: break
             if depth == 0:
-                if ch.isspace() or ch == ',':
-                    continue
-                if ch == ']':
-                    break
-                if ch != '{':
-                    continue
-                buf = ['{']
-                depth = 1
-                in_str = False
-                esc = False
-                continue
-
+                if ch.isspace() or ch == ',': continue
+                if ch == ']': break
+                if ch != '{': continue
+                buf=['{']; depth=1; in_str=False; esc=False; continue
             buf.append(ch)
-
             if in_str:
-                if esc:
-                    esc = False
-                elif ch == '\\':
-                    esc = True
-                elif ch == '"':
-                    in_str = False
+                if esc: esc=False
+                elif ch == '\\': esc=True
+                elif ch == '"': in_str=False
             else:
-                if ch == '"':
-                    in_str = True
-                elif ch == '{':
-                    depth += 1
+                if ch == '"': in_str=True
+                elif ch == '{': depth += 1
                 elif ch == '}':
                     depth -= 1
                     if depth == 0:
-                        obj = _emit_object(''.join(buf))
-                        buf = []
+                        obj = _emit(''.join(buf)); buf=[]
                         if isinstance(obj, dict):
                             nid_raw = obj.get('node_id')
-                            if nid_raw is not None:
-                                try:
-                                    nid = int(str(nid_raw))
-                                except Exception:
-                                    nid = None
-                                if nid == node_id:
-                                    seq = str(obj.get('sequence', '')).upper()
-                                    if not seq:
-                                        return None, None
-                                    af_bins = normalize_af_to_bins_compact(obj.get('genomead_af'), len(seq))
-                                    return seq, af_bins
-        return None, None
+                            try:
+                                nid = int(str(nid_raw)) if nid_raw is not None else None
+                            except: nid = None
+                            if nid == node_id:
+                                seq = str(obj.get('sequence', '')).upper()
+                                if not seq: return None, None
+                                return seq, normalize_af_to_bins_compact(obj.get('genomead_af'), len(seq))
+    return None, None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Variant extraction + pileup row builders
+# Variant + tensor rows
 
 def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_quality_values, read_cigar_ops_decoded,
                                      target_node_pos, node_sequence,
@@ -287,10 +234,8 @@ def detect_variants_from_cigar(offset_on_node, cigar_ops_decoded, read_sequence,
             for i in range(length):
                 cur_node_p, cur_read_p = node_pos + i, read_pos + i
                 if cur_node_p < node_seq_len and cur_read_p < read_seq_len:
-                    node_base = node_sequence[cur_node_p].upper()
-                    read_base = read_sequence[cur_read_p].upper()
-                    if node_base != read_base and op != '=':
-                        variants.append((cur_node_p, 'X', read_base, node_base))
+                    if node_sequence[cur_node_p].upper() != read_sequence[cur_read_p].upper() and op != '=':
+                        variants.append((cur_node_p, 'X', read_sequence[cur_read_p].upper(), node_sequence[cur_node_p].upper()))
                 else:
                     break
             node_pos += length
@@ -357,26 +302,115 @@ def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
     return bases, quals, mapqs, cigar_ops_indices
 
 # ─────────────────────────────────────────────────────────────────────────────
-# View helper (text)
+# 6-channel VIEW rendering
 
-def display_pileup_header(node_id: int, node_len: int, n_reads: int):
-    print(f"\n=== Node {node_id} (len={node_len}, reads={n_reads}) ===")
+def _row_to_bases_str(int_row: List[int]) -> str:
+    return ''.join(INDEX_TO_BASE_FOR_VIEW.get(x, '?') for x in int_row)
 
-def display_variant_marker(node_seq: str, v_pos: int, v_type: str):
-    window_center_pos = v_pos + 1 if v_type == 'I' else v_pos
-    window_start_pos = calculate_window_start(window_center_pos, TENSOR_WINDOW_SIZE)
-    ref_chars = []
-    for j in range(window_start_pos, window_start_pos + TENSOR_WINDOW_SIZE):
-        ref_chars.append(node_seq[j] if 0 <= j < len(node_seq) else '0')
-    marker_pos = v_pos - window_start_pos
-    marker_line = [' '] * TENSOR_WINDOW_SIZE
-    if 0 <= marker_pos < TENSOR_WINDOW_SIZE:
-        marker_line[marker_pos] = '^'
-    print(f"\n  Ref    : {''.join(ref_chars)}")
-    print(f"  Marker : {''.join(marker_line)}")
+def _row_to_bq_str(bq_row: List[int]) -> str:
+    # Sanger: 0 -> '.' ; 1..93 -> chr(33+q) ; >93 clamped to '~'
+    out = []
+    for q in bq_row:
+        if q <= 0:
+            out.append('.')
+        else:
+            q = min(q, 93)
+            out.append(chr(33 + q))
+    return ''.join(out)
+
+def _row_to_mismatch_str(flags_row: List[int], variant_idx: int) -> str:
+    # -1 pad -> ' ' ; 0 match -> '.' ; 1 mismatch -> 'x' ; 5 at variant idx -> '^'
+    out = []
+    for i, v in enumerate(flags_row):
+        if v == MISMATCH_COMPARISON_PADDING_VALUE:
+            ch = ' '
+        elif v == 0:
+            ch = '.'
+        elif v == 5:
+            ch = '^'
+        else:
+            ch = 'x'
+        out.append(ch)
+    # Ensure variant marker visible even if padding
+    if 0 <= variant_idx < len(out) and out[variant_idx] == '.':
+        out[variant_idx] = '^'
+    return ''.join(out)
+
+def _row_to_mapq_str(mq_row: List[int]) -> str:
+    # Compact single char per column:
+    #  -1 -> '.' ; 0..9 -> digits ; 10..35 -> 'A'..'Z' ; 36..61 -> 'a'..'z' ; 62+ -> '+'
+    out = []
+    for m in mq_row:
+        if m < 0:
+            out.append('.')
+        elif m <= 9:
+            out.append(str(m))
+        elif m <= 35:
+            out.append(chr(ord('A') + (m - 10)))
+        elif m <= 61:
+            out.append(chr(ord('a') + (m - 36)))
+        else:
+            out.append('+')
+    return ''.join(out)
+
+def _row_to_cigarop_str(op_row: List[int]) -> str:
+    return ''.join(INDEX_TO_CIGAR_OP.get(x, '0') for x in op_row)
+
+def _row_to_afbin_str(af_row: List[int]) -> str:
+    # Expect 0..7 ; otherwise '0'
+    return ''.join('01234567'[v] if 0 <= v <= 7 else '0' for v in af_row)
+
+def display_pileup_6ch(variant_key: str,
+                       node_seq: str,
+                       v_pos: int,
+                       v_type: str,
+                       ch1: np.ndarray, ch2: np.ndarray, ch3: np.ndarray,
+                       ch4: np.ndarray, ch5: np.ndarray, ch6: np.ndarray,
+                       reads_added: int):
+    """
+    ch* shape: (1 + TENSOR_MAX_READ_ROWS, TENSOR_WINDOW_SIZE)
+    prints ref (row0) then first `reads_added` reads.
+    """
+    win_center = v_pos + 1 if v_type == 'I' else v_pos
+    win_start = calculate_window_start(win_center, TENSOR_WINDOW_SIZE)
+    v_idx = v_pos - win_start
+
+    print(f"\n--- Variant: {variant_key} ---")
+
+    # Ref rows
+    ref_c1 = _row_to_bases_str(list(ch1[0, :]))
+    ref_c2 = _row_to_bq_str(list(ch2[0, :]))
+    ref_c3 = _row_to_mismatch_str(list(ch3[0, :]), v_idx)
+    ref_c4 = _row_to_mapq_str(list(ch4[0, :]))
+    ref_c5 = _row_to_cigarop_str(list(ch5[0, :]))
+    ref_c6 = _row_to_afbin_str(list(ch6[0, :]))
+
+    print(f"  Ref C1: {ref_c1}")
+    print(f"      ^ : {''.join('^' if i == v_idx else ' ' for i in range(TENSOR_WINDOW_SIZE))}")
+    print(f"  Ref C2: {ref_c2}")
+    print(f"  Ref C3: {ref_c3}")
+    print(f"  Ref C4: {ref_c4}")
+    print(f"  Ref C5: {ref_c5}")
+    print(f"  Ref C6: {ref_c6}")
+
+    # Read rows
+    for r in range(1, 1 + reads_added):
+        row_c1 = _row_to_bases_str(list(ch1[r, :]))
+        row_c2 = _row_to_bq_str(list(ch2[r, :]))
+        row_c3 = _row_to_mismatch_str(list(ch3[r, :]), v_idx)
+        row_c4 = _row_to_mapq_str(list(ch4[r, :]))
+        row_c5 = _row_to_cigarop_str(list(ch5[r, :]))
+        row_c6 = _row_to_afbin_str(list(ch6[r, :]))
+
+        print(f"  R{r:03d} C1: {row_c1}")
+        print(f"          C2: {row_c2}")
+        print(f"          C3: {row_c3}")
+        print(f"          C4: {row_c4}")
+        print(f"          C5: {row_c5}")
+        print(f"          C6: {row_c6}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main single-node routine
+# Main single-node routine (unchanged tensor logic; now builds view payload)
 
 def process_single_node(dat_path: str,
                         idx_path: str,
@@ -388,38 +422,28 @@ def process_single_node(dat_path: str,
                         min_variants: int,
                         min_allele_bq: float,
                         view_limit: Optional[int],
-                        max_reads_view: int,
+                        max_view_reads: int,
                         mapq_min: int,
                         max_reads_guard: int) -> Tuple[int, int]:
-    """
-    Return (n_variants_emitted, n_reads_consumed)
-    """
-    # 1) Locate node in IDX
     loc = find_node_in_idx(idx_path, node_id)
     if not loc:
         raise SystemExit(f"Node {node_id} not found in IDX.")
     dat_offset, n_records = loc
 
-    # 2) Get sequence + AF bins
     seq, af_bins = load_single_node_seq_and_af(merged_json_path, node_id)
     if not seq:
         raise SystemExit(f"Node {node_id} not found in merged JSON, or empty sequence.")
-    node_seq = seq.upper()
-    node_len = len(node_seq)
+    node_seq = seq.upper(); node_len = len(node_seq)
 
-    # 3) Read aligned segments for this node from .dat
     aligned = []
     with open(dat_path, 'rb') as df:
-        # replicate your offset behavior (+10 bytes header per node block)
         df.seek(dat_offset + 10)
         bulk = df.read(n_records * RECORD_SIZE)
         if len(bulk) < n_records * RECORD_SIZE:
             n_records = len(bulk) // RECORD_SIZE
             bulk = bulk[: n_records * RECORD_SIZE]
-
         for (off_from_file, raw_seq, raw_qual, raw_cigar, mapq_val, strand_byte) in RECORD_STRUCT.iter_unpack(bulk):
-            if mapq_val < mapq_min:
-                continue
+            if mapq_val < mapq_min: continue
             try:
                 rseq = raw_seq.rstrip(b'\0').decode('ascii', 'replace')
                 rqual = list(raw_qual.rstrip(b'\0'))
@@ -427,24 +451,18 @@ def process_single_node(dat_path: str,
                 strand = strand_byte.decode('ascii')
             except UnicodeDecodeError:
                 continue
-            if not rseq or len(rseq) != len(rqual):
-                continue
+            if not rseq or len(rseq) != len(rqual): continue
             ops = decode_cigar_to_int_ops(cigar)
-            if not ops and cigar != '*':
-                continue
+            if not ops and cigar != '*': continue
 
-            cur_seq = rseq
-            cur_qual = rqual
-            cur_ops = ops
-            cur_off = off_from_file
+            cur_seq, cur_qual, cur_ops, cur_off = rseq, rqual, ops, off_from_file
             if strand == '-':
                 cur_seq = reverse_complement(rseq)
                 cur_qual = rqual[::-1]
                 cur_ops = [op for op in reversed(ops)] if ops else []
                 aln_span = len(cur_seq)
                 cur_off = node_len - aln_span - off_from_file
-                if cur_off < 0:
-                    continue
+                if cur_off < 0: continue
 
             aligned.append({
                 "offset_on_node": cur_off,
@@ -464,37 +482,29 @@ def process_single_node(dat_path: str,
         log(f"Node {node_id}: too many reads ({n_reads} > {max_reads_guard}), skipping.")
         return 0, 0
 
-    # 4) Variant discovery
     candidate = defaultdict(int)
     for seg in aligned:
         for v_pos, v_type, v_alt, v_ref in detect_variants_from_cigar(
                 seg["offset_on_node"], seg["cigar_ops"], seg["read_sequence"], node_seq):
             candidate[(v_pos, v_type, v_ref, v_alt)] += 1
 
-    # 5) Per-variant counting + filters + tensor build
     out_node_dir = os.path.join(out_dir, str(node_id))
     os.makedirs(out_node_dir, exist_ok=True)
 
     emitted = 0
     summary = []
 
-    # Optional view
-    if view_limit is not None:
-        display_pileup_header(node_id, node_len, n_reads)
-
+    # iterate variants (respect --view limit during printing only)
     for (v_pos, v_type, v_ref_from_cigar, v_alt_from_cigar), _ in candidate.items():
-        if variant_type == 'snp' and v_type != 'X':
-            continue
-        if variant_type == 'indel' and v_type not in ('I', 'D'):
-            continue
+        if variant_type == 'snp' and v_type != 'X':  continue
+        if variant_type == 'indel' and v_type not in ('I', 'D'):  continue
 
         alt = v_alt_from_cigar
         ref = v_ref_from_cigar
         ref_for_indel_ctx = None
         if v_type == 'D':
             alt = "*"
-            if 0 <= v_pos < node_len:
-                ref = node_seq[v_pos]
+            if 0 <= v_pos < node_len: ref = node_seq[v_pos]
             ref_for_indel_ctx = v_ref_from_cigar
         elif v_type == 'I':
             ref = node_seq[v_pos] if 0 <= v_pos < node_len else "*"
@@ -511,23 +521,18 @@ def process_single_node(dat_path: str,
                 cov += 1
                 if allele == alt:
                     alt_cnt += 1
-                    if bq is not None:
-                        alt_bqs.append(bq)
+                    if bq is not None: alt_bqs.append(bq)
                 elif allele == ref or (v_type in ('I', 'D') and allele == "REF_STATE_FOR_INDEL"):
                     ref_cnt += 1
                 else:
                     other_cnt += 1
 
-        if alt_cnt < min_variants:
-            continue
-
+        if alt_cnt < min_variants: continue
         if v_type == 'X':
             tmp_af = alt_cnt / cov if cov > 0 else 0.0
-            if tmp_af < min_af:
-                continue
+            if tmp_af < min_af: continue
             mean_bq = sum(alt_bqs) / len(alt_bqs) if alt_bqs else 0.0
-            if mean_bq < min_allele_bq:
-                continue
+            if mean_bq < min_allele_bq: continue
         else:
             mean_bq = sum(alt_bqs) / len(alt_bqs) if alt_bqs else 0.0
 
@@ -537,13 +542,13 @@ def process_single_node(dat_path: str,
         win_center = v_pos + 1 if v_type == 'I' else v_pos
         win_start = calculate_window_start(win_center, TENSOR_WINDOW_SIZE)
 
-        # Row 0 (reference bases)
+        # Row 0 — reference bases
         ref_row = [PADDING_BASE_INDEX] * TENSOR_WINDOW_SIZE
         for i, pos in enumerate(range(win_start, win_start + TENSOR_WINDOW_SIZE)):
             if 0 <= pos < node_len:
                 ref_row[i] = BASE_TO_INDEX.get(node_seq[pos].upper(), BASE_TO_INDEX['N'])
 
-        # Row 0 for AF bins
+        # Row 0 — AF bins
         af_row = np.zeros(TENSOR_WINDOW_SIZE, dtype=np.uint8)
         if af_bins is not None:
             for i, pos in enumerate(range(win_start, win_start + TENSOR_WINDOW_SIZE)):
@@ -581,6 +586,7 @@ def process_single_node(dat_path: str,
                 r = 1 + reads_added
                 ch1[r, :] = np.asarray(base_row, dtype=np.int8)
                 ch2[r, :] = np.asarray(qual_row, dtype=np.int8)
+
                 ref_vec = ch1[0, :].astype(np.int16)
                 read_vec = ch1[r, :].astype(np.int16)
                 flags = np.full(W, MISMATCH_COMPARISON_PADDING_VALUE, dtype=np.int8)
@@ -589,6 +595,7 @@ def process_single_node(dat_path: str,
                 if 0 <= v_idx < W and mask[v_idx] and flags[v_idx] == 1:
                     flags[v_idx] = 5
                 ch3[r, :] = flags
+
                 ch4[r, :] = np.asarray(mapq_row, dtype=np.int8)
                 ch5[r, :] = np.asarray(cigar_row, dtype=np.int8)
                 ch6[r, :] = ch6[0, :]
@@ -610,16 +617,29 @@ def process_single_node(dat_path: str,
         })
         emitted += 1
 
-        # Optional view
+        # ── NEW: rich 6-channel view ─────────────────────────────────────────
         if view_limit is not None:
-            display_variant_marker(node_seq, v_pos, v_type)
-            print(f"  Variant: pos={v_pos}, type={v_type}, ref={ref}, alt={alt}, "
-                  f"AC={alt_cnt}, RC={ref_cnt}, OC={other_cnt}, DP={cov}, AF={cur_af:.3f}, meanBQ={mean_bq:.1f}")
+            # trim to N reads for display
+            reads_to_show = min(reads_added, max_view_reads)
+            display_pileup_6ch(
+                variant_key=key,
+                node_seq=node_seq,
+                v_pos=v_pos,
+                v_type=v_type,
+                ch1=ch1[:1+reads_to_show, :],
+                ch2=ch2[:1+reads_to_show, :],
+                ch3=ch3[:1+reads_to_show, :],
+                ch4=ch4[:1+reads_to_show, :],
+                ch5=ch5[:1+reads_to_show, :],
+                ch6=ch6[:1+reads_to_show, :],
+                reads_added=reads_to_show
+            )
             if view_limit > 0:
                 view_limit -= 1
                 if view_limit == 0:
                     print("\n  ... (view limit reached)")
-                    view_limit = None  # stop printing more
+                    # stop printing additional variants
+                    view_limit = None
 
     # Write summary
     with open(os.path.join(out_node_dir, "variant_summary.json"), "w") as fh:
@@ -634,26 +654,26 @@ def process_single_node(dat_path: str,
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Build tensors for ONE .idx/.dat node; JSON streamed; AF channel policy preserved.",
+        description="Build tensors for ONE node; show 6-channel view.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument("dat", help=".dat alignment file")
     ap.add_argument("idx", help=".idx index file")
-    ap.add_argument("merged_json", help="Merged node JSON with sequence and AF; .gz allowed")
+    ap.add_argument("merged_json", help="Merged node JSON with sequence+AF; .gz allowed")
     ap.add_argument("-o", "--output", required=True, help="Base output directory")
     ap.add_argument("--node_id", type=int, required=True, help="Node ID to process")
 
-    ap.add_argument("--variant_type", choices=["snp", "indel", "all"], default="all",
-                    help="Which variant types to emit")
-    ap.add_argument("--min_af", type=float, default=0.10, help="Min AF for SNP to pass")
-    ap.add_argument("--min_variants", type=int, default=3, help="Min ALT count to pass")
-    ap.add_argument("--min_allele_bq", type=float, default=10.0, help="Min mean base quality for ALT alleles")
+    ap.add_argument("--variant_type", choices=["snp", "indel", "all"], default="all")
+    ap.add_argument("--min_af", type=float, default=0.10)
+    ap.add_argument("--min_variants", type=int, default=3)
+    ap.add_argument("--min_allele_bq", type=float, default=10.0)
 
-    ap.add_argument("--mapq_min", type=int, default=10, help="Minimum MAPQ to accept a read")
-    ap.add_argument("--max_reads_guard", type=int, default=10000, help="Skip node if reads exceed this")
+    ap.add_argument("--mapq_min", type=int, default=10)
+    ap.add_argument("--max_reads_guard", type=int, default=10000)
 
     ap.add_argument("--view", nargs='?', const=10, type=int, metavar="N",
-                    help="Print brief text view for up to N variants (omit N to default to 10)")
-    ap.add_argument("--max_view_reads", type=int, default=20, help="(reserved) reads per variant for view")
+                    help="Print 6-channel pileups for up to N variants (omit N → 10).")
+    ap.add_argument("--max_view_reads", type=int, default=20,
+                    help="Max reads to show per variant in view mode")
 
     args = ap.parse_args()
 
@@ -673,7 +693,7 @@ def main():
         min_variants=args.min_variants,
         min_allele_bq=args.min_allele_bq,
         view_limit=args.view,
-        max_reads_view=args.max_view_reads,
+        max_view_reads=args.max_view_reads,
         mapq_min=args.mapq_min,
         max_reads_guard=args.max_reads_guard
     )
