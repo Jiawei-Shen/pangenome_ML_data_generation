@@ -115,6 +115,7 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
         if node_id not in wanted_nodes:
             for edit in mapping.edit:
                 # read_offset += max(edit.from_length, len(edit.sequence))
+                print(edit.to_length)
                 jump_len = edit.to_length if edit.to_length else 0
                 read_offset += jump_len
             continue
