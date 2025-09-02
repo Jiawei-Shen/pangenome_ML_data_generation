@@ -364,15 +364,18 @@ def display_pileup_c1_only(variant_key: str,
                            v_pos: int,
                            v_type: str,
                            ch1: np.ndarray,
-                           reads_added: int):
+                           max_reads_to_show: int):
     """
-    Print only Channel 1 (bases) for ref and the first `reads_added` reads.
+    Print only Channel 1 (bases) for ref and reads that *cover the variant column*.
     ch1 shape: (1 + TENSOR_MAX_READ_ROWS, TENSOR_WINDOW_SIZE)
     """
-    # compute variant column in the window
+    # Compute variant column in the window
     win_center = v_pos + 1 if v_type == 'I' else v_pos
     win_start  = calculate_window_start(win_center, TENSOR_WINDOW_SIZE)
     v_idx      = v_pos - win_start
+    if not (0 <= v_idx < TENSOR_WINDOW_SIZE):
+        # variant not inside window (shouldn't happen), print ref only
+        v_idx = -1
 
     def _row_to_bases_str(int_row):
         return ''.join(INDEX_TO_BASE_FOR_VIEW.get(int(x), '?') for x in int_row)
@@ -382,14 +385,28 @@ def display_pileup_c1_only(variant_key: str,
     # Ref row
     ref_c1 = _row_to_bases_str(ch1[0, :])
     print(f"  Ref C1: {ref_c1}")
-    # caret marker under the variant column
     marker = ''.join('^' if i == v_idx else ' ' for i in range(TENSOR_WINDOW_SIZE))
     print(f"       ^: {marker}")
 
-    # Read rows (only C1)
-    for r in range(1, 1 + reads_added):
+    # Build a list of read row indices that *cover* the variant column
+    covering_rows = []
+    H = ch1.shape[0]
+    if v_idx >= 0:
+        for r in range(1, H):
+            base_idx = int(ch1[r, v_idx])
+            # Non-padding at variant column indicates coverage at that position
+            # (for deletions we encoded '*' (BASE_TO_INDEX['*']) which is 90, also non-zero)
+            if base_idx != PADDING_BASE_INDEX:
+                covering_rows.append(r)
+
+    # Limit to requested number of reads
+    covering_rows = covering_rows[:max_reads_to_show]
+
+    # Print only reads that overlap the variant column
+    for i, r in enumerate(covering_rows, 1):
         row_c1 = _row_to_bases_str(ch1[r, :])
-        print(f"  R{r:03d} C1: {row_c1}")
+        print(f"  R{i:03d} C1: {row_c1}")
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -602,13 +619,13 @@ def process_single_node(dat_path: str,
 
         # ── NEW: rich 6-channel view ─────────────────────────────────────────
         if view_limit is not None:
-            reads_to_show = min(reads_added, max_view_reads)
             display_pileup_c1_only(
                 variant_key=key,
                 v_pos=v_pos,
                 v_type=v_type,
-                ch1=ch1[:1 + reads_to_show, :],
-                reads_added=reads_to_show
+                # pass only the rows that were actually filled (ref + reads_added)
+                ch1=ch1[: 1 + reads_added, :],
+                max_reads_to_show=max_view_reads
             )
             if view_limit > 0:
                 view_limit -= 1
