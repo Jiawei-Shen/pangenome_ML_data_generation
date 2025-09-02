@@ -42,9 +42,9 @@ def af_to_level(af: float) -> int:
 
     # Clamp to [0, 1] for binning
     if af < 0.0:
-        af = 0.0
+        af = 0
     if af > 1.0:
-        af = 1.0
+        af = 8
 
     for idx, (lo, hi) in enumerate(LEVEL_BOUNDS, start=1):
         if idx < 8:
