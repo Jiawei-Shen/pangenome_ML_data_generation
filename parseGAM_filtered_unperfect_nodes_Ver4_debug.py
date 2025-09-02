@@ -291,7 +291,8 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     for raw_msg in gam_record_iter(gam_path):
         segment_dict = process_alignment(raw_msg, wanted_nodes, chrom_filter)
         total_reads += 1
-        break
+        if segment_dict:
+            break
         for node_id, segs in segment_dict.items():
             segment_buffer[node_id].extend(segs)
             total_segments += len(segs)
