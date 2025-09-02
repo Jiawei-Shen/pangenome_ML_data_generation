@@ -231,8 +231,9 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
 
     with open(stats_path, "rb") as stats_file:
         stats_data = pickle.load(stats_file)
-    wanted_nodes = set()
 
+    wanted_nodes = set()
+    block_infos = {}
     current_offset = 0
     total_nodes = 0
 
