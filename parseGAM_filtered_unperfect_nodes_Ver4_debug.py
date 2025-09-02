@@ -96,7 +96,6 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
     segment_dict = {}
     alignment = vg_pb2.Alignment()
     alignment.ParseFromString(raw_message)
-    print(alignment)
     # Filter out low mapping quality
     if alignment.mapping_quality <= 10:
         return segment_dict
@@ -151,7 +150,7 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
             quality_parts.extend(quality_fragment)
             read_offset += edit_length
 
-        print(node_offset, sequence_parts)
+        print(read_sequence, node_offset, sequence_parts)
         # Construct final padded fields
         cigar_string = "".join(cigar_parts)
         seq_final = "".join(sequence_parts).encode().ljust(150, b'\x00')[:150]
