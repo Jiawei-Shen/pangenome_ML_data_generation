@@ -108,6 +108,7 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
     mapping_quality = alignment.mapping_quality
     read_offset = 0
 
+    print(read_sequence)
     for mapping in alignment.path.mapping:
         node_id = mapping.position.node_id
 
@@ -150,7 +151,7 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
             quality_parts.extend(quality_fragment)
             read_offset += edit_length
 
-        print(read_sequence, node_offset, sequence_parts)
+        print(node_offset, sequence_parts)
         # Construct final padded fields
         cigar_string = "".join(cigar_parts)
         seq_final = "".join(sequence_parts).encode().ljust(150, b'\x00')[:150]
