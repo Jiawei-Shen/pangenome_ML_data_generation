@@ -788,7 +788,7 @@ def main():
                                         args.max_view_reads,
                                         args.view if args.view != -1 else float('inf'))
 
-                if batch_nodes >= 10000 or processed == len(wave_tasks):
+                if batch_nodes >= 10 or processed == len(wave_tasks):
                     dt = time.time() - t_batch
                     rate = batch_nodes / dt if dt > 0 else 0.0
                     log(f"[Wave {wave_num}] processed {processed:,}/{len(wave_tasks):,}  "
