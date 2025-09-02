@@ -234,7 +234,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     total_segments = 0
     start_time = time.perf_counter()
 
-    dat_fh = open(dat_path, "r+b")
+    # dat_fh = open(dat_path, "r+b")
     segment_buffer = defaultdict(list)
 
     # def flush_segment_buffer():
@@ -276,7 +276,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
             next_milestone += milestone_step
 
     # flush_segment_buffer()
-    dat_fh.close()
+    # dat_fh.close()
 
     elapsed = time.perf_counter() - start_time
     print("\nFinal Summary:")
