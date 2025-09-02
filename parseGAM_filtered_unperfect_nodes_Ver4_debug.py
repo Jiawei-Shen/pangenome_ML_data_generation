@@ -108,7 +108,7 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
     mapping_quality = alignment.mapping_quality
     read_offset = 0
 
-    print(read_sequence)
+    print(read_sequence, alignment.path.mapping)
     for mapping in alignment.path.mapping:
         node_id = mapping.position.node_id
 
