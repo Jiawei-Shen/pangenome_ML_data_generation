@@ -115,8 +115,7 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
         if node_id not in wanted_nodes:
             for edit in mapping.edit:
                 # read_offset += max(edit.from_length, len(edit.sequence))
-                print(edit.to_length)
-                jump_len = edit.to_length if edit.to_length else 0
+                jump_len = edit.to_length
                 read_offset += jump_len
             continue
 
@@ -146,7 +145,8 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
                 raise ValueError(f"Unexpected edit: from_length={from_len}, sequence_length={edit_len}")
 
             # Append sequence and quality
-            edit_length = max(from_len, edit_len)
+            # edit_length = max(from_len, edit_len)
+            edit_length = to_len
             sequence_fragment = read_sequence[read_offset: read_offset + edit_length]
             quality_fragment = read_quality[read_offset: read_offset + edit_length]
 
