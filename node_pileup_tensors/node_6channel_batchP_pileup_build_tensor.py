@@ -712,7 +712,7 @@ def main():
     ap.add_argument("merged_json", help="Merged node JSON with sequence and AF (list or {'nodes':[...]}); .gz ok")
     ap.add_argument("--num_workers", type=int, default=os.cpu_count(), help="Worker processes")
     ap.add_argument("--chunksize", type=int, default=512, help="executor.map chunksize")
-    ap.add_argument("--wave_size", type=int, default=100000, help="Max nodes to submit per wave")
+    ap.add_argument("--wave_size", type=int, default=1000000, help="Max nodes to submit per wave")
     ap.add_argument("--view", nargs='?', const=-1, default=None, type=int, metavar='N',
                     help="Print pileups for top N variants per node (-1 for all)")
     ap.add_argument("--max_view_reads", type=int, default=20, help="Reads per pileup in view mode")
@@ -789,7 +789,7 @@ def main():
                                         args.max_view_reads,
                                         args.view if args.view != -1 else float('inf'))
 
-                if batch_nodes >= 10 or processed == len(wave_tasks):
+                if batch_nodes >= 100000 or processed == len(wave_tasks):
                     dt = time.time() - t_batch
                     rate = batch_nodes / dt if dt > 0 else 0.0
                     log(f"[Wave {wave_num}] processed {processed:,}/{len(wave_tasks):,}  "
