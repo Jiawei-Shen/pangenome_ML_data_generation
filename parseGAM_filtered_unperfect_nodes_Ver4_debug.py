@@ -224,10 +224,38 @@ def initialize_output_files(stats_path, output_prefix):
 # ─────────────────────────────────────────────────────────────────────────────
 def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filter):
     # print(f"Initializing output files...")
-    # block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
+    block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
     # print(f"Output file created: {dat_path}")
 
     # BUFFER_SEGMENTS = 400_000_000  # it takes about 240GB memory
+
+    with open(stats_path, "rb") as stats_file:
+        stats_data = pickle.load(stats_file)
+    wanted_nodes = set()
+
+    current_offset = 0
+    total_nodes = 0
+
+    for node_id_str, stat in stats_data.items():
+        total_nodes += 1
+        node_id = int(node_id_str)
+        perfect = stat["perfect"]
+        not_perfect = stat["not_perfect"]
+        if not_perfect > 1 and not_perfect / (perfect + not_perfect) > 0.10:
+            wanted_nodes.add(node_id)
+            n_records = perfect + not_perfect
+
+            block_infos[node_id] = {
+                "offset": current_offset,
+                "n_records": n_records,
+                "current_pos": 0
+            }
+            current_offset += 4 + 4 + 2 + n_records * RECORD_SIZE
+
+    print(f"Filtered {len(wanted_nodes)} nodes from {total_nodes} total nodes "
+          f"({len(wanted_nodes) / total_nodes:.2%} selected).")
+    del stats_data
+    gc.collect()
 
     next_milestone = milestone_step
     total_reads = 0
