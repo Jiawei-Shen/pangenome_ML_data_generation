@@ -167,6 +167,7 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
         )
         segment_dict.setdefault(node_id, []).append(seg)
 
+    print(seg)
     return segment_dict
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -289,7 +290,6 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
 
     for raw_msg in gam_record_iter(gam_path):
         segment_dict = process_alignment(raw_msg, wanted_nodes, chrom_filter)
-        print(segment_dict, '\n')
         total_reads += 1
 
         for node_id, segs in segment_dict.items():
