@@ -229,7 +229,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
     print(f"Output file created: {dat_path}")
 
-    BUFFER_SEGMENTS = 400_000_000  # it takes about 240GB memory
+    BUFFER_SEGMENTS = 200_000_000  # it takes about 240GB memory
 
     next_milestone = milestone_step
     total_reads = 0
@@ -291,7 +291,7 @@ def main():
     parser.add_argument("gam_path", help="Path to the GAM file")
     parser.add_argument("stats_pickle", help="Path to the node stats pickle file")
     parser.add_argument("output_prefix", help="Prefix for output files")
-    parser.add_argument("--milestone", type=int, default=10_000_000, help="Progress report interval")
+    parser.add_argument("--milestone", type=int, default=1_000_000, help="Progress report interval")
     parser.add_argument("--chr", default="", help="Optional chromosome name to filter on")
     args = parser.parse_args()
 

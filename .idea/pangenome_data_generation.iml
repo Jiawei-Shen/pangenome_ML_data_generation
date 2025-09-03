@@ -6,7 +6,7 @@
       <excludeFolder url="file://$MODULE_DIR$/Pangenome_Graph" />
       <excludeFolder url="file://$MODULE_DIR$/Qichen_trueset_VCF" />
     </content>
-    <orderEntry type="jdk" jdkName="pange" jdkType="Python SDK" />
+    <orderEntry type="jdk" jdkName="cse561A" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
   </component>
   <component name="PyDocumentationSettings">
