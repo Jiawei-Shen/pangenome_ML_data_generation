@@ -545,7 +545,7 @@ def main():
     p.add_argument("output_prefix", help="Prefix for output files (.dat/.idx)")
     p.add_argument("--milestone", type=int, default=1_000_000, help="Progress report interval in reads")
     p.add_argument("--chr", default="", help="Optional chromosome filter (matches Alignment.refpos.name)")
-    p.add_argument("--buffer-segments", type=int, default=100_000_000,
+    p.add_argument("--buffer-segments", type=int, default=200_000_000,
                    help="Flush when buffered segments reach this count (default: 100,000,000)")
     p.add_argument("--io-workers", type=int, default=4,
                    help="Concurrent pwrite workers (1 disables threading)")
