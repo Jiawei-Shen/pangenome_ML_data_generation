@@ -399,7 +399,6 @@ def process_single_node_for_pileup(task_args):
 
     if not aligned_read_segments:
         return node_id, {}, tensor_files_generated_for_node
-    # print(node_id, len(aligned_read_segments))
     if len(aligned_read_segments) > 100000:
         return node_id, None, tensor_files_generated_for_node
 

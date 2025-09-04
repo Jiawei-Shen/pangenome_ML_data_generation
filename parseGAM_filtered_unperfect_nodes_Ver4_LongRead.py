@@ -196,7 +196,7 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Output preallocation (variable record sizes; header-offset fixed)
+# Initialize outputs (variable record sizes; header-offset fixed)
 def initialize_output_files(stats_path, output_prefix, default_node_length=150):
     with open(stats_path, "rb") as stats_file:
         stats_data = pickle.load(stats_file)
@@ -284,6 +284,83 @@ def initialize_output_files(stats_path, output_prefix, default_node_length=150):
     return block_infos, dat_path, wanted_nodes
 
 
+# NEW: load existing .dat/.idx instead of initializing
+def load_existing_output_files(output_prefix):
+    idx_path = output_prefix + ".idx"
+    dat_path = output_prefix + ".dat"
+
+    if not (os.path.exists(idx_path) and os.path.exists(dat_path)):
+        raise FileNotFoundError(f"Expected existing files: {idx_path} and {dat_path}")
+
+    # Read .idx header
+    with open(idx_path, "rb") as f:
+        raw = f.read(4)
+        if len(raw) != 4:
+            raise RuntimeError("Corrupt .idx: cannot read block count")
+        (count,) = struct.unpack("<I", raw)
+        # Determine per-entry size to support older/newer variants (22 vs 26 bytes)
+        f.seek(0, os.SEEK_END)
+        total = f.tell()
+        remaining = total - 4
+        if count <= 0:
+            raise RuntimeError("Empty .idx (no blocks)")
+        entry_size = remaining // count
+        if entry_size not in (22, 26):
+            # Default to 26 and hope; otherwise fail
+            entry_size = 26
+        f.seek(4)
+
+        entries = []
+        for _ in range(count):
+            if entry_size == 26:
+                data = f.read(26)
+                if len(data) != 26: raise RuntimeError("Corrupt .idx: truncated entry")
+                node_id, offset, block_size, n_records, flags, node_len = struct.unpack("<I Q I I H I", data)
+            else:
+                data = f.read(22)
+                if len(data) != 22: raise RuntimeError("Corrupt .idx: truncated entry")
+                node_id, offset, block_size, n_records, flags = struct.unpack("<I Q I I H", data)
+                node_len = 0  # unknown; read from .dat
+            entries.append((node_id, offset, block_size, n_records, flags, node_len))
+
+    # Verify .dat global header and block count
+    with open(dat_path, "rb") as df:
+        magic = df.read(len(GLOBAL_MAGIC))
+        if magic != GLOBAL_MAGIC:
+            raise RuntimeError("Invalid .dat magic/version")
+        majors, minors, dat_count, _ = GLOBAL_VER_PACK.unpack(df.read(GLOBAL_VER_PACK.size))
+        if dat_count != len(entries):
+            print(f"[warn] .dat block_count ({dat_count}) != .idx count ({len(entries)})")
+
+        # Build block_infos, pulling node_length from .dat when missing
+        block_infos = {}
+        wanted_nodes = set()
+        for node_id, offset, block_size, n_records, flags, node_len in entries:
+            if node_len <= 0:
+                df.seek(offset, os.SEEK_SET)
+                hdr = df.read(BLOCK_HDR_SIZE)
+                if len(hdr) != BLOCK_HDR_SIZE:
+                    raise RuntimeError(f"Corrupt .dat: cannot read block header at {offset}")
+                nid2, nrec2, flg2, node_len = BLOCK_HDR_PACK.unpack(hdr)
+                # light validation
+                if nid2 != node_id or nrec2 != n_records:
+                    print(f"[warn] .dat/.idx mismatch for node {node_id} (idx n={n_records}, dat n={nrec2})")
+
+            rec_sz = record_size(node_len)
+            block_infos[node_id] = {
+                "offset": offset,
+                "n_records": n_records,
+                "current_pos": 0,          # assume unused/empty file
+                "node_length": node_len,
+                "record_size": rec_sz,
+                "block_size": block_size,
+            }
+            wanted_nodes.add(node_id)
+
+    print(f"Reusing existing output with {len(block_infos)} node blocks from {idx_path}")
+    return block_infos, dat_path, wanted_nodes
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Faster flusher: pack_into + pwrite + file-order + optional concurrency
 ZEROS = b"\x00" * (1024 * 1024)  # 1 MB shared pad buffer
@@ -346,22 +423,17 @@ def make_flusher(block_infos, dat_fh, io_workers=8, fsync_every=0, verify_bounds
             buf = bytearray(total_size)
             _ensure_zeros(max(L, 30))
 
+            def pad_exact(b: bytes, n: int) -> bytes:
+                lb = len(b)
+                if lb >= n:
+                    return b[:n]
+                return b + ZEROS[:n - lb]
+
             off = 0
             for seg in segs:
-                # Build exact-length fields without repeated allocations
-                # (We still create per-field bytes of length L/30 as required by struct)
-                if len(seg.seq) >= L:
-                    seq_f = memoryview(seg.seq)[:L]
-                else:
-                    seq_f = b"".join((seg.seq, memoryview(ZEROS)[:L - len(seg.seq)]))
-                if len(seg.bq) >= L:
-                    bq_f = memoryview(seg.bq)[:L]
-                else:
-                    bq_f = b"".join((seg.bq, memoryview(ZEROS)[:L - len(seg.bq)]))
-                if len(seg.cigar) >= 30:
-                    cg_f = memoryview(seg.cigar)[:30]
-                else:
-                    cg_f = b"".join((seg.cigar, memoryview(ZEROS)[:30 - len(seg.cigar)]))
+                seq_f = pad_exact(seg.seq, L)
+                bq_f  = pad_exact(seg.bq,  L)
+                cg_f  = pad_exact(seg.cigar, 30)
 
                 rec_pack.pack_into(
                     buf, off,
@@ -407,10 +479,14 @@ def make_flusher(block_infos, dat_fh, io_workers=8, fsync_every=0, verify_bounds
 
 # ─────────────────────────────────────────────────────────────────────────────
 def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filter,
-                 buffer_segments, io_workers, fsync_every, verify_bounds):
-    print("Initializing output files...")
-    block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
-    print(f"Output file created: {dat_path}")
+                 buffer_segments, io_workers, fsync_every, verify_bounds, use_existing):
+    if use_existing:
+        print("Reusing existing .dat/.idx...")
+        block_infos, dat_path, wanted_nodes = load_existing_output_files(output_prefix)
+    else:
+        print("Initializing output files...")
+        block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
+        print(f"Output file created: {dat_path}")
 
     next_milestone = milestone_step
     total_reads = 0
@@ -468,13 +544,15 @@ def main():
     p.add_argument("--milestone", type=int, default=1_000_000, help="Progress report interval in reads")
     p.add_argument("--chr", default="", help="Optional chromosome filter (matches Alignment.refpos.name)")
     p.add_argument("--buffer-segments", type=int, default=100_000_000,
-                   help="Flush when buffered segments reach this count (default: 5,000,000)")
+                   help="Flush when buffered segments reach this count (default: 100,000,000)")
     p.add_argument("--io-workers", type=int, default=4,
-                   help="Concurrent pwrite workers (1 disables threading; default: 8)")
+                   help="Concurrent pwrite workers (1 disables threading)")
     p.add_argument("--fsync-every", type=int, default=0,
                    help="Call fsync() after every N flushes (0 disables)")
     p.add_argument("--no-verify-bounds", action="store_true",
                    help="Disable extra assertions on write bounds (faster, less safe)")
+    p.add_argument("--use-existing", action="store_true",
+                   help="Reuse existing initialized output (output_prefix.dat/.idx) instead of reinitializing")
     args = p.parse_args()
 
     run_pipeline(
@@ -486,7 +564,8 @@ def main():
         buffer_segments=args.buffer_segments,
         io_workers=max(1, args.io_workers),
         fsync_every=max(0, args.fsync_every),
-        verify_bounds=not args.no_verify_bounds
+        verify_bounds=not args.no_verify_bounds,
+        use_existing=args.use_existing
     )
 
 
