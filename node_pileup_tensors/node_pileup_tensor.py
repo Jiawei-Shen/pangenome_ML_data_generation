@@ -37,7 +37,7 @@ INDEX_TO_BASE_FOR_VIEW = {
     2: 'A', 3: 'C', 5: 'G', 7: 'T',
     1: 'N',
     9: '*',
-    0: '0'  # Padding is represented by '0'
+    0: ' '  # Padding is represented by '0'
 }
 
 TENSOR_WINDOW_SIZE = 100
