@@ -78,6 +78,26 @@ def ref_span_from_cigar(ops):
     # reference-consuming ops
     return sum(L for L, op in ops if op in ('M', '=', 'X', 'D', 'N'))
 
+def spans_from_cigar(ops):
+    """
+    Returns (ref_span, read_span).
+    - Reference-consuming ops: M, =, X, D, N
+    - Read-consuming ops:      M, =, X, I, S
+    """
+    ref_span = 0
+    read_span = 0
+    for L, op in ops:
+        if op in ('M', '=', 'X'):
+            ref_span += L
+            read_span += L
+        elif op in ('D', 'N'):
+            ref_span += L
+        elif op in ('I', 'S'):
+            read_span += L
+        # H,P consume neither
+    return ref_span, read_span
+
+
 def calculate_window_start(variant_pos, window_size):
     center_index = window_size // 2
     return variant_pos - center_index
@@ -373,6 +393,8 @@ def process_single_node_for_pileup(task_args):
             if not original_decoded_cigar_ops and cigar_str_original != '*':
                 continue
 
+            ref_span, read_span = spans_from_cigar(original_decoded_cigar_ops)
+
             current_read_sequence = seq
             current_quality_values = qual_values
             current_decoded_cigar_ops = original_decoded_cigar_ops
@@ -384,10 +406,16 @@ def process_single_node_for_pileup(task_args):
                 # current_decoded_cigar_ops = [op for op in reversed(original_decoded_cigar_ops)] if original_decoded_cigar_ops else []
                 # alignment_span_on_node = len(current_read_sequence)
                 # current_offset_on_node = node_len - alignment_span_on_node - off_from_file
-                current_decoded_cigar_ops = list(
-                    reversed(original_decoded_cigar_ops)) if original_decoded_cigar_ops else []
-                ref_span = ref_span_from_cigar(original_decoded_cigar_ops)
-                current_offset_on_node = node_len - (off_from_file + ref_span)
+                current_decoded_cigar_ops = list(reversed(original_decoded_cigar_ops))
+
+                # Use READ span (M/=X + I + S), not reference span
+                current_offset_on_node = node_len - (off_from_file + read_span)
+
+                # guard
+                if not (-2 <= current_offset_on_node <= node_len + 2):
+                    # out of plausible range → skip this read
+                    continue
+
                 if current_offset_on_node < 0:
                     continue
 
