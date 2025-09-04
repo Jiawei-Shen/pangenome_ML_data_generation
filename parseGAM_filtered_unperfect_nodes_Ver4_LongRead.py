@@ -502,6 +502,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         verify_bounds=verify_bounds
     )
 
+    print("Start processing GAM.")
     for raw_msg in gam_record_iter(gam_path):
         segment_dict = process_alignment(raw_msg, wanted_nodes, chrom_filter)
         total_reads += 1
@@ -512,6 +513,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
 
         # Flush when buffered segment count exceeds threshold
         if total_segments >= buffer_segments:
+            print("Flushing GAM.")
             flush(segment_buffer)
             total_segments = 0
 
