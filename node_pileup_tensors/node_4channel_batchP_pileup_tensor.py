@@ -596,7 +596,6 @@ def process_single_node_for_pileup(task_args):
             json.dump({"node_id": node_id, "node_length": node_len,
                        "variants_passing_af_filter": variant_headers_for_summary}, f, indent=2)
 
-    print(node_id, tensor_files_generated_for_node)
     return node_id, (view_oriented_variant_data or {}), tensor_files_generated_for_node
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -766,7 +765,7 @@ def main():
                                     args.max_view_reads,
                                     args.view if args.view != -1 else float('inf'))
 
-            if nodes_since_last_report >= 10000 or processed == total_tasks:
+            if nodes_since_last_report >= 10 or processed == total_tasks:
                 elapsed_time = time.time() - batch_start_time
                 rate = nodes_since_last_report / elapsed_time if elapsed_time > 0 else 0.0
                 print(
