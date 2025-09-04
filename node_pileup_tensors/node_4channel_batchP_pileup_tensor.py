@@ -74,29 +74,6 @@ def af_float_to_bin(x: float) -> int:
     if x < 0.5:           return 6
     return 7
 
-def ref_span_from_cigar(ops):
-    # reference-consuming ops
-    return sum(L for L, op in ops if op in ('M', '=', 'X', 'D', 'N'))
-
-def spans_from_cigar(ops):
-    """
-    Returns (ref_span, read_span).
-    - Reference-consuming ops: M, =, X, D, N
-    - Read-consuming ops:      M, =, X, I, S
-    """
-    ref_span = 0
-    read_span = 0
-    for L, op in ops:
-        if op in ('M', '=', 'X'):
-            ref_span += L
-            read_span += L
-        elif op in ('D', 'N'):
-            ref_span += L
-        elif op in ('I', 'S'):
-            read_span += L
-        # H,P consume neither
-    return ref_span, read_span
-
 
 def calculate_window_start(variant_pos, window_size):
     center_index = window_size // 2
@@ -393,8 +370,6 @@ def process_single_node_for_pileup(task_args):
             if not original_decoded_cigar_ops and cigar_str_original != '*':
                 continue
 
-            ref_span, read_span = spans_from_cigar(original_decoded_cigar_ops)
-
             current_read_sequence = seq
             current_quality_values = qual_values
             current_decoded_cigar_ops = original_decoded_cigar_ops
@@ -403,19 +378,9 @@ def process_single_node_for_pileup(task_args):
             if strand_char == '-':
                 current_read_sequence = reverse_complement(seq)
                 current_quality_values = qual_values[::-1]
-                # current_decoded_cigar_ops = [op for op in reversed(original_decoded_cigar_ops)] if original_decoded_cigar_ops else []
-                # alignment_span_on_node = len(current_read_sequence)
-                # current_offset_on_node = node_len - alignment_span_on_node - off_from_file
-                current_decoded_cigar_ops = list(reversed(original_decoded_cigar_ops))
-
-                # Use READ span (M/=X + I + S), not reference span
-                current_offset_on_node = node_len - (off_from_file + read_span)
-
-                # guard
-                if not (-2 <= current_offset_on_node <= node_len + 2):
-                    # out of plausible range → skip this read
-                    continue
-
+                current_decoded_cigar_ops = [op for op in reversed(original_decoded_cigar_ops)] if original_decoded_cigar_ops else []
+                alignment_span_on_node = len(current_read_sequence)
+                current_offset_on_node = node_len - alignment_span_on_node - off_from_file
                 if current_offset_on_node < 0:
                     continue
 
@@ -434,7 +399,7 @@ def process_single_node_for_pileup(task_args):
 
     if not aligned_read_segments:
         return node_id, {}, tensor_files_generated_for_node
-
+    # print(node_id, len(aligned_read_segments))
     if len(aligned_read_segments) > 100000:
         return node_id, None, tensor_files_generated_for_node
 
@@ -681,7 +646,7 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
                 print(f"  ... ({len(variant_data.get('pileup_reads_data', [])) - j} more reads not shown)")
                 break
             bases_str = "".join([INDEX_TO_BASE_FOR_VIEW.get(idx, '?') for idx in read_entry["bases"]])
-            print(f"  Read {j + 1:3d}: {bases_str} (CIGAR:{read_entry['cigar']}, , STRAND:{read_entry.get('strand', '?')})")
+            print(f"  Read {j + 1:3d}: {bases_str} (CIGAR:{read_entry['cigar']})")
 
         print(
             f"  Alt Count: {variant_data.get('alt_allele_count', 'N/A')}, Ref Count: {variant_data.get('ref_allele_count_at_locus', 'N/A')}, Coverage: {variant_data.get('coverage_at_locus', 'N/A')}")
@@ -800,7 +765,7 @@ def main():
                                     args.max_view_reads,
                                     args.view if args.view != -1 else float('inf'))
 
-            if nodes_since_last_report >= 10 or processed == total_tasks:
+            if nodes_since_last_report >= 10000 or processed == total_tasks:
                 elapsed_time = time.time() - batch_start_time
                 rate = nodes_since_last_report / elapsed_time if elapsed_time > 0 else 0.0
                 print(
