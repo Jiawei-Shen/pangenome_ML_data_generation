@@ -74,6 +74,9 @@ def af_float_to_bin(x: float) -> int:
     if x < 0.5:           return 6
     return 7
 
+def ref_span_from_cigar(ops):
+    # reference-consuming ops
+    return sum(L for L, op in ops if op in ('M', '=', 'X', 'D', 'N'))
 
 def calculate_window_start(variant_pos, window_size):
     center_index = window_size // 2
@@ -379,8 +382,10 @@ def process_single_node_for_pileup(task_args):
                 current_read_sequence = reverse_complement(seq)
                 current_quality_values = qual_values[::-1]
                 current_decoded_cigar_ops = [op for op in reversed(original_decoded_cigar_ops)] if original_decoded_cigar_ops else []
-                alignment_span_on_node = len(current_read_sequence)
-                current_offset_on_node = node_len - alignment_span_on_node - off_from_file
+                # alignment_span_on_node = len(current_read_sequence)
+                # current_offset_on_node = node_len - alignment_span_on_node - off_from_file
+                ref_span = ref_span_from_cigar(original_decoded_cigar_ops)
+                current_offset_on_node = node_len - (off_from_file + ref_span)
                 if current_offset_on_node < 0:
                     continue
 
