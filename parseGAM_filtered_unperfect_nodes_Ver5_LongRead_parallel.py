@@ -513,6 +513,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         # Flush when buffered segment count exceeds threshold
         if total_segments >= buffer_segments:
             flush(segment_buffer)
+            segment_buffer = defaultdict(list)
             total_segments = 0
 
         if total_reads >= next_milestone:
