@@ -385,9 +385,9 @@ def process_single_node_for_pileup(task_args):
                 # Adjust span: +I, -D (reference-consuming vs non-consuming edits)
                 for L, op in original_decoded_cigar_ops:
                     if op == 'I':
-                        alignment_span_on_node += L
-                    elif op == 'D':
                         alignment_span_on_node -= L
+                    elif op == 'D':
+                        alignment_span_on_node += L
 
                 current_offset_on_node = node_len - alignment_span_on_node - off_from_file
                 if current_offset_on_node < 0:
