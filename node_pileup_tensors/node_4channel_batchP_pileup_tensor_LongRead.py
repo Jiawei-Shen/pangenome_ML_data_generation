@@ -739,7 +739,7 @@ def main():
     parser.add_argument("candidate_variants_json",
                         help="JSON file containing nodes and their sequences to process.")
     parser.add_argument("--num_workers", type=int, default=os.cpu_count(), help="Number of worker processes")
-    parser.add_argument("--chunksize", type=int, default=512, help="Task chunksize for executor.map()")
+    parser.add_argument("--chunksize", type=int, default=256, help="Task chunksize for executor.map()")
     parser.add_argument("--view", nargs='?', const=-1, default=None, type=int, metavar='N',
                         help="Print pileups for top N variants per node (-1 for all)")
     parser.add_argument("--max_view_reads", type=int, default=20, help="Max reads to show per pileup in view mode")
@@ -836,7 +836,7 @@ def main():
                                     args.max_view_reads,
                                     args.view if args.view != -1 else float('inf'))
 
-            if nodes_since_last_report >= 100 or processed == total_tasks:
+            if nodes_since_last_report >= 100000 or processed == total_tasks:
                 elapsed_time = time.time() - batch_start_time
                 rate = nodes_since_last_report / elapsed_time if elapsed_time > 0 else 0.0
                 print(
