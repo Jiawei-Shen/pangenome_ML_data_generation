@@ -548,9 +548,9 @@ def process_single_node_for_pileup(task_args):
                 # Adjust span: +I, -D (reference-consuming vs non-consuming edits)
                 for L, op in cigar_ops:
                     if op == 'I':
-                        aln_span += L
-                    elif op == 'D':
                         aln_span -= L
+                    elif op == 'D':
+                        aln_span += L
                 cur_off = node_len - aln_span - off_from_file
                 if cur_off < 0:
                     continue
