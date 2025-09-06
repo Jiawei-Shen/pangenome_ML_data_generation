@@ -444,7 +444,15 @@ def process_single_node_for_pileup(task_args):
                 current_read_sequence = reverse_complement(seq)
                 current_quality_values = qual_values[::-1]
                 current_decoded_cigar_ops = [op for op in reversed(original_decoded_cigar_ops)] if original_decoded_cigar_ops else []
+                # alignment_span_on_node = len(current_read_sequence)
                 alignment_span_on_node = len(current_read_sequence)
+
+                # Adjust span: +I, -D (reference-consuming vs non-consuming edits)
+                for L, op in original_decoded_cigar_ops:
+                    if op == 'I':
+                        alignment_span_on_node += L
+                    elif op == 'D':
+                        alignment_span_on_node -= L
                 current_offset_on_node = node_len - alignment_span_on_node - off_from_file
                 if current_offset_on_node < 0:
                     continue
