@@ -307,6 +307,42 @@ def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
     return bases, quals, mapqs, cigar_ops_indices
 
 # ─────────────────────────────────────────────────────────────────────────────
+# NEW: filename canonicalization (only naming; logic unchanged)
+def canonical_variant_key(v_pos, v_type, v_ref, v_alt, node_seq):
+    """
+    Convert current internal variant tuple into a left-anchored, 0-based filename key.
+
+    Current internal representation in this script:
+      - SNP/X: (v_pos = mismatch pos), v_ref = REF base, v_alt = ALT base
+      - INS/I: v_pos = anchor pos (already left of insertion),
+               v_ref = anchor base, v_alt = inserted sequence
+      - DEL/D: v_pos = first deleted base (NOT the anchor),
+               v_ref = deleted sequence, v_alt = "*"
+
+    We output:
+      - X : f"{v_pos}_X_{v_ref}_{v_alt}"
+      - I : f"{anchor}_I_{anchorBase}_{anchorBase+inserted}"
+      - D : f"{anchor}_D_{anchorBase+deleted}_{anchorBase}"
+    """
+    node_len = len(node_seq)
+    if v_type == 'I':
+        anchor_pos = v_pos
+        anchor_base = (v_ref if v_ref and v_ref != "*" else
+                       (node_seq[anchor_pos].upper() if 0 <= anchor_pos < node_len else "N"))
+        inserted = v_alt or ""
+        return f"{anchor_pos}_{v_type}_{anchor_base}_{anchor_base + inserted}"
+
+    if v_type == 'D':
+        # v_pos points to first deleted base; anchor is just before it
+        anchor_pos = max(0, v_pos - 1)
+        anchor_base = node_seq[anchor_pos].upper() if 0 <= anchor_pos < node_len else "N"
+        deleted = v_ref or ""
+        return f"{anchor_pos}_{v_type}_{anchor_base + deleted}_{anchor_base}"
+
+    # SNP / mismatch unchanged
+    return f"{v_pos}_{v_type}_{v_ref}_{v_alt}"
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Worker Process Initialization and Target Function
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -464,7 +500,11 @@ def process_single_node_for_pileup(task_args):
         current_alt_freq = alt_allele_count / locus_coverage if locus_coverage > 0 else 0.0
         mean_alt_bq = sum(alt_allele_base_qualities) / len(alt_allele_base_qualities) if alt_allele_base_qualities else 0.0
 
-        variant_key_string = f"{v_pos}_{v_type}_{v_ref_from_cigar}_{v_alt_from_cigar}"
+        # ── ONLY CHANGE: build filename with 0-based, left-anchored key for indels
+        variant_key_string = canonical_variant_key(
+            v_pos, v_type, v_ref_from_cigar, v_alt_from_cigar, node_sequence
+        )
+
         window_center_pos = v_pos + 1 if v_type == 'I' else v_pos
         window_start_pos = calculate_window_start(window_center_pos, TENSOR_WINDOW_SIZE)
 
