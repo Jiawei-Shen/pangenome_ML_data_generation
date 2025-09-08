@@ -118,7 +118,8 @@ def _process_alignment_to_packed(raw_message):
 
         if node_id not in WANTED_NODES:
             for edit in mapping.edit:
-                read_offset += max(edit.from_length, len(edit.sequence))
+                # read_offset += max(edit.from_length, len(edit.sequence))
+                read_offset += edit.to_length
             continue
 
         node_offset = mapping.position.offset
@@ -142,7 +143,8 @@ def _process_alignment_to_packed(raw_message):
             else:
                 raise ValueError(f"Unexpected edit: from_length={from_len}, sequence_length={edit_len}")
 
-            edit_length = max(from_len, edit_len)
+            # edit_length = max(from_len, edit_len)
+            edit_length = to_len
             sequence_fragment = read_sequence[read_offset: read_offset + edit_length]
             quality_fragment = read_quality[read_offset: read_offset + edit_length]
             sequence_parts.append(sequence_fragment.upper())

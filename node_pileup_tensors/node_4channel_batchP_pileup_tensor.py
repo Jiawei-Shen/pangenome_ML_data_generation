@@ -33,7 +33,7 @@ INDEX_TO_BASE_FOR_VIEW = {
     20: 'A', 30: 'C', 50: 'G', 70: 'T',
     10: 'N',
     90: '*',
-    0: '0'
+    0: ' '
 }
 
 TENSOR_WINDOW_SIZE = 100
@@ -399,7 +399,6 @@ def process_single_node_for_pileup(task_args):
 
     if not aligned_read_segments:
         return node_id, {}, tensor_files_generated_for_node
-    # print(node_id, len(aligned_read_segments))
     if len(aligned_read_segments) > 100000:
         return node_id, None, tensor_files_generated_for_node
 
@@ -646,7 +645,7 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
                 print(f"  ... ({len(variant_data.get('pileup_reads_data', [])) - j} more reads not shown)")
                 break
             bases_str = "".join([INDEX_TO_BASE_FOR_VIEW.get(idx, '?') for idx in read_entry["bases"]])
-            print(f"  Read {j + 1:3d}: {bases_str} (CIGAR:{read_entry['cigar']})")
+            print(f"  Read {j + 1:3d}: {bases_str} (CIGAR:{read_entry['cigar']}, STRAND:{read_entry.get('strand', '?')})")
 
         print(
             f"  Alt Count: {variant_data.get('alt_allele_count', 'N/A')}, Ref Count: {variant_data.get('ref_allele_count_at_locus', 'N/A')}, Coverage: {variant_data.get('coverage_at_locus', 'N/A')}")
