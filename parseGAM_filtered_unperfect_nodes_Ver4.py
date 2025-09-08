@@ -125,6 +125,20 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
         quality_parts = bytearray()
         cigar_parts = []
 
+        # --- NEW: detect leading deletion and shift node_offset left by 1 (0-based anchor) ---
+        # We check before any read bases are consumed for this mapping.
+        _mapping_read_offset_start = read_offset
+        for _ed in mapping.edit:
+            if _ed.from_length > 0 and _ed.to_length == 0 and read_offset == _mapping_read_offset_start:
+                # leading deletion: shift start one base to the left
+                if node_offset > 0:
+                    node_offset -= 1
+                break
+            # If the very first edit consumes read bases, no shift applies.
+            if _ed.to_length > 0:
+                break
+        # --- END NEW ---
+
         for edit in mapping.edit:
             from_len = edit.from_length
             to_len = edit.to_length
