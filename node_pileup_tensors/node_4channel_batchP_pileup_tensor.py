@@ -135,56 +135,48 @@ def decode_cigar_to_int_ops(cigar_string):
 def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_quality_values, read_cigar_ops_decoded,
                                      target_node_pos, node_sequence,
                                      expected_var_type=None, expected_ref_allele_for_indel=None):
-    """
-    Returns (allele_string, mean_bq) where allele_string is one of:
-      - SNPs: single base 'A/C/G/T/N'
-      - Insertions (expected_var_type=='I'): anchor_base + inserted_seq (ALT), or "REF_STATE_FOR_INDEL"
-      - Deletions  (expected_var_type=='D'): anchor_base (ALT), or "REF_STATE_FOR_INDEL"
-      - None if not observable on this read
-    """
     current_node_pos = read_offset_on_node
     current_read_pos = 0
-    node_len = len(node_sequence)
 
     for length, op in read_cigar_ops_decoded:
         if op in ('M', '=', 'X'):
-            # If anchor position is covered by this match/mismatch block, that supports REF state for indels
-            if expected_var_type in ('I', 'D'):
-                if current_node_pos <= target_node_pos < current_node_pos + length:
-                    return "REF_STATE_FOR_INDEL", None
-            # For SNPs, handle normally
-            if expected_var_type not in ('I', 'D'):
-                if current_node_pos <= target_node_pos < current_node_pos + length:
-                    offset_in_block = target_node_pos - current_node_pos
-                    read_idx = current_read_pos + offset_in_block
-                    if read_idx < len(read_sequence):
-                        allele = read_sequence[read_idx].upper()
-                        quality = read_quality_values[read_idx] if read_idx < len(read_quality_values) else 0
-                        return allele, quality
-                    return None, None
+            if current_node_pos <= target_node_pos < current_node_pos + length:
+                offset_in_block = target_node_pos - current_node_pos
+                read_idx = current_read_pos + offset_in_block
+
+                if read_idx < len(read_sequence):
+                    allele = read_sequence[read_idx].upper()
+                    quality = read_quality_values[read_idx] if read_idx < len(read_quality_values) else 0
+
+                    if expected_var_type in ('I', 'D'):
+                        return "REF_STATE_FOR_INDEL", quality
+                    return allele, quality
+                return None, None
             current_node_pos += length
             current_read_pos += length
 
         elif op == 'I':
-            # Insertion occurs *after* anchor. With left-anchored 0-based: anchor == target_node_pos
             if expected_var_type == 'I' and (current_node_pos - 1) == target_node_pos:
-                ins_seq = read_sequence[current_read_pos: current_read_pos + length].upper()
-                if ins_seq:
-                    quals = read_quality_values[current_read_pos: current_read_pos + length]
-                    mean_quality = sum(quals) / len(quals) if quals else 0.0
-                    anchor_base = node_sequence[target_node_pos].upper() if 0 <= target_node_pos < node_len else "N"
-                    return anchor_base + ins_seq, mean_quality
+                if current_read_pos + length <= len(read_sequence):
+                    qualities = read_quality_values[current_read_pos: current_read_pos + length]
+                    mean_quality = sum(qualities) / len(qualities) if qualities else 0.0
+                    return read_sequence[current_read_pos: current_read_pos + length].upper(), mean_quality
                 return None, None
             current_read_pos += length
 
         elif op == 'D':
-            # Deletion starts at current_node_pos and spans 'length' ref bases.
-            # For left-anchored 0-based, the event is at anchor == current_node_pos - 1
-            if expected_var_type == 'D' and (current_node_pos == target_node_pos + 1):
-                anchor_base = node_sequence[target_node_pos].upper() if 0 <= target_node_pos < node_len else "N"
-                # If this read truly carries the deletion, it will have 'D' here → ALT = anchor_base
-                return anchor_base, None
-            # Otherwise advance along the reference
+            if current_node_pos <= target_node_pos < current_node_pos + length:
+                if expected_var_type == 'I':
+                    return "OTHER_FOR_INDEL", None
+                if expected_var_type == 'D':
+                    if 0 <= current_node_pos < len(node_sequence) and current_node_pos + length <= len(node_sequence):
+                        deleted_seq_in_ref_context = node_sequence[current_node_pos: current_node_pos + length]
+                        if deleted_seq_in_ref_context == expected_ref_allele_for_indel:
+                            return "*", None
+                        else:
+                            return "OTHER_FOR_INDEL", None
+                    return "OTHER_FOR_INDEL", None
+                return "*", None
             current_node_pos += length
 
         elif op == 'S':
@@ -192,7 +184,6 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_qu
         elif op == 'N':
             current_node_pos += length
 
-        # Early exit heuristics to keep this fast
         if current_node_pos > target_node_pos + 1 and not (
                 expected_var_type == 'I' and (current_node_pos - 1) <= target_node_pos):
             break
@@ -200,12 +191,6 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_qu
     return None, None
 
 def detect_variants_from_cigar(offset_on_node, cigar_ops_decoded, read_sequence, node_sequence):
-    """
-    Emit candidate variants using 0-based, left-anchored VCF-style tuples:
-      SNP: (pos, 'X', REF_base, ALT_base)
-      INS: (anchor_pos, 'I', REF=anchor_base, ALT=anchor_base+inserted_seq)
-      DEL: (anchor_pos, 'D', REF=anchor_base+deleted_seq, ALT=anchor_base)
-    """
     variants = []
     node_pos, read_pos = offset_on_node, 0
     node_seq_len, read_seq_len = len(node_sequence), len(read_sequence)
@@ -215,42 +200,29 @@ def detect_variants_from_cigar(offset_on_node, cigar_ops_decoded, read_sequence,
             for i in range(length):
                 cur_node_p, cur_read_p = node_pos + i, read_pos + i
                 if cur_node_p < node_seq_len and cur_read_p < read_seq_len:
-                    ref_base = node_sequence[cur_node_p].upper()
-                    alt_base = read_sequence[cur_read_p].upper()
-                    if ref_base != alt_base and op != '=':
-                        variants.append((cur_node_p, 'X', ref_base, alt_base))
+                    node_base = node_sequence[cur_node_p].upper()
+                    read_base = read_sequence[cur_read_p].upper()
+                    if node_base != read_base and op != '=':
+                        variants.append((cur_node_p, 'X', read_base, node_base))
                 else:
                     break
             node_pos += length
             read_pos += length
-
         elif op == 'I':
-            # Left-anchored at the base BEFORE the insertion
-            anchor_pos = node_pos - 1 if node_pos > 0 else 0
-            anchor_base = node_sequence[anchor_pos].upper() if 0 <= anchor_pos < node_seq_len else "N"
             inserted_sequence = read_sequence[read_pos: read_pos + length].upper()
-            if inserted_sequence:
-                ref = anchor_base
-                alt = anchor_base + inserted_sequence
-                variants.append((anchor_pos, 'I', ref, alt))
+            ref_anchor_pos = node_pos - 1 if node_pos > 0 else 0
+            ref_base_at_anchor = node_sequence[ref_anchor_pos].upper() if 0 <= ref_anchor_pos < node_seq_len else "*"
+            variants.append((ref_anchor_pos, 'I', inserted_sequence, ref_base_at_anchor))
             read_pos += length
-
         elif op == 'D':
-            # Deletion removes [node_pos, node_pos+length-1]; anchor is the previous base
-            anchor_pos = node_pos - 1 if node_pos > 0 else 0
-            anchor_base = node_sequence[anchor_pos].upper() if 0 <= anchor_pos < node_seq_len else "N"
-            deleted_seq = node_sequence[node_pos: node_pos + length].upper() if node_pos + length <= node_seq_len else ""
-            if deleted_seq:
-                ref = anchor_base + deleted_seq
-                alt = anchor_base
-                variants.append((anchor_pos, 'D', ref, alt))
+            deleted_sequence_from_ref = node_sequence[node_pos: node_pos + length].upper() if node_pos + length <= node_seq_len else ""
+            if deleted_sequence_from_ref:
+                variants.append((node_pos, 'D', "*", deleted_sequence_from_ref))
             node_pos += length
-
         elif op == 'S':
             read_pos += length
         elif op == 'N':
             node_pos += length
-
     return variants
 
 def get_read_representation_in_window_for_view(segment_cigar_ops, segment_offset_on_node, segment_read_sequence,
@@ -373,7 +345,7 @@ def process_single_node_for_pileup(task_args):
 
     try:
         # Bulk read all records for this node and iter-unpack (fast)
-        worker_dat_file.seek(dat_file_offset + 10)  # keep as in original
+        worker_dat_file.seek(dat_file_offset + 10)  # skip 10-byte header per-record set if any (kept as in original)
         bulk = worker_dat_file.read(n_records * RECORD_SIZE)
         if len(bulk) < n_records * RECORD_SIZE:
             n_records = len(bulk) // RECORD_SIZE
@@ -430,10 +402,9 @@ def process_single_node_for_pileup(task_args):
     if len(aligned_read_segments) > 100000:
         return node_id, None, tensor_files_generated_for_node
 
-    # Build candidate variants from CIGAR
     candidate_variants = defaultdict(int)
     for seg in aligned_read_segments:
-        for v_pos, v_type, v_ref, v_alt in detect_variants_from_cigar(
+        for v_pos, v_type, v_alt, v_ref in detect_variants_from_cigar(
                 seg["offset_on_node"], seg["cigar_ops"], seg["read_sequence"], node_sequence):
             candidate_variants[(v_pos, v_type, v_ref, v_alt)] += 1
 
@@ -449,16 +420,19 @@ def process_single_node_for_pileup(task_args):
         alt_allele_count = ref_allele_count = other_allele_count = locus_coverage = 0
         alt_allele_base_qualities = []
 
-        # With left-anchored representation, use REF/ALT strings directly
         expected_ref_for_af = v_ref_from_cigar
         expected_alt_for_af = v_alt_from_cigar
-
-        # Provide indel context (anchor base is at v_pos)
         ref_allele_for_indel_context = None
-        if v_type in ('I', 'D'):
-            ref_allele_for_indel_context = expected_ref_for_af  # not strictly needed now
 
-        # Tally support
+        if v_type == 'D':
+            expected_alt_for_af = "*"
+            if 0 <= v_pos < node_len:
+                expected_ref_for_af = node_sequence[v_pos]
+            ref_allele_for_indel_context = v_ref_from_cigar
+        elif v_type == 'I':
+            expected_ref_for_af = node_sequence[v_pos] if 0 <= v_pos < node_len else "*"
+            ref_allele_for_indel_context = expected_ref_for_af
+
         for seg in aligned_read_segments:
             allele_observed, bq = get_allele_from_read_at_node_pos(
                 seg["offset_on_node"], seg["read_sequence"], seg["processed_quality_values"], seg["cigar_ops"],
@@ -470,7 +444,8 @@ def process_single_node_for_pileup(task_args):
                     alt_allele_count += 1
                     if bq is not None:
                         alt_allele_base_qualities.append(bq)
-                elif (allele_observed == expected_ref_for_af) or (allele_observed == "REF_STATE_FOR_INDEL"):
+                elif allele_observed == expected_ref_for_af or (
+                        v_type in ('I', 'D') and allele_observed == "REF_STATE_FOR_INDEL"):
                     ref_allele_count += 1
                 else:
                     other_allele_count += 1
@@ -478,7 +453,6 @@ def process_single_node_for_pileup(task_args):
         if alt_allele_count < min_variants_threshold:
             continue
 
-        # SNP-specific AF/BQ gate
         if v_type == 'X':
             current_alt_freq_tmp = alt_allele_count / locus_coverage if locus_coverage > 0 else 0.0
             if current_alt_freq_tmp < min_af_threshold:
@@ -490,11 +464,8 @@ def process_single_node_for_pileup(task_args):
         current_alt_freq = alt_allele_count / locus_coverage if locus_coverage > 0 else 0.0
         mean_alt_bq = sum(alt_allele_base_qualities) / len(alt_allele_base_qualities) if alt_allele_base_qualities else 0.0
 
-        # ── Filename key (now 0-based, left-anchored; no '*')
         variant_key_string = f"{v_pos}_{v_type}_{v_ref_from_cigar}_{v_alt_from_cigar}"
-
-        # Center window at v_pos for all variant types (no +1 for insertions)
-        window_center_pos = v_pos
+        window_center_pos = v_pos + 1 if v_type == 'I' else v_pos
         window_start_pos = calculate_window_start(window_center_pos, TENSOR_WINDOW_SIZE)
 
         # View data (gated)
@@ -534,6 +505,7 @@ def process_single_node_for_pileup(task_args):
             for i, node_pos_in_window in enumerate(range(window_start_pos, window_start_pos + TENSOR_WINDOW_SIZE)):
                 if 0 <= node_pos_in_window < node_len:
                     v = genomead_af_list[node_pos_in_window]
+                    # Accept either digits-per-base string ('0'..'7') or float AFs
                     if isinstance(v, str):
                         if len(v) == 1 and '0' <= v <= '7':
                             b = ord(v) - 48
@@ -546,6 +518,7 @@ def process_single_node_for_pileup(task_args):
                         b = af_float_to_bin(v)
                     genomead_af_row[i] = int(b)
 
+        # Pre-allocate numpy arrays for speed (drop Torch)
         H = 1 + TENSOR_MAX_READ_ROWS
         W = TENSOR_WINDOW_SIZE
         ch1 = np.full((H, W), PADDING_BASE_INDEX, dtype=np.int8)
@@ -648,7 +621,7 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
         variant_data = node_data_for_display_view[variant_key]
         v_pos, v_type = int(variant_key.split('_')[0]), variant_key.split('_')[1]
 
-        window_center_pos = v_pos  # left-anchored center
+        window_center_pos = v_pos + 1 if v_type == 'I' else v_pos
         window_start_pos = calculate_window_start(window_center_pos, TENSOR_WINDOW_SIZE)
 
         print(f"\n--- Variant: {variant_key} ---")
@@ -791,7 +764,7 @@ def main():
                                     args.max_view_reads,
                                     args.view if args.view != -1 else float('inf'))
 
-            if nodes_since_last_report >= 100000 or processed == total_tasks:
+            if nodes_since_last_report >= 10000 or processed == total_tasks:
                 elapsed_time = time.time() - batch_start_time
                 rate = nodes_since_last_report / elapsed_time if elapsed_time > 0 else 0.0
                 print(
