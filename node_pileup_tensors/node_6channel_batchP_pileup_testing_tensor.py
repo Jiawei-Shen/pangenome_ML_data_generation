@@ -557,7 +557,6 @@ def process_single_node_for_pileup(task_args):
     if not aligned_read_segments:
         return node_id, {}, tensor_files_generated_for_node
 
-    print(node_id, node_len , len(aligned_read_segments))
     # guard pathological nodes
     if len(aligned_read_segments) > 10000:
         return node_id, None, tensor_files_generated_for_node
