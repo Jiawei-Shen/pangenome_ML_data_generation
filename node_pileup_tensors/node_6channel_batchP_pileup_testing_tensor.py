@@ -93,6 +93,42 @@ def decode_cigar_to_int_ops(cigar_string: str) -> List[Tuple[int, str]]:
         return []
 
 # ─────────────────────────────────────────────────────────────────────────────
+# NEW: filename canonicalization (only naming; logic unchanged)
+def canonical_variant_key(v_pos, v_type, v_ref, v_alt, node_seq):
+    """
+    Convert current internal variant tuple into a left-anchored, 0-based filename key.
+
+    Internal representation here:
+      - SNP/X: v_pos = mismatch pos, v_ref = REF base, v_alt = ALT base
+      - INS/I: v_pos = anchor pos (already left of insertion),
+               v_ref = anchor base (or '*'), v_alt = inserted sequence
+      - DEL/D: v_pos = first deleted base (NOT the anchor),
+               v_ref = deleted sequence, v_alt = "*"
+
+    Output:
+      - X : f"{v_pos}_X_{v_ref}_{v_alt}"
+      - I : f"{anchor}_I_{anchorBase}_{anchorBase+inserted}"
+      - D : f"{anchor}_D_{anchorBase+deleted}_{anchorBase}"
+    """
+    node_len = len(node_seq)
+
+    if v_type == 'I':
+        anchor_pos = v_pos
+        anchor_base = (v_ref if v_ref and v_ref != "*"
+                       else (node_seq[anchor_pos].upper() if 0 <= anchor_pos < node_len else "N"))
+        inserted = v_alt or ""
+        return f"{anchor_pos}_{v_type}_{anchor_base}_{anchor_base + inserted}"
+
+    if v_type == 'D':
+        anchor_pos = max(0, v_pos - 1)  # first deleted base is at v_pos; anchor is one base left
+        anchor_base = node_seq[anchor_pos].upper() if 0 <= anchor_pos < node_len else "N"
+        deleted = v_ref or ""
+        return f"{anchor_pos}_{v_type}_{anchor_base + deleted}_{anchor_base}"
+
+    # SNP / mismatch unchanged
+    return f"{v_pos}_{v_type}_{v_ref}_{v_alt}"
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Stream the IDX in waves (no giant dict)
 
 def iter_idx_waves(idx_path: str, wave_size: int) -> Iterable[List[Tuple[int, int, int]]]:
@@ -521,6 +557,7 @@ def process_single_node_for_pileup(task_args):
     if not aligned_read_segments:
         return node_id, {}, tensor_files_generated_for_node
 
+    print(node_id, node_len , len(aligned_read_segments))
     # guard pathological nodes
     if len(aligned_read_segments) > 10000:
         return node_id, None, tensor_files_generated_for_node
@@ -585,7 +622,11 @@ def process_single_node_for_pileup(task_args):
         current_alt_freq = alt_allele_count / locus_coverage if locus_coverage > 0 else 0.0
         mean_alt_bq = sum(alt_allele_bq) / len(alt_allele_bq) if alt_allele_bq else 0.0
 
-        variant_key_string = f"{v_pos}_{v_type}_{v_ref_from_cigar}_{v_alt_from_cigar}"
+        # ── ONLY CHANGE: use canonical (left-anchored, 0-based) key for filenames
+        variant_key_string = canonical_variant_key(
+            v_pos, v_type, v_ref_from_cigar, v_alt_from_cigar, node_sequence
+        )
+
         window_center_pos = v_pos + 1 if v_type == 'I' else v_pos
         window_start_pos = calculate_window_start(window_center_pos, TENSOR_WINDOW_SIZE)
 
@@ -788,7 +829,7 @@ def main():
                                         args.max_view_reads,
                                         args.view if args.view != -1 else float('inf'))
 
-                if batch_nodes >= 1000000 or processed == len(wave_tasks):
+                if batch_nodes >= 100000 or processed == len(wave_tasks):
                     dt = time.time() - t_batch
                     rate = batch_nodes / dt if dt > 0 else 0.0
                     log(f"[Wave {wave_num}] processed {processed:,}/{len(wave_tasks):,}  "
