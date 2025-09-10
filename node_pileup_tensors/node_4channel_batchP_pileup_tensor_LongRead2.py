@@ -389,6 +389,11 @@ def process_single_node_for_pileup(task_args):
     node_len = len(node_sequence)
     aligned_read_segments = []
 
+    # right after unpacking block header in process_single_node_for_pileup
+    if n_records > 50000 or node_len > 2000:
+        print("pathological nodes!")
+        return node_id, {}, 0  # skip pathological nodes quickly
+
     try:
         # ── NEW FORMAT READ ───────────────────────────────────────────────────
         # Read the per-block header at dat_file_offset to recover node_length
@@ -471,8 +476,6 @@ def process_single_node_for_pileup(task_args):
 
     if not aligned_read_segments:
         return node_id, {}, tensor_files_generated_for_node
-    if len(aligned_read_segments) > 100000:
-        return node_id, None, tensor_files_generated_for_node
 
     candidate_variants = defaultdict(int)
     for seg in aligned_read_segments:
@@ -756,7 +759,7 @@ def main():
     os.makedirs(args.output, exist_ok=True)
 
     # Gate view-building in workers
-    need_view = args.view is not None
+    need_view = (args.view is not None and args.view != 0)
 
     # Load candidate nodes (sequence + AF) into read-only globals
     node_sequences = {}
