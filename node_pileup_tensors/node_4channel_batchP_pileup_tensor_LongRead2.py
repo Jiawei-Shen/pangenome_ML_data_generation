@@ -390,7 +390,7 @@ def process_single_node_for_pileup(task_args):
     aligned_read_segments = []
 
     # right after unpacking block header in process_single_node_for_pileup
-    if n_records > node_len * 5:
+    if n_records > node_len * 50 or n_records > 3000:
         return node_id, {}, 0  # skip pathological nodes quickly
 
     try:
@@ -482,10 +482,24 @@ def process_single_node_for_pileup(task_args):
                 seg["offset_on_node"], seg["cigar_ops"], seg["read_sequence"], node_sequence):
             candidate_variants[(v_pos, v_type, v_ref, v_alt)] += 1
 
+    # ── NEW: cap at most 20 candidates per node (by support, then by position) ──
+    MAX_VARIANTS_PER_NODE = node_len // 10
+    if len(candidate_variants) > MAX_VARIANTS_PER_NODE:
+        # sort by descending support count, then by genomic position for stability
+        sorted_items = sorted(candidate_variants.items(),
+                              key=lambda kv: (-kv[1], kv[0][0]))
+        selected_keys = set(k for k, _ in sorted_items[:MAX_VARIANTS_PER_NODE])
+    else:
+        selected_keys = set(candidate_variants.keys())
+
     view_oriented_variant_data = {} if worker_need_view else None
     variant_headers_for_summary = []
 
     for (v_pos, v_type, v_ref_from_cigar, v_alt_from_cigar), _ in candidate_variants.items():
+        # Skip any candidates beyond the cap
+        if (v_pos, v_type, v_ref_from_cigar, v_alt_from_cigar) not in selected_keys:
+            continue
+
         if variant_type_to_process == 'snp' and v_type != 'X':
             continue
         if variant_type_to_process == 'indel' and (v_type not in ('I', 'D')):
@@ -670,6 +684,7 @@ def process_single_node_for_pileup(task_args):
                        "variants_passing_af_filter": variant_headers_for_summary}, f, indent=2)
 
     return node_id, (view_oriented_variant_data or {}), tensor_files_generated_for_node
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Pileup Viewing Function
