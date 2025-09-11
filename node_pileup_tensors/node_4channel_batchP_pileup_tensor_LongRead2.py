@@ -390,8 +390,6 @@ def process_single_node_for_pileup(task_args):
     aligned_read_segments = []
 
     # right after unpacking block header in process_single_node_for_pileup
-    if n_records > node_len * 5:
-        return node_id, {}, 0  # skip pathological nodes quickly
 
     try:
         # ── NEW FORMAT READ ───────────────────────────────────────────────────
