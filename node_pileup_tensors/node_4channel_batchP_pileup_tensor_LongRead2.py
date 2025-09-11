@@ -391,7 +391,6 @@ def process_single_node_for_pileup(task_args):
 
     # right after unpacking block header in process_single_node_for_pileup
     if n_records > node_len * 5:
-        print("pathological nodes!")
         return node_id, {}, 0  # skip pathological nodes quickly
 
     try:
