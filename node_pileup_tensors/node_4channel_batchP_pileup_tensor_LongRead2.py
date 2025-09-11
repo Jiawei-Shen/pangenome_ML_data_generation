@@ -389,8 +389,6 @@ def process_single_node_for_pileup(task_args):
     node_len = len(node_sequence)
     aligned_read_segments = []
 
-    # right after unpacking block header in process_single_node_for_pileup
-
     try:
         # ── NEW FORMAT READ ───────────────────────────────────────────────────
         # Read the per-block header at dat_file_offset to recover node_length
@@ -473,16 +471,14 @@ def process_single_node_for_pileup(task_args):
 
     if not aligned_read_segments:
         return node_id, {}, tensor_files_generated_for_node
+    if len(aligned_read_segments) > 100000:
+        return node_id, None, tensor_files_generated_for_node
 
     candidate_variants = defaultdict(int)
     for seg in aligned_read_segments:
         for v_pos, v_type, v_alt, v_ref in detect_variants_from_cigar(
                 seg["offset_on_node"], seg["cigar_ops"], seg["read_sequence"], node_sequence):
             candidate_variants[(v_pos, v_type, v_ref, v_alt)] += 1
-
-    MAX_VARIANTS_PER_NODE = node_len // 2 + 5
-    if len(candidate_variants) > MAX_VARIANTS_PER_NODE:
-        return node_id, {}, tensor_files_generated_for_node
 
     view_oriented_variant_data = {} if worker_need_view else None
     variant_headers_for_summary = []
