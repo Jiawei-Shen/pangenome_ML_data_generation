@@ -389,11 +389,8 @@ def process_single_node_for_pileup(task_args):
     node_len = len(node_sequence)
     aligned_read_segments = []
 
-    if n_records > 500 or node_len > 1100:
-        print(f"pathological nodes {node_id}, {n_records}, {node_len}!")
-
     # right after unpacking block header in process_single_node_for_pileup
-    if n_records > 50000 or node_len > 2000:
+    if n_records > node_len * 5:
         print("pathological nodes!")
         return node_id, {}, 0  # skip pathological nodes quickly
 
