@@ -373,8 +373,8 @@ def process_node_serially(dat_file_path, base_output_dir,
                         other_c += 1
 
         alt_freq = alt_c / locus_cov if locus_cov > 0 else 0.0
+        print(alt_freq, min_af_threshold)
         if alt_freq < min_af_threshold:
-            print(alt_freq, min_af_threshold)
             continue
 
         key_str = f"{v_pos}_{v_type}_{v_ref}_{v_alt}"
