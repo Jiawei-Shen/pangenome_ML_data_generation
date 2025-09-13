@@ -396,7 +396,7 @@ def process_node_serially(dat_file_path, base_output_dir,
         view_oriented_variant_data[key_str] = {
             "pileup_reads_data": view_reads_data, "alt_allele_count": alt_c,
             "ref_allele_count_at_locus": ref_c, "other_allele_count_at_locus": other_c,
-            "coverage_at_locus": locus_cov, "alt_allele_frequency": round(alt_freq, 4)}
+            "coverage_at_locus": locus_cov, "alt_allele_frequency": alt_freq}
 
         ch1_bases, ch2_quals, ch3_mismatches = [], [], []
         ref_bases_tensor = [PADDING_BASE_INDEX] * TENSOR_WINDOW_SIZE
