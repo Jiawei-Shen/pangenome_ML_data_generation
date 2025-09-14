@@ -119,7 +119,7 @@ def canonical_variant_key(v_pos, v_type, v_ref, v_alt, node_seq):
         anchor_base = (v_ref if v_ref and v_ref != "*" else
                        (node_seq[anchor_pos].upper() if 0 <= anchor_pos < node_len else "N"))
         inserted = v_alt or ""
-        return f"{anchor_pos}_{v_type}_{anchor_base}_{inserted}"
+        return f"{anchor_pos}_{v_type}_{anchor_base}_{anchor_base + inserted}"
 
     if v_type == 'D':
         # v_pos points to first deleted base; anchor is just before it
