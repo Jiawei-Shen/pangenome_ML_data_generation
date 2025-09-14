@@ -196,23 +196,50 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_ci
                                      expected_var_type=None, expected_ref_allele_for_indel=None):
     current_node_pos = read_offset_on_node
     current_read_pos = 0
+
+    # Track whether we've covered the insertion anchor in a match;
+    # if no 'I' follows at this anchor, we’ll return REF at the end.
+    saw_insertion_anchor = False
+
     for length, op in read_cigar_ops_decoded:
         if op in ('M', '=', 'X'):
             if current_node_pos <= target_node_pos < current_node_pos + length:
-                if expected_var_type in ('I', 'D'): return "REF_STATE_FOR_INDEL"
                 offset_in_block = target_node_pos - current_node_pos
-                if current_read_pos + offset_in_block < len(read_sequence):
-                    return read_sequence[current_read_pos + offset_in_block].upper()
-                return None
+                read_idx = current_read_pos + offset_in_block
+
+                if read_idx < len(read_sequence):
+                    allele = read_sequence[read_idx].upper()
+
+                    if expected_var_type == 'D':
+                        # Deletion: covering base ⇒ REF (no deletion spanning it)
+                        return "REF_STATE_FOR_INDEL"
+
+                    if expected_var_type == 'I':
+                        # Insertion: mark anchor seen and KEEP SCANNING for a following 'I'
+                        saw_insertion_anchor = True
+                        # do not return yet
+                    else:
+                        # SNP
+                        return allele
+                else:
+                    # Out of read range; still treat as anchor seen for insertions
+                    if expected_var_type == 'I':
+                        saw_insertion_anchor = True
+                    else:
+                        return None
             current_node_pos += length
             current_read_pos += length
+
         elif op == 'I':
+            # Insertion occurs BETWEEN bases; its anchor is (current_node_pos - 1)
             if expected_var_type == 'I' and (current_node_pos - 1) == target_node_pos:
                 return read_sequence[current_read_pos: current_read_pos + length].upper()
-            current_read_pos += length
+            current_read_pos += length  # ref doesn't advance
+
         elif op == 'D':
             if current_node_pos <= target_node_pos < current_node_pos + length:
-                if expected_var_type == 'I': return "OTHER_FOR_INDEL"
+                if expected_var_type == 'I':
+                    return "OTHER_FOR_INDEL"
                 if expected_var_type == 'D':
                     ref_deleted_segment = node_sequence[current_node_pos: current_node_pos + length]
                     if ref_deleted_segment == expected_ref_allele_for_indel:
@@ -221,14 +248,23 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_ci
                         return "OTHER_FOR_INDEL"
                 return "*"
             current_node_pos += length
+
         elif op == 'S':
             current_read_pos += length
         elif op == 'N':
             current_node_pos += length
+
+        # Preserve original early-stop condition
         if current_node_pos > target_node_pos + 1 and op in ('M', '=', 'X', 'D', 'N'):
             if not (expected_var_type == 'I' and (current_node_pos - 1) <= target_node_pos):
                 break
+
+    # If we saw the insertion anchor but never encountered an 'I' at that anchor → REF
+    if expected_var_type == 'I' and saw_insertion_anchor:
+        return "REF_STATE_FOR_INDEL"
+
     return None
+
 
 def detect_variants_from_cigar(offset_on_node, cigar_ops_decoded, read_sequence, node_sequence):
     variants = []
