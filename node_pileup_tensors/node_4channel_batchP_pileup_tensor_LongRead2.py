@@ -78,7 +78,7 @@ GLOBAL_NODE_AF = {}
 # Helper Functions
 # ─────────────────────────────────────────────────────────────────────────────
 def _fmt_id_list(ids, max_show=200):
-    """Pretty-print a list of IDs without flooding logs."""
+    """Pretty-print IDs without flooding logs."""
     ids = list(ids)
     n = len(ids)
     if n == 0:
@@ -89,6 +89,7 @@ def _fmt_id_list(ids, max_show=200):
     head = ", ".join(map(str, ids[:half]))
     tail = ", ".join(map(str, ids[-half:]))
     return f"{head}, ... , {tail}  (showing {max_show} of {n})"
+
 
 
 def af_float_to_bin(x: float) -> int:
@@ -839,6 +840,9 @@ def main():
     if not full_idx_data:
         sys.exit("Failed to load index data.")
 
+    _idx_ids_sorted = sorted(full_idx_data.keys())
+    print(f"[IDX] total={len(_idx_ids_sorted)} :: {_fmt_id_list(_idx_ids_sorted)}")
+
     # Prepare tiny tasks: do NOT include sequences/AF (workers read from globals)
     tasks = []
     missing = 0
@@ -857,12 +861,16 @@ def main():
     # Sort by DAT offset → streaming I/O instead of random seeks
     tasks.sort(key=lambda t: t[1])
 
-    # IDs present in IDX but not submitted (e.g., not in JSON or filtered out)
-    _idx_ids = set(full_idx_data.keys())
-    _submitted_ids = {t[0] for t in tasks}
-    _missing_ids_sorted = sorted(_idx_ids - _submitted_ids)
-    print(f"[MISSING] Node IDs in IDX but not submitted (total {len(_missing_ids_sorted)}): "
-          f"{_fmt_id_list(_missing_ids_sorted)}")
+    # Submitted IDs (order here reflects DAT offset order); also report unique set
+    _submitted_ids_list = [t[0] for t in tasks]
+    _submitted_ids_unique_sorted = sorted(set(_submitted_ids_list))
+    print(f"[SUBMIT] total={len(_submitted_ids_list)} unique={len(_submitted_ids_unique_sorted)} :: "
+          f"{_fmt_id_list(_submitted_ids_unique_sorted)}")
+
+    # IDs present in IDX but not submitted
+    _idx_id_set = set(full_idx_data.keys())
+    _missing_ids_sorted = sorted(_idx_id_set - set(_submitted_ids_list))
+    print(f"[NOT-SUBMIT] total={len(_missing_ids_sorted)} :: {_fmt_id_list(_missing_ids_sorted)}")
 
     # Publish read-only globals for workers (copy-on-write under fork)
     global GLOBAL_NODE_SEQS, GLOBAL_NODE_AF
