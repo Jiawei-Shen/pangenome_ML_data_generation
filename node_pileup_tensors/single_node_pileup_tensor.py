@@ -13,21 +13,36 @@ import torch  # Still used for tensor creation before converting to NumPy
 import os
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Dynamic per-node record struct (new .dat format)
-def make_record_struct(node_length: int) -> struct.Struct:
+# Dynamic per-node record struct (support NEW + OLD .dat formats)
+
+def make_record_struct_old(node_length: int) -> struct.Struct:
     """
-    New-format per-read record (variable by node_length):
+    OLD format per-read record (variable by node_length):
       <h {L}s {L}s {L}s h c>
         - i16 offset
-        - seq[L]      (null-padded ASCII)
-        - bq[L]       (raw quality bytes, 0..~60; null-padded)
-        - cigar[L]    (null-padded ASCII)
+        - seq[L]
+        - bq[L]
+        - cigar[L]
         - i16 mapq
-        - char strand ('+' / '-')
+        - char strand
     """
     return struct.Struct(f"<h{node_length}s{node_length}s{node_length}shc")
 
-# .dat block header (try padded 16B first, then 14B)
+def make_record_struct_latest(max_read_len: int, max_cigar_len: int) -> struct.Struct:
+    """
+    LATEST format per-read record (variable by per-block maxima):
+      <h {R}s {R}s {C}s h c>
+        - i16 offset
+        - seq[R]
+        - bq[R]
+        - cigar[C]
+        - i16 mapq
+        - char strand
+    """
+    return struct.Struct(f"<h{max_read_len}s{max_read_len}s{max_cigar_len}shc")
+
+# .dat block headers
+BLOCK_HDR_PACK_LATEST = struct.Struct("<I I H I I")   # 18 bytes: node_id, n_records, flags, max_read_len, max_cigar_len
 BLOCK_HDR_PACK_PADDED = struct.Struct("<I I H 2x I")  # 16 bytes: node_id, n_records, flags, pad, node_length
 BLOCK_HDR_PACK_14B    = struct.Struct("<I I H I")     # 14 bytes: node_id, n_records, flags, node_length
 
@@ -50,29 +65,45 @@ def reverse_complement(sequence):
     return sequence.translate(complement_map)[::-1]
 
 def _read_block_header(dat_file, block_start):
-    """Read .dat block header at block_start; returns (node_id, n_records, flags, node_length, header_size_bytes)."""
-    # Try padded 16B first
+    """
+    Read .dat block header at block_start; returns:
+      (node_id, n_records, flags, lengths, header_size_bytes, fmt)
+    where:
+      - fmt == 'latest' and lengths == (R, C)  for 18B header
+      - fmt == 'old'    and lengths == L       for 16B/14B headers
+    """
+    # Try latest 18B (R,C)
+    dat_file.seek(block_start, os.SEEK_SET)
+    hdr = dat_file.read(BLOCK_HDR_PACK_LATEST.size)
+    if len(hdr) == BLOCK_HDR_PACK_LATEST.size:
+        nid, nrec, flags, R, C = BLOCK_HDR_PACK_LATEST.unpack(hdr)
+        if (1 <= R <= 1_000_000) and (1 <= C <= 1_000_000) and (0 <= nrec < 10_000_000):
+            return nid, nrec, flags, (R, C), BLOCK_HDR_PACK_LATEST.size, 'latest'
+
+    # Try old 16B padded (L)
     dat_file.seek(block_start, os.SEEK_SET)
     hdr = dat_file.read(BLOCK_HDR_PACK_PADDED.size)
     if len(hdr) == BLOCK_HDR_PACK_PADDED.size:
-        nid, nrec, flags, node_len = BLOCK_HDR_PACK_PADDED.unpack(hdr)
-        if 1 <= node_len <= 1_000_000 and 0 <= nrec < 10_000_000:
-            return nid, nrec, flags, node_len, BLOCK_HDR_PACK_PADDED.size
-    # Fallback: 14B
+        nid, nrec, flags, L = BLOCK_HDR_PACK_PADDED.unpack(hdr)
+        if (1 <= L <= 1_000_000) and (0 <= nrec < 10_000_000):
+            return nid, nrec, flags, L, BLOCK_HDR_PACK_PADDED.size, 'old'
+
+    # Fallback: old 14B (L)
     dat_file.seek(block_start, os.SEEK_SET)
     hdr = dat_file.read(BLOCK_HDR_PACK_14B.size)
     if len(hdr) != BLOCK_HDR_PACK_14B.size:
         raise RuntimeError(f"Cannot read block header at offset {block_start}")
-    nid, nrec, flags, node_len = BLOCK_HDR_PACK_14B.unpack(hdr)
-    if not (1 <= node_len <= 1_000_000 and 0 <= nrec < 10_000_000):
-        raise RuntimeError(f"Suspicious block header at {block_start}: node_len={node_len}, nrec={nrec}")
-    return nid, nrec, flags, node_len, BLOCK_HDR_PACK_14B.size
+    nid, nrec, flags, L = BLOCK_HDR_PACK_14B.unpack(hdr)
+    if not (1 <= L <= 1_000_000 and 0 <= nrec < 10_000_000):
+        raise RuntimeError(f"Suspicious block header at {block_start}: node_len={L}, nrec={nrec}")
+    return nid, nrec, flags, L, BLOCK_HDR_PACK_14B.size, 'old'
 
 def load_full_idx_data(idx_path):
     """
     Supports:
-      • New fixed-size entry: 26B  <I Q I I H I>
-      • Older fixed-size entry: 22B <I Q I I H>
+      • Latest fixed-size entry: 30B  <I Q I I H I I>
+      • New fixed-size entry:    26B  <I Q I I H I>
+      • Older fixed-size entry:  22B  <I Q I I H>
       • Legacy variable-size entries with metadata_len (fallback)
     Returns: dict { node_id: (offset, n_records) }
     """
@@ -97,7 +128,9 @@ def load_full_idx_data(idx_path):
             # Choose strategy by per-entry size if possible
             if remaining % num_nodes_in_idx == 0:
                 per = remaining // num_nodes_in_idx
-                if per == 26:
+                if per == 30:
+                    strategy = "fixed30"
+                elif per == 26:
                     strategy = "fixed26"
                 elif per == 22:
                     strategy = "fixed22"
@@ -109,7 +142,12 @@ def load_full_idx_data(idx_path):
             print(f"  Detected index entry layout: {strategy}")
 
             for i in range(num_nodes_in_idx):
-                if strategy == "fixed26":
+                if strategy == "fixed30":
+                    rec = f.read(30)
+                    if len(rec) != 30:
+                        sys.stderr.write(f"❌ Error: Truncated 30B index entry at {i}.\n"); break
+                    node_id, offset, _bsize, nrec, _flags, _R, _C = struct.unpack("<I Q I I H I I", rec)
+                elif strategy == "fixed26":
                     rec = f.read(26)
                     if len(rec) != 26:
                         sys.stderr.write(f"❌ Error: Truncated 26B index entry at {i}.\n"); break
@@ -392,10 +430,17 @@ def process_node_serially(dat_file_path, base_output_dir,
     aligned_read_segments = []
     try:
         with open(dat_file_path, 'rb') as dat_f:
-            # Read block header at offset to recover node_length (and authoritative n_records)
-            nid2, n_records, _flags, node_length, hdr_size = _read_block_header(dat_f, dat_file_offset)
+            # Read block header at offset to recover lengths (and authoritative n_records)
+            nid2, n_records, _flags, lengths, hdr_size, fmt = _read_block_header(dat_f, dat_file_offset)
+
             # Build dynamic record struct
-            rec_struct = make_record_struct(int(node_length))
+            if fmt == 'latest':
+                R, C = lengths
+                rec_struct = make_record_struct_latest(int(R), int(C))
+            else:
+                L = int(lengths)
+                rec_struct = make_record_struct_old(L)
+
             rec_size = rec_struct.size
 
             # Seek to records start
@@ -431,11 +476,11 @@ def process_node_serially(dat_file_path, base_output_dir,
                     # alignment_span_on_node = len(cur_seq)
                     alignment_span_on_node = len(cur_seq)
                     # Adjust span: +I, -D (reference-consuming vs non-consuming edits)
-                    for L, op in cigar_ops_orig:
-                        if op == 'I':
-                            alignment_span_on_node -= L
-                        elif op == 'D':
-                            alignment_span_on_node += L
+                    for Lx, opx in cigar_ops_orig:
+                        if opx == 'I':
+                            alignment_span_on_node -= Lx
+                        elif opx == 'D':
+                            alignment_span_on_node += Lx
                     cur_offset = node_len - alignment_span_on_node - off
                     if cur_offset < 0: continue
 
@@ -509,9 +554,7 @@ def process_node_serially(dat_file_path, base_output_dir,
         if alt_freq < min_af_threshold:
             continue
 
-        # Filename key:
-        #  • SNP/Insertion unchanged: {pos}_{type}_{ref}_{alt}
-        #  • Deletion star-less 0-based: {pos}_D_{anchor+deleted}_{anchor}
+        # Filename key
         if v_type == 'D':
             deleted_seq = v_alt if (v_alt and v_alt != '*') else v_ref  # pick the non-* token
             anchor_base = node_sequence[v_pos] if 0 <= v_pos < node_len else 'N'
@@ -660,7 +703,7 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
 # Main
 def main():
     parser = argparse.ArgumentParser(
-        description="Serial variant tensor generator (supports new .dat/.idx formats; select SNP/INDEL).",
+        description="Serial variant tensor generator (supports new and old .dat/.idx formats; select SNP/INDEL).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("dat", help=".dat file path")
     parser.add_argument("idx", help=".idx file path")
