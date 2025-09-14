@@ -24,12 +24,12 @@ class Segment:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# File layout (no node_length; per-block maxima instead)
+# File layout (STRICT latest format only: no node_length; per-block maxima)
 
 # Global header: magic + version block
 GLOBAL_MAGIC = b"MYFMT\x01"                              # 6 bytes: "MYFMT" + 0x01
 GLOBAL_VER_PACK = struct.Struct("<BBI16s")               # major, minor, block_count, reserved[16]
-GLOBAL_MAJOR, GLOBAL_MINOR = 0, 5                        # minor bumped: no node_length, per-block maxima
+GLOBAL_MAJOR_EXPECTED, GLOBAL_MINOR_EXPECTED = 0, 5      # STRICT: require version 0.5
 GLOBAL_HEADER_SIZE = len(GLOBAL_MAGIC) + GLOBAL_VER_PACK.size  # 6 + 22 = 28
 
 # Per-node block header (NO node_length)
@@ -49,6 +49,8 @@ def make_record_struct(max_read_len: int, max_cigar_len: int) -> struct.Struct:
       - i16 rq (MAPQ)
       - char strand ('+' / '-')
     """
+    if max_read_len <= 0 or max_cigar_len <= 0:
+        raise ValueError("max_read_len and max_cigar_len must be > 0 for latest format")
     return struct.Struct(f"<h{max_read_len}s{max_read_len}s{max_cigar_len}shc")
 
 def record_size(max_read_len: int, max_cigar_len: int) -> int:
@@ -205,6 +207,29 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# STRICT header validation helpers (latest only)
+
+def _validate_latest_dat_header(dat_path):
+    with open(dat_path, "rb") as df:
+        magic = df.read(len(GLOBAL_MAGIC))
+        if magic != GLOBAL_MAGIC:
+            raise RuntimeError(f"Invalid .dat magic (got {magic!r}, want {GLOBAL_MAGIC!r})")
+        major, minor, _count, _ = GLOBAL_VER_PACK.unpack(df.read(GLOBAL_VER_PACK.size))
+        if (major, minor) != (GLOBAL_MAJOR_EXPECTED, GLOBAL_MINOR_EXPECTED):
+            raise RuntimeError(f"Unsupported .dat version {major}.{minor}; require {GLOBAL_MAJOR_EXPECTED}.{GLOBAL_MINOR_EXPECTED}")
+
+def _validate_latest_idx_header_and_size(idx_path):
+    with open(idx_path, "rb") as f:
+        data = f.read()
+    if len(data) < 4:
+        raise RuntimeError("Corrupt .idx: too small to contain count")
+    (count,) = struct.unpack("<I", data[:4])
+    expected_size = 4 + count * 30  # STRICT latest entry size
+    if len(data) != expected_size:
+        raise RuntimeError(f"Unsupported .idx layout/size: got {len(data)} bytes; expected {expected_size} for {count} entries of 30B")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Initialize outputs (read per-node maxima directly from stats PKL; no node_length)
 def initialize_output_files(stats_path, output_prefix):
     with open(stats_path, "rb") as stats_file:
@@ -226,8 +251,8 @@ def initialize_output_files(stats_path, output_prefix):
         # pull maxima from PKL (fallback to 1 if missing/invalid)
         R = int(stat.get("max_read_length", 1) or 1)
         C = int(stat.get("max_cigar_length", 1) or 1)
-        if R <= 0: R = 1
-        if C <= 0: C = 1
+        if R <= 0 or C <= 0:
+            raise RuntimeError(f"Invalid maxima in stats for node {node_id}: R={R}, C={C}")
 
         # your selection rule (unchanged)
         if (perfect + not_perfect) > 0 and not_perfect > 1 and not_perfect / (perfect + not_perfect) > 0.05:
@@ -255,11 +280,11 @@ def initialize_output_files(stats_path, output_prefix):
 
     dat_path = output_prefix + ".dat"
 
-    # Write .dat file: global header + blocks
+    # Write .dat file: global header + blocks (STRICT latest format)
     with open(dat_path, "wb") as f:
         # Global header
         f.write(GLOBAL_MAGIC)
-        f.write(GLOBAL_VER_PACK.pack(GLOBAL_MAJOR, GLOBAL_MINOR, len(block_infos), b'\x00' * 16))
+        f.write(GLOBAL_VER_PACK.pack(GLOBAL_MAJOR_EXPECTED, GLOBAL_MINOR_EXPECTED, len(block_infos), b'\x00' * 16))
 
         # Blocks
         for node_id, info in block_infos.items():
@@ -283,7 +308,7 @@ def initialize_output_files(stats_path, output_prefix):
             for _ in range(n_records):
                 f.write(blank)
 
-    # Write .idx: store maxima (no node_length)
+    # Write .idx: store maxima (STRICT latest format: 30B/entry)
     idx_path = output_prefix + ".idx"
     with open(idx_path, "wb") as idx_file:
         # count
@@ -306,7 +331,7 @@ def initialize_output_files(stats_path, output_prefix):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Reuse existing .dat/.idx (new format only: no node_length)
+# Reuse existing .dat/.idx (STRICT latest format only)
 def load_existing_output_files(output_prefix):
     idx_path = output_prefix + ".idx"
     dat_path = output_prefix + ".dat"
@@ -314,47 +339,51 @@ def load_existing_output_files(output_prefix):
     if not (os.path.exists(idx_path) and os.path.exists(dat_path)):
         raise FileNotFoundError(f"Expected existing files: {idx_path} and {dat_path}")
 
-    # Parse .idx (fixed 30-byte entries in the new format)
-    with open(idx_path, "rb") as f:
-        raw = f.read(4)
-        if len(raw) != 4:
-            raise RuntimeError("Corrupt .idx: cannot read block count")
-        (count,) = struct.unpack("<I", raw)
+    # Strictly validate headers/sizes first
+    _validate_latest_idx_header_and_size(idx_path)
+    _validate_latest_dat_header(dat_path)
 
-        entries = []
+    # Parse .idx (fixed 30-byte entries)
+    entries = []
+    with open(idx_path, "rb") as f:
+        (count,) = struct.unpack("<I", f.read(4))
         for _ in range(count):
             data = f.read(30)
             if len(data) != 30:
                 raise RuntimeError("Corrupt .idx: truncated entry")
-            node_id, offset, block_size, n_records, flags, R, C = struct.unpack("<I Q I I H I I", data)
-            entries.append((node_id, offset, block_size, n_records, flags, R, C))
+            node_id, offset, block_size, n_records, flags, R_idx, C_idx = struct.unpack("<I Q I I H I I", data)
+            entries.append((node_id, offset, block_size, n_records, flags, R_idx, C_idx))
 
-    # Verify .dat header & block_count; trust maxima from .dat
+    # Verify .dat header & block_count; trust maxima from .dat and validate strictly
     with open(dat_path, "rb") as df:
         magic = df.read(len(GLOBAL_MAGIC))
         if magic != GLOBAL_MAGIC:
             raise RuntimeError("Invalid .dat magic/version")
-        majors, minors, dat_count, _ = GLOBAL_VER_PACK.unpack(df.read(GLOBAL_VER_PACK.size))
+        major, minor, dat_count, _ = GLOBAL_VER_PACK.unpack(df.read(GLOBAL_VER_PACK.size))
+        if (major, minor) != (GLOBAL_MAJOR_EXPECTED, GLOBAL_MINOR_EXPECTED):
+            raise RuntimeError(f"Unsupported .dat version {major}.{minor}; require {GLOBAL_MAJOR_EXPECTED}.{GLOBAL_MINOR_EXPECTED}")
         if dat_count != len(entries):
-            print(f"[warn] .dat block_count ({dat_count}) != .idx count ({len(entries)})")
+            raise RuntimeError(f".dat block_count ({dat_count}) != .idx count ({len(entries)}) for latest format")
 
         block_infos = {}
         wanted_nodes = set()
-        for node_id, offset, block_size, n_records, flags, R, C in entries:
+        for node_id, offset, block_size, n_records, flags, _R_idx, _C_idx in entries:
             df.seek(offset, os.SEEK_SET)
             hdr = df.read(BLOCK_HDR_SIZE)
+            if len(hdr) != BLOCK_HDR_SIZE:
+                raise RuntimeError(f"Corrupt .dat: cannot read block header at {offset}")
             nid2, nrec2, flg2, R2, C2 = struct.unpack("<I I H I I", hdr)
             if nid2 != node_id or nrec2 != n_records:
-                print(f"[warn] .dat/.idx mismatch for node {node_id} (idx n={n_records}, dat n={nrec2})")
-            R = R2 or R or 1
-            C = C2 or C or 1
-            rec_sz = record_size(R, C)
+                raise RuntimeError(f".dat/.idx mismatch for node {node_id} (idx n={n_records}, dat n={nrec2})")
+            if R2 <= 0 or C2 <= 0:
+                raise RuntimeError(f"Invalid maxima in .dat for node {node_id}: R={R2}, C={C2}")
+            rec_sz = record_size(R2, C2)
             block_infos[node_id] = {
                 "offset": offset,
                 "n_records": n_records,
                 "current_pos": 0,       # assumes empty blocks; not resuming partial writes
-                "max_read_len": R,
-                "max_cigar_len": C,
+                "max_read_len": R2,
+                "max_cigar_len": C2,
                 "record_size": rec_sz,
                 "block_size": block_size,
             }
@@ -367,10 +396,10 @@ def load_existing_output_files(output_prefix):
 # ─────────────────────────────────────────────────────────────────────────────
 def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filter, use_existing):
     if use_existing:
-        print("Reusing existing .dat/.idx...")
+        print("Reusing existing .dat/.idx (strict latest format)...")
         block_infos, dat_path, wanted_nodes = load_existing_output_files(output_prefix)
     else:
-        print("Initializing output files (reading maxima from PKL)...")
+        print("Initializing output files (reading maxima from PKL, strict latest format)...")
         block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
         print(f"Output file created: {dat_path}")
 
@@ -448,7 +477,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="GAM segment extractor with per-block maxima (no node_length); maxima pulled from stats PKL."
+        description="GAM segment extractor with per-block maxima (STRICT latest .dat/.idx format only); maxima pulled from stats PKL."
     )
     parser.add_argument("gam_path", help="Path to the GAM file")
     parser.add_argument("stats_pickle", help="Path to the node stats pickle file (must include max_read_length/max_cigar_length)")
@@ -456,7 +485,7 @@ def main():
     parser.add_argument("--milestone", type=int, default=1_000_000, help="Progress report interval")
     parser.add_argument("--chr", default="", help="Optional chromosome name to filter on")
     parser.add_argument("--use-existing", action="store_true",
-                        help="Reuse existing initialized output (output_prefix.dat/.idx) in new format")
+                        help="Reuse existing initialized output (output_prefix.dat/.idx) — latest format only")
     args = parser.parse_args()
 
     run_pipeline(
