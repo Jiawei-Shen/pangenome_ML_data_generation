@@ -219,6 +219,11 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_qu
     current_node_pos = read_offset_on_node
     current_read_pos = 0
 
+    # NEW: track if we've seen the insertion anchor in a match block;
+    # if we don't later see an 'I' at that anchor, we will return REF.
+    saw_insertion_anchor = False
+    bq_at_anchor = None
+
     for length, op in read_cigar_ops_decoded:
         if op in ('M', '=', 'X'):
             if current_node_pos <= target_node_pos < current_node_pos + length:
@@ -229,21 +234,38 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_qu
                     allele = read_sequence[read_idx].upper()
                     quality = read_quality_values[read_idx] if read_idx < len(read_quality_values) else 0
 
-                    if expected_var_type in ('I', 'D'):
+                    if expected_var_type == 'D':
+                        # Deletions: seeing the base at target means REF (no deletion spanning it)
                         return "REF_STATE_FOR_INDEL", quality
-                    return allele, quality
-                return None, None
+
+                    if expected_var_type == 'I':
+                        # Insertions: do NOT return yet; mark that the anchor is covered,
+                        # then continue scanning to see if the next op is an 'I' at this anchor.
+                        saw_insertion_anchor = True
+                        bq_at_anchor = quality
+                        # fall through (no return) to keep scanning
+                    else:
+                        return allele, quality
+                else:
+                    # out of read range
+                    if expected_var_type == 'I':
+                        saw_insertion_anchor = True
+                        bq_at_anchor = None
+                    else:
+                        return None, None
+            # advance through the match
             current_node_pos += length
             current_read_pos += length
 
         elif op == 'I':
+            # For an insertion, the anchor is the base just before current_node_pos.
             if expected_var_type == 'I' and (current_node_pos - 1) == target_node_pos:
                 if current_read_pos + length <= len(read_sequence):
                     qualities = read_quality_values[current_read_pos: current_read_pos + length]
                     mean_quality = sum(qualities) / len(qualities) if qualities else 0.0
                     return read_sequence[current_read_pos: current_read_pos + length].upper(), mean_quality
                 return None, None
-            current_read_pos += length
+            current_read_pos += length  # ref doesn't advance on I
 
         elif op == 'D':
             if current_node_pos <= target_node_pos < current_node_pos + length:
@@ -258,16 +280,22 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_qu
                             return "OTHER_FOR_INDEL", None
                     return "OTHER_FOR_INDEL", None
                 return "*", None
-            current_node_pos += length
+            current_node_pos += length  # ref advances on D
 
         elif op == 'S':
             current_read_pos += length
         elif op == 'N':
             current_node_pos += length
 
+        # original early-stop logic kept as-is
         if current_node_pos > target_node_pos + 1 and not (
                 expected_var_type == 'I' and (current_node_pos - 1) <= target_node_pos):
             break
+
+    # If we saw the insertion anchor in a match but never found an 'I' at that anchor,
+    # count this read as REF for the insertion.
+    if expected_var_type == 'I' and saw_insertion_anchor:
+        return "REF_STATE_FOR_INDEL", bq_at_anchor
 
     return None, None
 
