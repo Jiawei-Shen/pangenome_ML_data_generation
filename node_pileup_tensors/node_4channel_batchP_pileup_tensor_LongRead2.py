@@ -96,6 +96,41 @@ def af_float_to_bin(x: float) -> int:
     if x < 0.5:           return 6
     return 7
 
+# NEW: filename canonicalization (only naming; logic unchanged)
+def canonical_variant_key(v_pos, v_type, v_ref, v_alt, node_seq):
+    """
+    Convert current internal variant tuple into a left-anchored, 0-based filename key.
+
+    Current internal representation in this script:
+      - SNP/X: (v_pos = mismatch pos), v_ref = REF base, v_alt = ALT base
+      - INS/I: v_pos = anchor pos (already left of insertion),
+               v_ref = anchor base, v_alt = inserted sequence
+      - DEL/D: v_pos = first deleted base (NOT the anchor),
+               v_ref = deleted sequence, v_alt = "*"
+
+    We output:
+      - X : f"{v_pos}_X_{v_ref}_{v_alt}"
+      - I : f"{anchor}_I_{anchorBase}_{anchorBase+inserted}"
+      - D : f"{anchor}_D_{anchorBase+deleted}_{anchorBase}"
+    """
+    node_len = len(node_seq)
+    if v_type == 'I':
+        anchor_pos = v_pos
+        anchor_base = (v_ref if v_ref and v_ref != "*" else
+                       (node_seq[anchor_pos].upper() if 0 <= anchor_pos < node_len else "N"))
+        inserted = v_alt or ""
+        return f"{anchor_pos}_{v_type}_{anchor_base}_{anchor_base + inserted}"
+
+    if v_type == 'D':
+        # v_pos points to first deleted base; anchor is just before it
+        anchor_pos = max(0, v_pos - 1)
+        anchor_base = node_seq[anchor_pos].upper() if 0 <= anchor_pos < node_len else "N"
+        deleted = v_ref or ""
+        return f"{anchor_pos}_{v_type}_{anchor_base + deleted}_{anchor_base}"
+
+    # SNP / mismatch unchanged
+    return f"{v_pos}_{v_type}_{v_ref}_{v_alt}"
+
 
 def calculate_window_start(variant_pos, window_size):
     center_index = window_size // 2
@@ -537,17 +572,9 @@ def process_single_node_for_pileup(task_args):
         mean_alt_bq = sum(alt_allele_base_qualities) / len(alt_allele_base_qualities) if alt_allele_base_qualities else 0.0
 
         # variant_key_string = f"{v_pos}_{v_type}_{v_ref_from_cigar}_{v_alt_from_cigar}"
-
-        if v_type == 'D':
-            # Choose the non-* string as the deleted sequence, regardless of which side it was stored on
-            deleted_seq = v_alt_from_cigar if (v_alt_from_cigar and v_alt_from_cigar != '*') else v_ref_from_cigar
-            # Anchor base is the reference base at the deletion start (v_pos)
-            anchor_base = node_sequence[v_pos] if 0 <= v_pos < node_len else 'N'
-            # Name: {pos}_D_{anchor}_{anchor+deleted}
-            variant_key_string = f"{v_pos}_{v_type}_{anchor_base}{deleted_seq}_{anchor_base}"
-        else:
-            # SNPs and insertions unchanged
-            variant_key_string = f"{v_pos}_{v_type}_{v_ref_from_cigar}_{v_alt_from_cigar}"
+        variant_key_string = canonical_variant_key(
+            v_pos, v_type, v_ref_from_cigar, v_alt_from_cigar, node_sequence
+        )
 
         window_center_pos = v_pos + 1 if v_type == 'I' else v_pos
         window_start_pos = calculate_window_start(window_center_pos, TENSOR_WINDOW_SIZE)
