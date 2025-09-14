@@ -544,7 +544,7 @@ def process_single_node_for_pileup(task_args):
             # Anchor base is the reference base at the deletion start (v_pos)
             anchor_base = node_sequence[v_pos] if 0 <= v_pos < node_len else 'N'
             # Name: {pos}_D_{anchor}_{anchor+deleted}
-            variant_key_string = f"{v_pos}_{v_type}_{anchor_base}_{anchor_base}{deleted_seq}"
+            variant_key_string = f"{v_pos}_{v_type}_{anchor_base}{deleted_seq}_{anchor_base}"
         else:
             # SNPs and insertions unchanged
             variant_key_string = f"{v_pos}_{v_type}_{v_ref_from_cigar}_{v_alt_from_cigar}"
