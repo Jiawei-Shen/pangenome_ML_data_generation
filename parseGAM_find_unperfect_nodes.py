@@ -90,7 +90,7 @@ def process_group_serialized(args):
         alignment.ParseFromString(msg_bytes)
 
         # Skip low mapping quality reads
-        if alignment.mapping_quality <= 10:
+        if alignment.mapping_quality <= 5:
             continue
 
         if chrom_name and not is_on_chromosome(alignment, chrom_name):
@@ -106,8 +106,8 @@ def process_group_serialized(args):
             is_perfect = True
 
             for edit in mapping.edit:
-                # Perfect iff no inserted sequence and from_length > 0 for all edits
-                if edit.sequence or edit.from_length == 0:
+                # Perfect if no inserted sequence and from_length > 0 for all edits
+                if edit.sequence or edit.from_length != edit.to_length:
                     is_perfect = False
                     break
 
