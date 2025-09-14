@@ -386,16 +386,22 @@ def process_node_serially(dat_file_path, base_output_dir,
                 if not cigar_ops_orig and cigar_orig != '*': continue
 
                 cur_seq, cur_quals, cur_cigar_ops, cur_offset = seq, qual_vals, list(cigar_ops_orig), off
+
                 if strand == '-':
                     cur_seq = reverse_complement(seq)
-                    cur_quals = list(reversed(qual_vals))
-                    # reverse op order for opposite strand (do not invert op types)
-                    cur_cigar_ops = [op for op in reversed(cigar_ops_orig)] if cigar_ops_orig else []
-                    # Keep your original offset flip logic for serial path
-                    read_len_span = len(cur_seq)
-                    if read_len_span > 0:
-                        cur_offset = node_len - read_len_span - off
-                        if cur_offset < 0: continue
+                    cur_quals = qual_vals[::-1]
+                    cur_cigar_ops = [op for op in reversed(
+                        cigar_ops_orig)] if cigar_ops_orig else []
+                    # alignment_span_on_node = len(cur_seq)
+                    alignment_span_on_node = len(cur_seq)
+                    # Adjust span: +I, -D (reference-consuming vs non-consuming edits)
+                    for L, op in cigar_ops_orig:
+                        if op == 'I':
+                            alignment_span_on_node -= L
+                        elif op == 'D':
+                            alignment_span_on_node += L
+                    cur_offset = node_len - alignment_span_on_node - off
+                    if cur_offset < 0: continue
 
                 aligned_read_segments.append({
                     "offset_on_node": cur_offset,
