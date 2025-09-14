@@ -542,7 +542,7 @@ def process_single_node_for_pileup(task_args):
             # v_alt_from_cigar is the deleted reference substring; anchor is the base at v_pos
             deleted_seq = v_alt_from_cigar
             anchor_base = node_sequence[v_pos] if 0 <= v_pos < node_len else 'N'
-            variant_key_string = f"{v_pos}_{v_type}_{deleted_seq}_{anchor_base}"
+            variant_key_string = f"{v_pos}_{v_type}_{anchor_base}_{anchor_base + deleted_seq}"
         else:
             # SNPs and Insertions unchanged
             variant_key_string = f"{v_pos}_{v_type}_{v_ref_from_cigar}_{v_alt_from_cigar}"
