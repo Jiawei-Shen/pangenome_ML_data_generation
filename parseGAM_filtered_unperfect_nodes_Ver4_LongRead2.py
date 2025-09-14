@@ -116,10 +116,10 @@ def build_cigar(mapping_edits):
                 cigar_parts.append(f"{from_len}M")  # match
             else:
                 cigar_parts.append(f"{from_len}X")  # substitution
-        elif from_len > 0 and to_len == 0:
-            cigar_parts.append(f"{from_len}D")      # deletion
-        elif from_len == 0 and to_len > 0:
-            cigar_parts.append(f"{to_len}I")        # insertion
+        elif from_len > to_len:
+            cigar_parts.append(f"{from_len - to_len}D")      # deletion
+        elif from_len < to_len:
+            cigar_parts.append(f"{to_len - from_len}I")        # insertion
         else:
             raise ValueError(f"Unexpected edit: from_length={from_len}, to_length={to_len}")
     return "".join(cigar_parts)
