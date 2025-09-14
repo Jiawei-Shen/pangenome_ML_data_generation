@@ -234,7 +234,7 @@ def initialize_output_files(stats_path, output_prefix, default_node_length=150):
                 warned_default = True
 
         # your selection rule
-        if (perfect + not_perfect) > 0 and not_perfect > 1 and not_perfect / (perfect + not_perfect) > 0.01:
+        if (perfect + not_perfect) > 0 and not_perfect > 1 and not_perfect / (perfect + not_perfect) > 0:
             wanted_nodes.add(node_id)
             n_records = perfect + not_perfect
 
