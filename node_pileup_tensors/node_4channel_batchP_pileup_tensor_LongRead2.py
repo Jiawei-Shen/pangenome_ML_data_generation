@@ -537,14 +537,16 @@ def process_single_node_for_pileup(task_args):
         mean_alt_bq = sum(alt_allele_base_qualities) / len(alt_allele_base_qualities) if alt_allele_base_qualities else 0.0
 
         # variant_key_string = f"{v_pos}_{v_type}_{v_ref_from_cigar}_{v_alt_from_cigar}"
-        # Filename key: keep SNP/Insertion naming unchanged; tweak Deletion to be star-less.
+
         if v_type == 'D':
-            # v_alt_from_cigar is the deleted reference substring; anchor is the base at v_pos
-            deleted_seq = v_alt_from_cigar
+            # Choose the non-* string as the deleted sequence, regardless of which side it was stored on
+            deleted_seq = v_alt_from_cigar if (v_alt_from_cigar and v_alt_from_cigar != '*') else v_ref_from_cigar
+            # Anchor base is the reference base at the deletion start (v_pos)
             anchor_base = node_sequence[v_pos] if 0 <= v_pos < node_len else 'N'
-            variant_key_string = f"{v_pos}_{v_type}_{anchor_base}_{anchor_base + deleted_seq}"
+            # Name: {pos}_D_{anchor}_{anchor+deleted}
+            variant_key_string = f"{v_pos}_{v_type}_{anchor_base}_{anchor_base}{deleted_seq}"
         else:
-            # SNPs and Insertions unchanged
+            # SNPs and insertions unchanged
             variant_key_string = f"{v_pos}_{v_type}_{v_ref_from_cigar}_{v_alt_from_cigar}"
 
         window_center_pos = v_pos + 1 if v_type == 'I' else v_pos
