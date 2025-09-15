@@ -346,7 +346,7 @@ def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepat
                         ultimate_filtered_nodes_list.append(current_node_copy)
 
                     batch_node_counter_step4 += 1
-                    if (batch_node_counter_step4 % 5000 == 0 and batch_node_counter_step4 > 0) or \
+                    if (batch_node_counter_step4 % 100000 == 0 and batch_node_counter_step4 > 0) or \
                             (node_idx_step4 + 1 == num_initial_common_nodes and batch_node_counter_step4 > 0):
                         batch_time_step4 = time.time() - batch_start_time_step4
                         print(
