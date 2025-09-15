@@ -62,27 +62,56 @@ def load_needed_node_positions(json_path: str, needed_ids: Set[str]) -> Dict[str
                     pos[nid] = p
         return pos
 
-def _vcf_subset_for_positions(positions: Set[int]) -> Set[Tuple[int,str,str]]:
-    """Fetch a small window from the VCF and build a tiny membership set."""
-    if not positions:
-        return set()
-    mn, mx = min(positions), max(positions)
-    out: Set[Tuple[int,str,str]] = set()
-    # pysam fetch uses 0-based start, half-open end; rec.pos is 1-based
-    for rec in G_VCF.fetch(G_CHR, max(0, mn-1), mx+1):
-        if rec.pos in positions and rec.alts:
-            r = rec.ref.upper()
-            for a in rec.alts:
-                out.add((rec.pos, r, a.upper()))
-    return out
+# ---------- NEW: relaxed matching helpers (per-item VCF fetch) ----------------
 
-def _parse_key(variant_key: str) -> Tuple[int,str,str]:
-    # variant_key looks like "OFFSET_x_REF_ALT_..." — adapt if needed
+def _parse_key(variant_key: str) -> Tuple[int, str, str, str]:
+    """
+    Expected canonical forms used earlier in your pipeline:
+      SNP/other:   "{offset}_{type}_{ref}_{alt}"
+      Deletion D:  "{anchor}_{D}_{anchor+deleted}_{anchor}"
+      Insertion I: "{anchor}_{I}_{anchorBase}_{anchorBase+inserted}"
+
+    Returns: (offset, vtype, REF, ALT) all uppercased.
+    """
     parts = variant_key.split("_")
+    if len(parts) < 4:
+        raise ValueError(f"Unexpected variant_key: {variant_key}")
     offset = int(parts[0])
-    ref = parts[2].upper()
-    alt = parts[3].upper()
-    return offset, ref, alt
+    vtype  = parts[1]
+    ref    = parts[2].upper()
+    alt    = parts[3].upper()
+    return offset, vtype, ref, alt
+
+def _vcf_has_partial_match(pos: int, v_ref: str, v_alt: str, v_type: str) -> bool:
+    """
+    Fetch records at POS and test:
+      - Deletion (D):     VCF.REF contains v_ref  AND  any VCF.ALT contains v_alt
+      - Insertion (I):    any VCF.ALT contains v_alt  AND  VCF.REF contains v_ref
+      - Other (e.g. X):   exact REF==v_ref and ALT==v_alt
+    """
+    # pysam fetch uses 0-based start, half-open end; rec.pos is 1-based
+    for rec in G_VCF.fetch(G_CHR, max(0, pos-1), pos+1):
+        if rec.pos != pos:
+            continue
+        ref_truth = (rec.ref or "").upper()
+        alts_truth = [(a or "").upper() for a in (rec.alts or [])]
+        if v_type == "D":
+            if v_ref and (v_ref in ref_truth):
+                for a in alts_truth:
+                    if v_alt in a:
+                        return True
+        elif v_type == "I":
+            if v_ref and (v_ref in ref_truth):
+                for a in alts_truth:
+                    if v_alt in a:
+                        return True
+        else:
+            for a in alts_truth:
+                if ref_truth == v_ref and a == v_alt:
+                    return True
+    return False
+
+# ------------------------------------------------------------------------------
 
 def _copy_or_link(src: str, dst: str, use_symlinks: bool) -> None:
     """Create dst as a symlink to src, or copy if symlinks not requested/possible."""
@@ -121,8 +150,9 @@ def _classify_node(node_dir: str):
     if not variants:
         return [], 0, 0
 
-    items = []  # (tpath, tf, pos, ref, alt)
-    pos_needed: Set[int] = set()
+    recs = []
+    t = f = 0
+
     for v in variants:
         tf = v.get("tensor_file"); vk = v.get("variant_key")
         if not tf or not vk or not tf.endswith(".npy"):
@@ -131,28 +161,20 @@ def _classify_node(node_dir: str):
         if not os.path.isfile(tpath):
             continue
         try:
-            off, ref, alt = _parse_key(vk)
+            off, vtype, ref, alt = _parse_key(vk)
         except Exception:
             continue
-        pos = start_pos + off
-        items.append((os.path.abspath(tpath), tf, pos, ref, alt))
-        pos_needed.add(pos)
 
-    if not items:
-        return [], 0, 0
+        pos = start_pos + off  # absolute GRCh38 position (1-based to match pysam VariantRecord.pos)
 
-    # Build a small, node-local VCF membership set
-    local_vcf = _vcf_subset_for_positions(pos_needed)
+        # relaxed matching via per-item fetch
+        is_match = _vcf_has_partial_match(pos, ref, alt, vtype)
 
-    recs = []
-    t = f = 0
-    for tpath, tf, pos, ref, alt in items:
-        is_match = (pos, ref, alt) in local_vcf
         label = "true" if is_match else "false"
         if is_match: t += 1
         else:        f += 1
 
-        # If NOT organizing (i.e., G_TRUE_DIR/G_FALSE_DIR are set), place now.
+        # If NOT organizing, place now.
         if G_TRUE_DIR and G_FALSE_DIR:
             dest_dir = G_TRUE_DIR if is_match else G_FALSE_DIR
             dst = os.path.join(dest_dir, f"{node_id}_{tf}")
@@ -164,10 +186,11 @@ def _classify_node(node_dir: str):
         recs.append({
             "node_id": node_id,
             "tensor_file": tf,
-            "tensor_path": tpath,     # absolute path
+            "tensor_path": os.path.abspath(tpath),
             "genomic_position": pos,
             "ref": ref,
             "alt": alt,
+            "type": vtype,
             "classification": label
         })
 
@@ -180,11 +203,9 @@ def _parallel_place(tasks: List[Tuple[str, str, bool]], max_workers: int) -> Non
     total = len(tasks)
     done = 0
     start = time.monotonic()
-    # Use threads for I/O-bound copying/symlinking
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = [ex.submit(_copy_or_link, src, dst, use_symlinks) for (src, dst, use_symlinks) in tasks]
         for fut in as_completed(futures):
-            # propagate errors if any
             _ = fut.result()
             done += 1
             if done % 500 == 0 or done == total:
@@ -221,9 +242,7 @@ def organize_classified_data_from_summary(summary_ndjson: str, base_dir: str,
             if label in grouped and tpath and tf and nid:
                 grouped[label].append((tpath, f"{nid}_{tf}"))
 
-    # Build placement tasks in bulk, then run in parallel
     tasks: List[Tuple[str, str, bool]] = []
-
     for label, items in grouped.items():
         random.shuffle(items)
         n = len(items)
@@ -266,28 +285,22 @@ def main():
     os.makedirs(args.output_folder, exist_ok=True)
 
     organize_mode = args.organize is not None
-
-    # In non-organize mode, we create true/false roots and place outputs there immediately.
     if not organize_mode:
         true_dir  = os.path.join(args.output_folder, "true")
         false_dir = os.path.join(args.output_folder, "false")
         os.makedirs(true_dir, exist_ok=True)
         os.makedirs(false_dir, exist_ok=True)
     else:
-        # In organize mode, skip creating true/false and do not place during classification.
         true_dir = None
         false_dir = None
 
-    # Node dirs and the set of IDs we actually need
     node_dirs = list(list_node_dirs(args.tensor_folder_path))
     need_ids = {os.path.basename(p) for p in node_dirs}
     print(f"Found {len(node_dirs):,} node dirs.")
 
-    # Load ONLY the positions we need (streaming if possible)
     node_pos = load_needed_node_positions(args.node_pos_json, need_ids)
     print(f"Loaded positions for {len(node_pos):,} nodes from JSON.")
 
-    # Stream summary to NDJSON to avoid big in-RAM arrays
     summary_path = os.path.join(args.output_folder, "classification_summary.ndjson")
     summary_f = open(summary_path, "w")
 
@@ -323,7 +336,6 @@ def main():
     print(f"Summary written to: {summary_path}")
     print(f"True: {total_true}  False: {total_false}")
 
-    # If organize mode, now read NDJSON and directly populate train/val/test (in parallel)
     if organize_mode:
         print("Organizing directly into train/val/test (parallel, no true/false roots)…")
         organize_classified_data_from_summary(
