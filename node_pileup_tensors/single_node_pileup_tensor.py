@@ -460,7 +460,7 @@ def process_node_serially(dat_file_path, base_output_dir,
                     strand = strand_b.decode('ascii') if isinstance(strand_b, (bytes, bytearray)) else chr(strand_b)
                 except UnicodeDecodeError:
                     continue
-                if not seq:
+                if not cigar_orig or len(seq) != len(qual_vals):
                     continue
 
                 cigar_ops_orig = decode_cigar_to_int_ops(cigar_orig)
