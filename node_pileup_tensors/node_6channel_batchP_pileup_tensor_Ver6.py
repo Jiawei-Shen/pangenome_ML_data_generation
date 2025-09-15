@@ -342,7 +342,7 @@ def process_single_node_for_pileup(task_args):
                 strand_char = strand_byte.decode('ascii') if isinstance(strand_byte, (bytes, bytearray)) else chr(strand_byte)
             except UnicodeDecodeError:
                 continue
-            if not seq or len(seq) != len(qual_values):
+            if not cigar_str or len(seq) != len(qual_values):
                 continue
             cop = decode_cigar_to_int_ops(cigar_str)
             if not cop and cigar_str != '*':
