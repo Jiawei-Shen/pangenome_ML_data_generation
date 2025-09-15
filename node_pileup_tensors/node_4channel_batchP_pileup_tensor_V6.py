@@ -105,18 +105,26 @@ def af_float_to_bin(x: float) -> int:
 
 def canonical_variant_key(v_pos, v_type, v_ref, v_alt, node_seq):
     node_len = len(node_seq)
+
     if v_type == 'I':
         anchor_pos = v_pos
         anchor_base = (v_ref if v_ref and v_ref != "*"
                        else (node_seq[anchor_pos].upper() if 0 <= anchor_pos < node_len else "N"))
         inserted = v_alt or ""
-        return f"{anchor_pos}_{v_type}_{anchor_base}_{anchor_base + inserted}"
+        return f"{anchor_pos}_I_{anchor_base}_{anchor_base + inserted}"
+
     if v_type == 'D':
-        anchor_pos = max(0, v_pos - 1)
-        anchor_base = node_seq[anchor_pos].upper() if 0 <= anchor_pos < node_len else "N"
         deleted = v_ref or ""
-        return f"{anchor_pos}_{v_type}_{anchor_base + deleted}_{anchor_base}"
+        if v_pos <= 0:
+            # no known left anchor — use '*' for ALT and only the deleted bases for REF
+            return f"0_D_{deleted}_*"
+        else:
+            anchor_pos = v_pos - 1
+            anchor_base = node_seq[anchor_pos].upper() if 0 <= anchor_pos < node_len else "N"
+            return f"{anchor_pos}_D_{anchor_base + deleted}_{anchor_base}"
+
     return f"{v_pos}_{v_type}_{v_ref}_{v_alt}"
+
 
 def calculate_window_start(variant_pos, window_size):
     return variant_pos - (window_size // 2)
