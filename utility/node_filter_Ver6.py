@@ -7,187 +7,80 @@ import time
 import copy
 import re
 import os
-import pysam  # Replaces subprocess and shutil for VCF operations
+import pysam  # for VCF queries via pysam.VariantFile
 
 # ─────────────────────────────────────────────────────────────────────────────
-# File format constants
+# Latest format constants ONLY
 
-# Global header (unchanged)
+# Global header (not strictly required in this script, kept for reference)
 GLOBAL_MAGIC = b"MYFMT\x01"
 GLOBAL_VER_PACK = struct.Struct("<BBI16s")   # major, minor, block_count, reserved[16]
 
-# LATEST per-block header (18 bytes): nid, nrec, flags, R, C
-BLOCK_HDR_PACK_LATEST = struct.Struct("<I I H I I")
-BLOCK_HDR_SIZE_LATEST = BLOCK_HDR_PACK_LATEST.size  # 18
+# Latest per-block header in .dat (18B): nid, nrec, flags, R, C
+BLOCK_HDR_PACK = struct.Struct("<I I H I I")   # 18 bytes
 
-# OLDER per-block header (14 bytes): nid, nrec, flags, node_length
-BLOCK_HDR_PACK_OLD = struct.Struct("<I I H I")
-BLOCK_HDR_SIZE_OLD = BLOCK_HDR_PACK_OLD.size        # 14
-
-# LATEST .idx entry (30 bytes): nid, offset, block_size, n_records, flags, R, C
-IDX_ENTRY_PACK_LATEST = struct.Struct("<I Q I I H I I")
-IDX_ENTRY_SIZE_LATEST = IDX_ENTRY_PACK_LATEST.size  # 30
-
-# "New (older)" .idx entry (26 bytes): nid, offset, block_size, n_records, flags, node_length
-IDX_ENTRY_PACK_26 = struct.Struct("<I Q I I H I")
-IDX_ENTRY_SIZE_26 = IDX_ENTRY_PACK_26.size          # 26
-
-# Oldest .idx entry (22 bytes): nid, offset, block_size, n_records, flags
-IDX_ENTRY_PACK_22 = struct.Struct("<I Q I I H")
-IDX_ENTRY_SIZE_22 = IDX_ENTRY_PACK_22.size          # 22
-
+# Latest .idx entry (30B): nid, offset, block_size, n_records, flags, R, C
+IDX_ENTRY_PACK = struct.Struct("<I Q I I H I I")
+IDX_ENTRY_SIZE = IDX_ENTRY_PACK.size  # 30
 
 # ─────────────────────────────────────────────────────────────────────────────
-# IDX loader with format auto-detect (30 / 26 / 22). Optionally peeks into .dat.
+# Strict latest-only IDX loader
 # ─────────────────────────────────────────────────────────────────────────────
-def load_index(idx_path, dat_path=None):
+def load_index_latest(idx_path: str):
     """
-    Load .idx (supports latest and older layouts):
-
-      • Latest (30B/entry): <I Q I I H I I> → nid, offset, block_size, n_records, flags, R, C
-      • 26B/entry:          <I Q I I H I>   → nid, offset, block_size, n_records, flags, node_length
-      • 22B/entry:          <I Q I I H>     → nid, offset, block_size, n_records, flags
+    Strictly parse latest .idx format (30 bytes/entry):
+      <I Q I I H I I> → nid, offset, block_size, n_records, flags, R, C
 
     Returns dict[nid] = {
         "start": offset,
         "block_size": block_size,
         "n_records": n_records,
         "flags": flags,
-        # present if known (0 if unknown):
         "max_read_len": R,
         "max_cigar_len": C,
-        "node_length": node_length
     }
-
-    If dat_path is given and any fields are missing (e.g., old idx),
-    we'll peek into .dat block headers to fill them (preferring latest header <R,C>,
-    falling back to old header <node_length>).
     """
     node_index = {}
 
     try:
         with open(idx_path, "rb") as f:
-            raw = f.read(4)
-            if len(raw) != 4:
-                print(f"Error: Could not read block count from {idx_path}", file=sys.stderr)
-                return {}
-            (count,) = struct.unpack("<I", raw)
+            hdr = f.read(4)
+            if len(hdr) != 4:
+                raise RuntimeError("idx header too short")
+            (count,) = struct.unpack("<I", hdr)
 
+            # file size must match exactly: 4 + count*30
             f.seek(0, os.SEEK_END)
             size = f.tell()
-            remaining = size - 4
-            if count <= 0 or remaining <= 0:
-                print(f"Error: {idx_path} is empty or corrupt.", file=sys.stderr)
-                return {}
-
-            # auto-detect entry size
-            entry_size = remaining // count
-            if entry_size not in (IDX_ENTRY_SIZE_LATEST, IDX_ENTRY_SIZE_26, IDX_ENTRY_SIZE_22):
-                # If not cleanly divisible, try to guess latest first
-                if remaining % IDX_ENTRY_SIZE_LATEST == 0:
-                    entry_size = IDX_ENTRY_SIZE_LATEST
-                elif remaining % IDX_ENTRY_SIZE_26 == 0:
-                    entry_size = IDX_ENTRY_SIZE_26
-                elif remaining % IDX_ENTRY_SIZE_22 == 0:
-                    entry_size = IDX_ENTRY_SIZE_22
-                else:
-                    print(f"Warning: Unrecognized idx layout (remaining={remaining}, count={count}). "
-                          f"Attempting latest (30B) parsing.", file=sys.stderr)
-                    entry_size = IDX_ENTRY_SIZE_LATEST
+            expected = 4 + count * IDX_ENTRY_SIZE
+            if size != expected:
+                raise RuntimeError(
+                    f"idx size mismatch for latest format: file={size}, expected={expected} "
+                    f"(count={count}, entry={IDX_ENTRY_SIZE})"
+                )
 
             f.seek(4)
             for i in range(count):
-                data = f.read(entry_size)
-                if len(data) != entry_size:
-                    print(f"Error: Truncated .idx at entry {i} in {idx_path}", file=sys.stderr)
-                    return {}
-
-                if entry_size == IDX_ENTRY_SIZE_LATEST:
-                    nid, off, blk_sz, nrec, flg, R, C = IDX_ENTRY_PACK_LATEST.unpack(data)
-                    node_index[nid] = {
-                        "start": off,
-                        "block_size": blk_sz,
-                        "n_records": nrec,
-                        "flags": flg,
-                        "max_read_len": int(R),
-                        "max_cigar_len": int(C),
-                        "node_length": 0,
-                    }
-                elif entry_size == IDX_ENTRY_SIZE_26:
-                    nid, off, blk_sz, nrec, flg, nlen = IDX_ENTRY_PACK_26.unpack(data)
-                    node_index[nid] = {
-                        "start": off,
-                        "block_size": blk_sz,
-                        "n_records": nrec,
-                        "flags": flg,
-                        "max_read_len": 0,
-                        "max_cigar_len": 0,
-                        "node_length": int(nlen),
-                    }
-                else:  # 22B
-                    nid, off, blk_sz, nrec, flg = IDX_ENTRY_PACK_22.unpack(data)
-                    node_index[nid] = {
-                        "start": off,
-                        "block_size": blk_sz,
-                        "n_records": nrec,
-                        "flags": flg,
-                        "max_read_len": 0,
-                        "max_cigar_len": 0,
-                        "node_length": 0,
-                    }
-
+                rec = f.read(IDX_ENTRY_SIZE)
+                if len(rec) != IDX_ENTRY_SIZE:
+                    raise RuntimeError(f"truncated idx at entry {i+1}")
+                nid, off, blk_sz, nrec, flg, R, C = IDX_ENTRY_PACK.unpack(rec)
+                node_index[nid] = {
+                    "start": off,
+                    "block_size": blk_sz,
+                    "n_records": nrec,
+                    "flags": flg,
+                    "max_read_len": int(R),
+                    "max_cigar_len": int(C),
+                }
     except FileNotFoundError:
-        print(f"Error: IDX file not found at {idx_path}", file=sys.stderr)
-        return {}
-    except struct.error as e:
-        print(f"Error: Could not unpack data from IDX file {idx_path}. Details: {e}", file=sys.stderr)
+        print(f"Error: idx not found: {idx_path}", file=sys.stderr)
         return {}
     except Exception as e:
-        print(f"An unexpected error occurred while reading IDX file {idx_path}: {e}", file=sys.stderr)
+        print(f"Error parsing latest idx {idx_path}: {e}", file=sys.stderr)
         return {}
 
-    # Fill missing per-block details from .dat (if provided)
-    if dat_path and any((info.get("max_read_len", 0) <= 0 and info.get("node_length", 0) <= 0)
-                        for info in node_index.values()):
-        try:
-            with open(dat_path, "rb") as df:
-                magic = df.read(len(GLOBAL_MAGIC))
-                if magic != GLOBAL_MAGIC:
-                    print(f"Warning: .dat magic mismatch for {dat_path}; header peek skipped.", file=sys.stderr)
-                else:
-                    _ = GLOBAL_VER_PACK.unpack(df.read(GLOBAL_VER_PACK.size))  # version, block_count (not strictly used)
-                    for nid, info in node_index.items():
-                        # Skip blocks that already have R/C (latest) or node_length
-                        if info.get("max_read_len", 0) > 0 and info.get("max_cigar_len", 0) > 0:
-                            continue
-                        if info.get("node_length", 0) > 0:
-                            continue
-
-                        df.seek(info["start"], os.SEEK_SET)
-                        # Try latest 18-byte header first
-                        hdr = df.read(BLOCK_HDR_SIZE_LATEST)
-                        if len(hdr) == BLOCK_HDR_SIZE_LATEST:
-                            nid2, nrec2, flg2, R, C = BLOCK_HDR_PACK_LATEST.unpack(hdr)
-                            if nid2 == nid:
-                                if R > 0 and C > 0:
-                                    info["max_read_len"] = int(R)
-                                    info["max_cigar_len"] = int(C)
-                                    # Header matched: no need to try old layout for this block
-                                    continue
-                        # Fall back to old 14-byte header
-                        df.seek(info["start"], os.SEEK_SET)
-                        hdr_old = df.read(BLOCK_HDR_SIZE_OLD)
-                        if len(hdr_old) == BLOCK_HDR_SIZE_OLD:
-                            nid2, nrec2, flg2, nlen = BLOCK_HDR_PACK_OLD.unpack(hdr_old)
-                            if nid2 == nid:
-                                info["node_length"] = int(nlen)
-        except FileNotFoundError:
-            print(f"Note: .dat not found at {dat_path}; could not fill missing block details.", file=sys.stderr)
-        except Exception as e:
-            print(f"Note: Could not read .dat to fill block details: {e}", file=sys.stderr)
-
     return node_index
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # JSON helper (unchanged)
@@ -229,7 +122,6 @@ def load_json_data_ids_and_map(json_filepath):
         print(f"Unexpected error reading JSON {json_filepath}: {e}", file=sys.stderr)
         return None, set(), {}
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Chromosome extractor (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -241,12 +133,11 @@ def extract_chromosome_from_path_pattern(path_pattern):
         return match.group(1)
     return None
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Main filter (unchanged semantics; calls new load_index)
+# Main filter (unchanged behavior; uses latest-only idx loader)
 # ─────────────────────────────────────────────────────────────────────────────
 def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepath,
-                                vcf_file=None, txt_output_path=None, dat_filepath=None):
+                                vcf_file=None, txt_output_path=None):
     print("Step 1: Loading JSON data and node map...")
     main_json_structure, target_node_ids_from_json, json_nodes_map = load_json_data_ids_and_map(json_filepath)
     if main_json_structure is None:
@@ -267,9 +158,8 @@ def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepat
         else:
             print(f"Extracted chromosome '{chromosome_for_vcf}' for VCF queries.")
 
-    print("\nStep 2: Loading node index (IDX)...")
-    # Pass dat_filepath so we can fill R/C or node_length when missing
-    idx_data = load_index(idx_filepath, dat_path=dat_filepath)
+    print("\nStep 2: Loading node index (LATEST IDX only)...")
+    idx_data = load_index_latest(idx_filepath)
     available_idx_node_ids = set(idx_data.keys())
     print(f"Found {len(available_idx_node_ids)} unique node IDs in {idx_filepath}")
 
@@ -350,9 +240,12 @@ def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepat
                             (node_idx_step4 + 1 == num_initial_common_nodes and batch_node_counter_step4 > 0):
                         batch_time_step4 = time.time() - batch_start_time_step4
                         print(
-                            f"  Step 4 Batch: Processed {batch_node_counter_step4} nodes ({node_idx_step4 + 1}/{num_initial_common_nodes} total common). "
-                            f"VCF queried in batch: {batch_queried_for_vcf_step4}. Kept with VCF results in batch: {batch_kept_with_vcf_results_step4}. "
-                            f"Time: {batch_time_step4:.2f}s.")
+                            f"  Step 4 Batch: Processed {batch_node_counter_step4} nodes "
+                            f"({node_idx_step4 + 1}/{num_initial_common_nodes} total common). "
+                            f"VCF queried in batch: {batch_queried_for_vcf_step4}. "
+                            f"Kept with VCF results in batch: {batch_kept_with_vcf_results_step4}. "
+                            f"Time: {batch_time_step4:.2f}s."
+                        )
                         batch_node_counter_step4 = 0
                         batch_queried_for_vcf_step4 = 0
                         batch_kept_with_vcf_results_step4 = 0
@@ -373,34 +266,25 @@ def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepat
     if vcf_file:
         print(f"VCF Query Summary:")
         print(f"  Total nodes eligible and queried with pysam: {total_nodes_queried_with_pysam}")
-        print(
-            f"  Nodes filtered out due to VCF prerequisites (missing coords/length, etc.): {total_nodes_filtered_out_by_vcf_prereq}")
+        print(f"  Nodes filtered out due to VCF prerequisites: {total_nodes_filtered_out_by_vcf_prereq}")
         print(f"  Nodes filtered out due to empty VCF query results: {total_nodes_filtered_out_by_empty_vcf}")
         print(f"  Nodes kept that had non-empty VCF results: {total_nodes_kept_with_vcf_results}")
 
     if txt_output_path:
         print(f"\nStep 6: Writing {num_ultimate_nodes} ultimate filtered node ID(s) to {txt_output_path}...")
-        if ultimate_filtered_nodes_list:
-            try:
-                with open(txt_output_path, 'w') as f_txt:
-                    ids_to_write = [str(node.get("node_id")) for node in ultimate_filtered_nodes_list if
-                                    node.get("node_id") is not None]
-                    try:
-                        sorted_ids = sorted(ids_to_write, key=int)
-                    except ValueError:
-                        sorted_ids = sorted(ids_to_write)
-                    for node_id_str in sorted_ids: f_txt.write(f"{node_id_str}\n")
-                print(f"Successfully wrote ultimate filtered node IDs to {txt_output_path}")
-            except Exception as e:
-                print(f"Error writing ultimate filtered node IDs to TXT {txt_output_path}: {e}", file=sys.stderr)
-        else:
-            print(f"No ultimate filtered node IDs to write to {txt_output_path}.")
-            try:
-                with open(txt_output_path, 'w') as f_txt:
-                    pass
-                print(f"Created empty TXT file at {txt_output_path}.")
-            except Exception as e:
-                print(f"Error creating empty TXT file {txt_output_path}: {e}", file=sys.stderr)
+        try:
+            with open(txt_output_path, 'w') as f_txt:
+                ids_to_write = [str(node.get("node_id")) for node in ultimate_filtered_nodes_list if
+                                node.get("node_id") is not None]
+                try:
+                    sorted_ids = sorted(ids_to_write, key=int)
+                except ValueError:
+                    sorted_ids = sorted(ids_to_write)
+                for node_id_str in sorted_ids:
+                    f_txt.write(f"{node_id_str}\n")
+            print(f"Successfully wrote ultimate filtered node IDs to {txt_output_path}")
+        except Exception as e:
+            print(f"Error writing ultimate filtered node IDs to TXT {txt_output_path}: {e}", file=sys.stderr)
 
     print(f"\nStep 7: Writing final JSON (with {num_ultimate_nodes} nodes) to {output_json_filepath}...")
     try:
@@ -410,27 +294,21 @@ def filter_json_nodes_and_write(json_filepath, idx_filepath, output_json_filepat
     except Exception as e:
         print(f"Error writing output JSON {output_json_filepath}: {e}", file=sys.stderr)
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="Filter 'nodes' list in a JSON based on IDX file and VCF content using pysam. "
-                    "Understands latest 30B .idx (R,C) and older 26B/22B idx. "
-                    "Optionally peeks into .dat to fill missing block details."
+        description="Filter 'nodes' list in a JSON based on LATEST .idx format (30B entries) and optional VCF content via pysam."
     )
     parser.add_argument("json_path", help="Path to the input JSON file.")
-    parser.add_argument("idx_path", help="Path to the .idx file.")
+    parser.add_argument("idx_path", help="Path to the LATEST .idx file (30B entries).")
     parser.add_argument("output_json_path", help="Path for the output filtered JSON file.")
     parser.add_argument("--vcf_file",
                         help="Optional: bgzipped & tabix-indexed VCF (.vcf.gz). Filters nodes whose region has no variants.",
                         default=None)
     parser.add_argument("--txt", dest="txt_output_path",
                         help="Optional: write final node IDs (one per line).", default=None)
-    parser.add_argument("--dat", dest="dat_filepath",
-                        help="Optional: matching .dat path (used to fill R/C or node_length when missing in old idx).",
-                        default=None)
     args = parser.parse_args()
 
     filter_json_nodes_and_write(
@@ -438,8 +316,7 @@ def main():
         args.idx_path,
         args.output_json_path,
         args.vcf_file,
-        args.txt_output_path,
-        args.dat_filepath
+        args.txt_output_path
     )
 
 if __name__ == "__main__":
