@@ -94,10 +94,10 @@ def _vcf_has_partial_match(pos: int, v_ref: str, v_alt: str, v_type: str) -> boo
         ref_truth = (rec.ref or "").upper()
         alts_truth = [(a or "").upper() for a in (rec.alts or [])]
         if v_type == "D":
-            if v_ref and (v_ref[len(v_alt):] in ref_truth):
+            if ref_truth and (v_ref[len(v_alt):] in ref_truth):
                 return True
         elif v_type == "I":
-            if v_ref and (v_ref in ref_truth):
+            if ref_truth and (v_ref in ref_truth):
                 for a in alts_truth:
                     if v_alt in a:
                         return True
