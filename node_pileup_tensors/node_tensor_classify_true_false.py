@@ -90,7 +90,7 @@ def _vcf_has_partial_match(pos: int, v_ref: str, v_alt: str, v_type: str) -> boo
       - Other (e.g. X):   exact REF==v_ref and ALT==v_alt
     """
     # pysam fetch uses 0-based start, half-open end; rec.pos is 1-based
-    for rec in G_VCF.fetch(G_CHR, max(0, pos-1), pos+1):
+    for rec in G_VCF.fetch(G_CHR, max(0, pos-1), pos):
         ref_truth = (rec.ref or "").upper()
         alts_truth = [(a or "").upper() for a in (rec.alts or [])]
         if v_type == "D":
