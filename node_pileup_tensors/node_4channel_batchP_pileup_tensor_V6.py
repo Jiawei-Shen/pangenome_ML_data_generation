@@ -117,7 +117,7 @@ def canonical_variant_key(v_pos, v_type, v_ref, v_alt, node_seq):
         deleted = v_ref or ""
         if v_pos <= 0:
             # no known left anchor — use '*' for ALT and only the deleted bases for REF
-            return f"0_D_{deleted}_*"
+            return f"0_D_{deleted}_{v_alt}"
         else:
             anchor_pos = v_pos - 1
             anchor_base = node_seq[anchor_pos].upper() if 0 <= anchor_pos < node_len else "N"
