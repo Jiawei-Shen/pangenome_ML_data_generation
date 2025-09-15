@@ -314,9 +314,15 @@ def process_node_serially(dat_file_path, base_output_dir,
                     cur_seq, cur_qual = reverse_complement(seq), qual[::-1]
                     cur_cigar_ops = [op for op in reversed(cigar_ops_orig)] if cigar_ops_orig else []
                     read_len_span = len(cur_seq)  # User confirmed logic for offset
+                    for Lx, opx in cigar_ops_orig:
+                        if opx == 'I':
+                            read_len_span -= Lx
+                        elif opx == 'D':
+                            read_len_span += Lx
                     if read_len_span > 0:
                         cur_offset = node_len - read_len_span - off
-                        if cur_offset < 0: continue
+                    if cur_offset < 0: continue
+
                 aligned_read_segments.append({
                     "offset_on_node": cur_offset, "read_sequence": cur_seq,
                     "processed_quality_str": cur_qual, "cigar_ops": cur_cigar_ops,
