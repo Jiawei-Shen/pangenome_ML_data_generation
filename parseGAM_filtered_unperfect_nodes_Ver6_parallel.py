@@ -216,12 +216,12 @@ def reader_process(gam_path, queue, total_reads_counter, milestone_step, num_wor
 # WORKER PROCESS: Processes messages and writes to .dat file via mmap
 # ─────────────────────────────────────────────────────────────────────────────
 def worker_process(queue, dat_path, block_infos, wanted_nodes, chrom_filter, shared_positions, locks):
-    """
-    **MODIFIED**: This worker now reports its flush statistics.
-    """
     dat_fh = open(dat_path, "r+b")
     fileno = dat_fh.fileno()
-    pid = os.getpid()  # Get Process ID once for reporting
+    pid = os.getpid()
+
+    # --- NEW: Get the size of the lock pool for the modulo operation ---
+    num_locks = len(locks)
 
     for batch in iter(queue.get, None):
         local_segment_buffer = defaultdict(list)
@@ -233,11 +233,9 @@ def worker_process(queue, dat_path, block_infos, wanted_nodes, chrom_filter, sha
         if not local_segment_buffer:
             continue
 
-        # --- NEW: Start timing and counting before the flush ---
         flush_start_time = time.perf_counter()
         total_segments_in_batch = sum(len(segs) for segs in local_segment_buffer.values())
 
-        # This is the main flush loop
         for node_id, segs in local_segment_buffer.items():
             if not segs: continue
 
@@ -245,17 +243,18 @@ def worker_process(queue, dat_path, block_infos, wanted_nodes, chrom_filter, sha
             R, C, rec_size = info["max_read_len"], info["max_cigar_len"], info["record_size"]
             rec_pack = make_record_struct(R, C)
 
-            # Atomically reserve a block of records to write to
             num_segs = len(segs)
-            with locks[node_id]:
+
+            # --- MODIFIED: Select a lock from the pool using the node_id ---
+            lock = locks[node_id % num_locks]
+            with lock:
+                # -------------------------------------------------------------
                 start_record_idx = shared_positions[node_id].value
                 shared_positions[node_id].value += num_segs
 
-            # Calculate absolute byte offset for this reserved block
             block_records_start_offset = info["offset"] + BLOCK_HDR_SIZE
             write_start_offset = block_records_start_offset + (start_record_idx * rec_size)
 
-            # Write the data using mmap
             with mmap.mmap(fileno, length=num_segs * rec_size, access=mmap.ACCESS_WRITE,
                            offset=write_start_offset) as mm:
                 current_pos_in_map = 0
@@ -267,15 +266,13 @@ def worker_process(queue, dat_path, block_infos, wanted_nodes, chrom_filter, sha
                     )
                     current_pos_in_map += rec_size
 
-        # --- NEW: Report flush stats after writing is complete ---
         flush_duration = time.perf_counter() - flush_start_time
         print(f"  [Worker {pid}] Flushed {total_segments_in_batch} segments in {flush_duration:.4f} seconds.")
 
     dat_fh.close()
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Main Pipeline Orchestrator - UNCHANGED
+# Main Pipeline Orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
 def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filter, use_existing, num_workers):
     if use_existing:
@@ -285,24 +282,35 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
 
     start_time = time.perf_counter()
 
+    # Create shared resources for multiprocessing
     manager = multiprocessing.Manager()
-    locks = manager.dict({node_id: Lock() for node_id in block_infos})
+
+    # --- MODIFIED: Create a fixed-size pool of locks instead of one per node ---
+    NUM_LOCKS = 4096  # A fixed number, e.g., 4096. Much less than millions of nodes.
+    locks = [Lock() for _ in range(NUM_LOCKS)]
+    # --------------------------------------------------------------------------
+
+    # The shared_positions dictionary is fine as is.
     shared_positions = manager.dict({node_id: Value(c_ulonglong, 0) for node_id in block_infos})
 
     work_queue = Queue(maxsize=num_workers * 4)
     total_reads_counter = Value('L', 0)
 
+    # Start the single reader process
     reader = Process(target=reader_process,
                      args=(gam_path, work_queue, total_reads_counter, milestone_step, num_workers))
     reader.start()
 
+    # Start the pool of worker processes
     workers = []
     for _ in range(num_workers):
+        # Pass the entire list of locks to each worker
         p = Process(target=worker_process,
                     args=(work_queue, dat_path, block_infos, wanted_nodes, chrom_filter, shared_positions, locks))
         workers.append(p)
         p.start()
 
+    # Wait for all processes to complete
     reader.join()
     for p in workers:
         p.join()
@@ -312,7 +320,6 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     print(f"  Total reads processed: {total_reads_counter.value}")
     print(f"  Nodes included: {len(block_infos)}")
     print(f"  Elapsed time: {elapsed:.2f} seconds")
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main entry point - UNCHANGED
