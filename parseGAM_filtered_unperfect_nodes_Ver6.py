@@ -256,7 +256,7 @@ def initialize_output_files(stats_path, output_prefix):
             raise RuntimeError(f"Invalid maxima in stats for node {node_id}: R={R}, C={C}")
 
         # your selection rule (unchanged)
-        if (perfect + not_perfect) > 0 and not_perfect > 1 and not_perfect / (perfect + not_perfect) > 0.08:
+        if (perfect + not_perfect) > 0 and not_perfect > 1 and not_perfect / (perfect + not_perfect) > 0.9:
             wanted_nodes.add(node_id)
             n_records = perfect + not_perfect
 
@@ -405,7 +405,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         print(f"Output file created: {dat_path}")
 
     BUFFER_SEGMENTS = 1_000_000  # number of segments buffered before flushing
-    print("Flushing!")
+
 
     next_milestone = milestone_step
     total_reads = 0
@@ -420,6 +420,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         if not segment_buffer:
             return
 
+        count_i = 0
         for node_id, segs in segment_buffer.items():
             if not segs:
                 continue
@@ -459,6 +460,8 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
                     )
                     rel += rec_size
                 mm.flush()  # ensure OS sees the writes
+            count_i += 1
+            print(f"\rProgress: {count_i})", end="", flush=True)
 
             info["current_pos"] += len(segs)
 
