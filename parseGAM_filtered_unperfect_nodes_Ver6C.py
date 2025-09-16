@@ -353,8 +353,8 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     # Open for in-place updates (do NOT truncate)
     dat_fh = open(dat_path, "r+b")
 
-    # cache of per-node packers to avoid rebuilding structs
-    packers = {}
+    # # cache of per-node packers to avoid rebuilding structs
+    # packers = {}
 
     def write_segments_now(nid, segs):
         """Write a small batch (this read’s segments for a node) immediately."""
@@ -372,10 +372,11 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
                 f"len(segs)={len(segs)}, n_records={info['n_records']}"
             )
 
-        rec_pack = packers.get(nid)
-        if rec_pack is None:
-            rec_pack = make_record_struct(R, C)
-            packers[nid] = rec_pack
+        rec_pack = make_record_struct(R, C)
+        # rec_pack = packers.get(nid)
+        # if rec_pack is None:
+        #     rec_pack = make_record_struct(R, C)
+        #     packers[nid] = rec_pack
 
         # Build one small contiguous batch and write once
         n = len(segs)
