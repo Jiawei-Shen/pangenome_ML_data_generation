@@ -501,7 +501,7 @@ def main():
     parser.add_argument("--chr", default="", help="Optional chromosome name to filter on")
     parser.add_argument("--use-existing", action="store_true",
                         help="Reuse existing initialized output (output_prefix.dat/.idx) — latest format only")
-    parser.add_argument("--threads", type=int, default=os.cpu_count(),
+    parser.add_argument("--threads", type=int, default=min(4, os.cpu_count()),
                         help="Number of processes to use when flushing with mmap")
     args = parser.parse_args()
 
