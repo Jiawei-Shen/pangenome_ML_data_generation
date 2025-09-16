@@ -256,7 +256,7 @@ def initialize_output_files(stats_path, output_prefix):
             raise RuntimeError(f"Invalid maxima in stats for node {node_id}: R={R}, C={C}")
 
         # your selection rule (unchanged)
-        if (perfect + not_perfect) > 0 and not_perfect > 1 and not_perfect / (perfect + not_perfect) > 0.05:
+        if (perfect + not_perfect) > 0 and not_perfect > 1 and not_perfect / (perfect + not_perfect) > 0.08:
             wanted_nodes.add(node_id)
             n_records = perfect + not_perfect
 
@@ -420,42 +420,36 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         if not segment_buffer:
             return
 
-        page = mmap.ALLOCATIONGRANULARITY
-        fileno = dat_fh.fileno()
-
         for node_id, segs in segment_buffer.items():
             if not segs:
                 continue
 
             info = block_infos[node_id]
             base_offset = info["offset"] + BLOCK_HDR_SIZE  # start of records for this block
+
             R = info["max_read_len"]
             C = info["max_cigar_len"]
             rec_pack = make_record_struct(R, C)
+            rec_size = info["record_size"]
 
-            rec_size = info.get("record_size", rec_pack.size)
-            write_offset = base_offset + info["current_pos"] * rec_size
-            nrec = len(segs)
-            total_bytes = nrec * rec_size
+            # Absolute byte range we’re about to write for this node
+            start = base_offset + info["current_pos"] * rec_size
+            nbytes = len(segs) * rec_size
 
-            # Ensure file is large enough for this write (extend sparsely if needed)
-            end_pos = write_offset + total_bytes
-            cur_size = os.fstat(fileno).st_size
-            if end_pos > cur_size:
-                dat_fh.seek(end_pos - 1)
-                dat_fh.write(b"\x00")
-                dat_fh.flush()
+            # Map only the needed window, aligned to the system allocation granularity
+            page = mmap.ALLOCATIONGRANULARITY
+            aligned_off = (start // page) * page
+            rel0 = start - aligned_off
+            map_len = rel0 + nbytes
+            if map_len <= 0:
+                continue  # nothing to write
 
-            # Map a page-aligned window that covers exactly the bytes we’ll write
-            aligned_off = (write_offset // page) * page
-            delta = write_offset - aligned_off
-            map_len = delta + total_bytes
+            fileno = dat_fh.fileno()
             with mmap.mmap(fileno, length=map_len, offset=aligned_off, access=mmap.ACCESS_WRITE) as mm:
-                mv = memoryview(mm)[delta:]  # view on the exact target slice
-                pos = 0
+                rel = rel0
                 for seg in segs:
                     rec_pack.pack_into(
-                        mv, pos,
+                        mm, rel,
                         int(seg.offset),
                         seg.seq.ljust(R, b'\x00')[:R],
                         seg.bq.ljust(R, b'\x00')[:R],
@@ -463,10 +457,10 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
                         int(seg.rq),
                         seg.strand if seg.strand in (b'+', b'-') else b'+'
                     )
-                    pos += rec_size
-                mm.flush()  # push dirty pages
+                    rel += rec_size
+                mm.flush()  # ensure OS sees the writes
 
-            info["current_pos"] += nrec
+            info["current_pos"] += len(segs)
 
         segment_buffer.clear()
         total_segments = 0
