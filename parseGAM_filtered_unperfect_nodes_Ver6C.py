@@ -256,7 +256,7 @@ def initialize_output_files(stats_path, output_prefix):
             raise RuntimeError(f"Invalid maxima in stats for node {node_id}: R={R}, C={C}")
 
         # your selection rule (unchanged)
-        if (perfect + not_perfect) > 0 and not_perfect > 1 and not_perfect / (perfect + not_perfect) > 0.06:
+        if (perfect + not_perfect) > 0 and not_perfect > 1 and not_perfect / (perfect + not_perfect) > 0.05:
             wanted_nodes.add(node_id)
             n_records = perfect + not_perfect
 
@@ -404,7 +404,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
         print(f"Output file created: {dat_path}")
 
-    BUFFER_SEGMENTS = 500_000_000  # number of segments buffered before flushing
+    BUFFER_SEGMENTS = 400_000_000  # number of segments buffered before flushing
 
 
     next_milestone = milestone_step
@@ -419,29 +419,54 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         nonlocal total_segments
         if not segment_buffer:
             return
+
+        count_i = 0
         for node_id, segs in segment_buffer.items():
             if not segs:
                 continue
+
             info = block_infos[node_id]
-            base_offset = info["offset"] + BLOCK_HDR_SIZE # start of records for this block
+            base_offset = info["offset"] + BLOCK_HDR_SIZE  # start of records for this block
+
             R = info["max_read_len"]
             C = info["max_cigar_len"]
-            rec_pack = make_record_struct(R, C) # Build contiguous blob for this node batch
-            batch = bytearray()
-            for seg in segs:
-                batch += rec_pack.pack(
-                    int(seg.offset),
-                    seg.seq.ljust(R, b'\x00')[:R],
-                    seg.bq.ljust(R, b'\x00')[:R],
-                    seg.cigar.ljust(C, b'\x00')[:C],
-                    int(seg.rq), seg.strand if seg.strand in (b'+', b'-') else b'+' )
-                pos = base_offset + info["current_pos"] * info["record_size"]
-                dat_fh.seek(pos, os.SEEK_SET)
-                dat_fh.write(batch)
-                info["current_pos"] += len(segs)
+            rec_pack = make_record_struct(R, C)
+            rec_size = info["record_size"]
 
-            segment_buffer.clear()
-            total_segments = 0
+            # Absolute byte range we’re about to write for this node
+            start = base_offset + info["current_pos"] * rec_size
+            nbytes = len(segs) * rec_size
+
+            # Map only the needed window, aligned to the system allocation granularity
+            page = mmap.ALLOCATIONGRANULARITY
+            aligned_off = (start // page) * page
+            rel0 = start - aligned_off
+            map_len = rel0 + nbytes
+            if map_len <= 0:
+                continue  # nothing to write
+
+            fileno = dat_fh.fileno()
+            with mmap.mmap(fileno, length=map_len, offset=aligned_off, access=mmap.ACCESS_WRITE) as mm:
+                rel = rel0
+                for seg in segs:
+                    rec_pack.pack_into(
+                        mm, rel,
+                        int(seg.offset),
+                        seg.seq.ljust(R, b'\x00')[:R],
+                        seg.bq.ljust(R, b'\x00')[:R],
+                        seg.cigar.ljust(C, b'\x00')[:C],
+                        int(seg.rq),
+                        seg.strand if seg.strand in (b'+', b'-') else b'+'
+                    )
+                    rel += rec_size
+                mm.flush()  # ensure OS sees the writes
+            count_i += 1
+            print(f"\rProgress: {count_i})", end="", flush=True)
+
+            info["current_pos"] += len(segs)
+
+        segment_buffer.clear()
+        total_segments = 0
 
     for raw_msg in gam_record_iter(gam_path):
         segment_dict = process_alignment(raw_msg, wanted_nodes, chrom_filter)
@@ -492,7 +517,6 @@ def main():
         chrom_filter=args.chr,
         use_existing=args.use_existing
     )
-
 
 if __name__ == "__main__":
     main()
