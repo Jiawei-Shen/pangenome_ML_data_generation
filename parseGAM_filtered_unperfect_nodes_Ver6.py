@@ -461,7 +461,6 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
                     rel += rec_size
                 mm.flush()  # ensure OS sees the writes
             count_i += 1
-            print("Flushing!!")
             print(f"\rProgress: {count_i})", end="", flush=True)
 
             info["current_pos"] += len(segs)
