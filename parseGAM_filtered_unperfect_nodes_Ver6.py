@@ -351,15 +351,26 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         nonlocal total_segments
         if not segment_buffer:
             return
-        for nid, segs in segment_buffer.items():
+
+        # Drain the dict safely: no size changes during iteration
+        while segment_buffer:
+            nid, segs = segment_buffer.popitem()
             if not segs:
                 continue
-            info = block_infos[nid]
+
+            # If a node somehow slipped in that's not in block_infos, skip it safely
+            info = block_infos.get(nid)
+            if info is None:
+                # Optional: log once if you want to know this happened
+                # print(f"[warn] node {nid} not in block_infos; skipping {len(segs)} segs")
+                continue
+
             base_offset = info["offset"] + BLOCK_HDR_SIZE
             R = info["max_read_len"]
             C = info["max_cigar_len"]
             rec_pack = make_record_struct(R, C)
 
+            # Build one contiguous batch for this node
             batch = bytearray()
             for seg in segs:
                 batch += rec_pack.pack(
@@ -376,7 +387,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
             dat_fh.write(batch)
             info["current_pos"] += len(segs)
 
-        segment_buffer.clear()
+        # Buffer is already empty (drained via popitem)
         total_segments = 0
 
     for raw_msg in gam_record_iter(gam_path):
@@ -389,7 +400,6 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
 
         if total_segments >= BUFFER_SEGMENTS:
             flush_segment_buffer()
-            segment_buffer = defaultdict(list)
 
         if total_reads >= next_milestone:
             elapsed = time.perf_counter() - start_time
