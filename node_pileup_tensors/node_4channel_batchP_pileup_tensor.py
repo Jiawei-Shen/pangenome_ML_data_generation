@@ -135,58 +135,91 @@ def decode_cigar_to_int_ops(cigar_string):
 def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_quality_values, read_cigar_ops_decoded,
                                      target_node_pos, node_sequence,
                                      expected_var_type=None, expected_ref_allele_for_indel=None):
-    current_node_pos = read_offset_on_node
-    current_read_pos = 0
+    """
+    For SNPs: exact base at target_node_pos.
+    For insertions: detect an 'I' whose anchor is (current_node_pos - 1) == target_node_pos.
+                    If the anchor base is covered by M/=/X but no such 'I' is found, count as REF.
+    For deletions: if a 'D' covers target_node_pos and matches expected_ref_allele_for_indel, return '*';
+                   otherwise treat anchor coverage as REF state.
+    """
+    npos = read_offset_on_node
+    rpos = 0
+    rlen = len(read_sequence)
+    qlen = len(read_quality_values)
 
-    for length, op in read_cigar_ops_decoded:
+    # Track whether we saw the insertion anchor covered by M/=/X (for REF state if no 'I' follows)
+    saw_ins_anchor = False
+    bq_at_anchor = None
+
+    for L, op in read_cigar_ops_decoded:
         if op in ('M', '=', 'X'):
-            if current_node_pos <= target_node_pos < current_node_pos + length:
-                offset_in_block = target_node_pos - current_node_pos
-                read_idx = current_read_pos + offset_in_block
+            # Does this block cover the target position on the node?
+            if npos <= target_node_pos < npos + L:
+                off = target_node_pos - npos
+                ridx = rpos + off
+                if ridx < rlen:
+                    base = read_sequence[ridx].upper()
+                    bq   = read_quality_values[ridx] if ridx < qlen else 0
 
-                if read_idx < len(read_sequence):
-                    allele = read_sequence[read_idx].upper()
-                    quality = read_quality_values[read_idx] if read_idx < len(read_quality_values) else 0
-
-                    if expected_var_type in ('I', 'D'):
-                        return "REF_STATE_FOR_INDEL", quality
-                    return allele, quality
-                return None, None
-            current_node_pos += length
-            current_read_pos += length
+                    if expected_var_type == 'D':
+                        # Deletion expected; being in a match block at the locus = REF state for indel
+                        return "REF_STATE_FOR_INDEL", bq
+                    if expected_var_type == 'I':
+                        # Anchor covered; don't return yet—an 'I' may follow at this anchor
+                        saw_ins_anchor = True
+                        bq_at_anchor = bq
+                    else:
+                        # SNP / mismatch
+                        return base, bq
+                else:
+                    # Out of read sequence at this spot
+                    if expected_var_type == 'I':
+                        saw_ins_anchor = True
+                        bq_at_anchor = None
+                    else:
+                        return None, None
+            # advance through the match block
+            npos += L
+            rpos += L
 
         elif op == 'I':
-            if expected_var_type == 'I' and (current_node_pos - 1) == target_node_pos:
-                if current_read_pos + length <= len(read_sequence):
-                    qualities = read_quality_values[current_read_pos: current_read_pos + length]
-                    mean_quality = sum(qualities) / len(qualities) if qualities else 0.0
-                    return read_sequence[current_read_pos: current_read_pos + length].upper(), mean_quality
+            # Insertion is anchored BEFORE current node position
+            if expected_var_type == 'I' and (npos - 1) == target_node_pos:
+                if rpos + L <= rlen:
+                    qs = read_quality_values[rpos: rpos + L]
+                    mean_q = sum(qs) / len(qs) if qs else 0.0
+                    return read_sequence[rpos: rpos + L].upper(), mean_q
                 return None, None
-            current_read_pos += length
+            # insertion consumes read only
+            rpos += L
 
         elif op == 'D':
-            if current_node_pos <= target_node_pos < current_node_pos + length:
+            # Deletion covers reference; if it spans the target, check whether it's the expected one
+            if npos <= target_node_pos < npos + L:
                 if expected_var_type == 'I':
                     return "OTHER_FOR_INDEL", None
                 if expected_var_type == 'D':
-                    if 0 <= current_node_pos < len(node_sequence) and current_node_pos + length <= len(node_sequence):
-                        deleted_seq_in_ref_context = node_sequence[current_node_pos: current_node_pos + length]
-                        if deleted_seq_in_ref_context == expected_ref_allele_for_indel:
-                            return "*", None
-                        else:
-                            return "OTHER_FOR_INDEL", None
+                    if 0 <= npos < len(node_sequence) and npos + L <= len(node_sequence):
+                        del_ref = node_sequence[npos: npos + L]
+                        return ("*" if del_ref == expected_ref_allele_for_indel else "OTHER_FOR_INDEL"), None
                     return "OTHER_FOR_INDEL", None
+                # Non-indel caller seeing a deletion -> treat as gap
                 return "*", None
-            current_node_pos += length
+            # deletion consumes reference only
+            npos += L
 
         elif op == 'S':
-            current_read_pos += length
+            rpos += L
         elif op == 'N':
-            current_node_pos += length
+            npos += L
 
-        if current_node_pos > target_node_pos + 1 and not (
-                expected_var_type == 'I' and (current_node_pos - 1) <= target_node_pos):
+        # Early exit once we've safely passed the anchor region
+        if npos > target_node_pos + 1 and not (expected_var_type == 'I' and (npos - 1) <= target_node_pos):
             break
+
+    # If we saw the insertion anchor in an M/=/X block but never observed an 'I' at that anchor → REF
+    if expected_var_type == 'I' and saw_ins_anchor:
+        return "REF_STATE_FOR_INDEL", bq_at_anchor
 
     return None, None
 

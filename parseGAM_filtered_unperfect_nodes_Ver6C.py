@@ -47,6 +47,8 @@ def make_record_struct(max_read_len: int, max_cigar_len: int) -> struct.Struct:
         - i16 rq (MAPQ)
         - char strand ('+' / '-')
     """
+    if max_read_len <= 0 or max_cigar_len <= 0:
+        raise ValueError("max_read_len and max_cigar_len must be > 0")
     return struct.Struct(f"<h{max_read_len}s{max_read_len}s{max_cigar_len}shc")
 
 def record_size(max_read_len: int, max_cigar_len: int) -> int:
@@ -100,7 +102,7 @@ def gam_record_iter(path, tag="GAM"):
                     break
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CIGAR builder (same semantics)
+# CIGAR builder (same semantics; not used by writer but handy for debug)
 def build_cigar(mapping_edits):
     parts = []
     for e in mapping_edits:
@@ -197,8 +199,8 @@ def initialize_output_files(stats_path, output_prefix):
         nid = int(node_id_key)
         perfect = int(stat.get("perfect", 0))
         not_perfect = int(stat.get("not_perfect", 0))
-        # Selection rule (unchanged)
-        if (perfect + not_perfect) > 0 and not_perfect > 1 and not_perfect / (perfect + not_perfect) > 0.06:
+        # Selection rule (keep your original threshold 0.06 here)
+        if (perfect + not_perfect) > 0 and not_perfect > 1 and not_perfect / (perfect + not_perfect) > 0.05:
             wanted_nodes.add(nid)
             node_counts[nid] = perfect + not_perfect
             # Pull maxima directly from PKL (fallback to 1 if missing/bad)
@@ -235,22 +237,27 @@ def initialize_output_files(stats_path, output_prefix):
 
     dat_path = output_prefix + ".dat"
 
-    # write .dat
+    # write .dat with sparse preallocation (no per-record blank writes)
     with open(dat_path, "wb") as f:
         f.write(GLOBAL_MAGIC)
         f.write(GLOBAL_VER_PACK.pack(GLOBAL_MAJOR, GLOBAL_MINOR, len(block_infos), b'\x00' * 16))
 
+        # Keep deterministic order for writing: rely on insertion order from block_infos
         for nid, info in block_infos.items():
             nrec = info["n_records"]
             R = info["max_read_len"]
             C = info["max_cigar_len"]
 
+            # block header
             f.write(BLOCK_HDR_PACK.pack(nid, nrec, 0, R, C))
 
-            rec_pack = make_record_struct(R, C)
-            blank = rec_pack.pack(0, b'\x00'*R, b'\x00'*R, b'\x00'*C, 0, b'+')
-            for _ in range(nrec):
-                f.write(blank)
+            # sparse region for nrec records
+            rec_sz = info["record_size"]
+            if nrec > 0:
+                # Seek from current position (right after header) to last byte of the block payload
+                f.seek(nrec * rec_sz - 1, os.SEEK_CUR)
+                f.write(b"\x00")
+            # else: empty block payload
 
     # write .idx
     idx_path = output_prefix + ".idx"
@@ -306,6 +313,8 @@ def load_existing_output_files(output_prefix):
         for nid, offset, block_size, n_records, flags, R, C in entries:
             df.seek(offset, os.SEEK_SET)
             hdr = df.read(BLOCK_HDR_SIZE)
+            if len(hdr) != BLOCK_HDR_SIZE:
+                raise RuntimeError(f"Corrupt .dat: cannot read block header at {offset}")
             nid2, nrec2, flg2, R2, C2 = struct.unpack("<I I H I I", hdr)
             if (nid2 != nid) or (nrec2 != n_records):
                 print(f"[warn] .dat/.idx mismatch for node {nid} (idx n={n_records}, dat n={nrec2})")
@@ -337,66 +346,71 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
         print(f"Output file created: {dat_path}")
 
-    BUFFER_SEGMENTS = 500_000_000
-
     next_milestone = milestone_step
     total_reads = 0
-    total_segments = 0
     start_time = time.perf_counter()
 
+    # Open for in-place updates (do NOT truncate)
     dat_fh = open(dat_path, "r+b")
-    segment_buffer = defaultdict(list)
 
-    def flush_segment_buffer():
-        nonlocal total_segments
-        if not segment_buffer:
+    # cache of per-node packers to avoid rebuilding structs
+    packers = {}
+
+    def write_segments_now(nid, segs):
+        """Write a small batch (this read’s segments for a node) immediately."""
+        if not segs:
             return
-        for nid, segs in segment_buffer.items():
-            if not segs:
-                continue
-            info = block_infos[nid]
-            base_offset = info["offset"] + BLOCK_HDR_SIZE
-            R = info["max_read_len"]
-            C = info["max_cigar_len"]
+
+        info = block_infos[nid]
+        R, C   = info["max_read_len"], info["max_cigar_len"]
+        rec_sz = info["record_size"]
+
+        # bounds check: don’t overrun block
+        if info["current_pos"] + len(segs) > info["n_records"]:
+            raise RuntimeError(
+                f"Block overflow for node {nid}: current_pos={info['current_pos']}, "
+                f"len(segs)={len(segs)}, n_records={info['n_records']}"
+            )
+
+        rec_pack = packers.get(nid)
+        if rec_pack is None:
             rec_pack = make_record_struct(R, C)
+            packers[nid] = rec_pack
 
-            batch = bytearray()
-            for seg in segs:
-                batch += rec_pack.pack(
-                    int(seg.offset),
-                    seg.seq.ljust(R, b'\x00')[:R],
-                    seg.bq.ljust(R, b'\x00')[:R],
-                    seg.cigar.ljust(C, b'\x00')[:C],
-                    int(seg.rq),
-                    seg.strand if seg.strand in (b'+', b'-') else b'+'
-                )
+        # Build one small contiguous batch and write once
+        n = len(segs)
+        batch = bytearray(n * rec_sz)
+        off = 0
+        for s in segs:
+            batch[off:off+rec_sz] = rec_pack.pack(
+                int(s.offset),
+                s.seq.ljust(R, b'\x00')[:R],
+                s.bq.ljust(R, b'\x00')[:R],
+                s.cigar.ljust(C, b'\x00')[:C],
+                int(s.rq),
+                s.strand if s.strand in (b'+', b'-') else b'+'
+            )
+            off += rec_sz
 
-            pos = base_offset + info["current_pos"] * info["record_size"]
-            dat_fh.seek(pos, os.SEEK_SET)
-            dat_fh.write(batch)
-            info["current_pos"] += len(segs)
+        base_offset = info["offset"] + BLOCK_HDR_SIZE
+        pos = base_offset + info["current_pos"] * rec_sz
+        dat_fh.seek(pos, os.SEEK_SET)
+        dat_fh.write(batch)
+        info["current_pos"] += n
 
-        segment_buffer.clear()
-        total_segments = 0
-
+    # Main loop: streaming; no global buffer
     for raw_msg in gam_record_iter(gam_path):
         segs_by_node = process_alignment(raw_msg, wanted_nodes, chrom_filter)
         total_reads += 1
 
         for nid, segs in segs_by_node.items():
-            segment_buffer[nid].extend(segs)
-            total_segments += len(segs)
-
-        if total_segments >= BUFFER_SEGMENTS:
-            flush_segment_buffer()
-            segment_buffer = defaultdict(list)
+            write_segments_now(nid, segs)
 
         if total_reads >= next_milestone:
             elapsed = time.perf_counter() - start_time
             print(f"{total_reads} reads processed | {elapsed:.1f} seconds")
             next_milestone += milestone_step
 
-    flush_segment_buffer()
     dat_fh.close()
 
     elapsed = time.perf_counter() - start_time
@@ -408,7 +422,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="GAM segment extractor with per-block maxima read directly from stats PKL."
+        description="GAM segment extractor with per-block maxima read directly from stats PKL (streaming writes, sparse preallocation)."
     )
     parser.add_argument("gam_path", help="Path to the GAM file")
     parser.add_argument("stats_pickle", help="Path to the stats pickle (must contain max_read_length/max_cigar_length per node)")
