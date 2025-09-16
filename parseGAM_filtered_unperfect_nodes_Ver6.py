@@ -352,42 +352,44 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         if not segment_buffer:
             return
 
-        # Drain the dict safely: no size changes during iteration
+        # Drain safely to avoid "dict changed size during iteration"
         while segment_buffer:
             nid, segs = segment_buffer.popitem()
             if not segs:
                 continue
 
-            # If a node somehow slipped in that's not in block_infos, skip it safely
             info = block_infos.get(nid)
             if info is None:
-                # Optional: log once if you want to know this happened
-                # print(f"[warn] node {nid} not in block_infos; skipping {len(segs)} segs")
                 continue
 
             base_offset = info["offset"] + BLOCK_HDR_SIZE
             R = info["max_read_len"]
             C = info["max_cigar_len"]
             rec_pack = make_record_struct(R, C)
+            rec_sz = info["record_size"]
 
-            # Build one contiguous batch for this node
-            batch = bytearray()
-            for seg in segs:
-                batch += rec_pack.pack(
-                    int(seg.offset),
-                    seg.seq.ljust(R, b'\x00')[:R],
-                    seg.bq.ljust(R, b'\x00')[:R],
-                    seg.cigar.ljust(C, b'\x00')[:C],
-                    int(seg.rq),
-                    seg.strand if seg.strand in (b'+', b'-') else b'+'
+            # --- only change: preallocate once, then pack_into ---
+            n = len(segs)
+            buf = bytearray(rec_sz * n)
+            off = 0
+            for s in segs:
+                rec_pack.pack_into(
+                    buf, off,
+                    int(s.offset),
+                    s.seq.ljust(R, b'\x00')[:R],
+                    s.bq.ljust(R, b'\x00')[:R],
+                    s.cigar.ljust(C, b'\x00')[:C],
+                    int(s.rq),
+                    s.strand if s.strand in (b'+', b'-') else b'+'
                 )
+                off += rec_sz
+            # -----------------------------------------------------
 
-            pos = base_offset + info["current_pos"] * info["record_size"]
+            pos = base_offset + info["current_pos"] * rec_sz
             dat_fh.seek(pos, os.SEEK_SET)
-            dat_fh.write(batch)
-            info["current_pos"] += len(segs)
+            dat_fh.write(buf)
+            info["current_pos"] += n
 
-        # Buffer is already empty (drained via popitem)
         total_segments = 0
 
     for raw_msg in gam_record_iter(gam_path):
