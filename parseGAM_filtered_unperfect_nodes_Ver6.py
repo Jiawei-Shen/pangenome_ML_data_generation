@@ -403,7 +403,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
         print(f"Output file created: {dat_path}")
 
-    BUFFER_SEGMENTS = 400_000_000  # number of segments buffered before flushing
+    BUFFER_SEGMENTS = 500_000_000  # number of segments buffered before flushing
 
     next_milestone = milestone_step
     total_reads = 0
@@ -413,36 +413,61 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     dat_fh = open(dat_path, "r+b")
     segment_buffer = defaultdict(list)
 
+    import mmap
+    import os
+
     def flush_segment_buffer():
         nonlocal total_segments
         if not segment_buffer:
             return
+
+        page = mmap.ALLOCATIONGRANULARITY
+        fileno = dat_fh.fileno()
+
         for node_id, segs in segment_buffer.items():
             if not segs:
                 continue
+
             info = block_infos[node_id]
             base_offset = info["offset"] + BLOCK_HDR_SIZE  # start of records for this block
             R = info["max_read_len"]
             C = info["max_cigar_len"]
             rec_pack = make_record_struct(R, C)
 
-            # Build contiguous blob for this node batch
-            batch = bytearray()
-            for seg in segs:
-                batch += rec_pack.pack(
-                    int(seg.offset),
-                    seg.seq.ljust(R, b'\x00')[:R],
-                    seg.bq.ljust(R, b'\x00')[:R],
-                    seg.cigar.ljust(C, b'\x00')[:C],
-                    int(seg.rq),
-                    seg.strand if seg.strand in (b'+', b'-') else b'+'
-                )
+            rec_size = info.get("record_size", rec_pack.size)
+            write_offset = base_offset + info["current_pos"] * rec_size
+            nrec = len(segs)
+            total_bytes = nrec * rec_size
 
-            pos = base_offset + info["current_pos"] * info["record_size"]
-            dat_fh.seek(pos, os.SEEK_SET)
-            dat_fh.write(batch)
+            # Ensure file is large enough for this write (extend sparsely if needed)
+            end_pos = write_offset + total_bytes
+            cur_size = os.fstat(fileno).st_size
+            if end_pos > cur_size:
+                dat_fh.seek(end_pos - 1)
+                dat_fh.write(b"\x00")
+                dat_fh.flush()
 
-            info["current_pos"] += len(segs)
+            # Map a page-aligned window that covers exactly the bytes we’ll write
+            aligned_off = (write_offset // page) * page
+            delta = write_offset - aligned_off
+            map_len = delta + total_bytes
+            with mmap.mmap(fileno, length=map_len, offset=aligned_off, access=mmap.ACCESS_WRITE) as mm:
+                mv = memoryview(mm)[delta:]  # view on the exact target slice
+                pos = 0
+                for seg in segs:
+                    rec_pack.pack_into(
+                        mv, pos,
+                        int(seg.offset),
+                        seg.seq.ljust(R, b'\x00')[:R],
+                        seg.bq.ljust(R, b'\x00')[:R],
+                        seg.cigar.ljust(C, b'\x00')[:C],
+                        int(seg.rq),
+                        seg.strand if seg.strand in (b'+', b'-') else b'+'
+                    )
+                    pos += rec_size
+                mm.flush()  # push dirty pages
+
+            info["current_pos"] += nrec
 
         segment_buffer.clear()
         total_segments = 0
