@@ -453,7 +453,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
                     errors.append((node_id, f"short write: {written} of {expected_n}"))
                 info = block_infos[node_id]
                 info["current_pos"] += written
-                if done_cnt % 2000 == 0 or done_cnt == submitted:
+                if done_cnt % 1000 == 0 or done_cnt == submitted:
                     print(f"\rFlushed {done_cnt}/{submitted} node-batches", end="", flush=True)
             print()
 
