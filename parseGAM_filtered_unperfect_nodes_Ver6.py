@@ -5,6 +5,7 @@ import pickle
 import struct
 import time
 import gc
+import mmap
 import os
 from collections import defaultdict
 import vg_pb2
@@ -403,7 +404,8 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
         print(f"Output file created: {dat_path}")
 
-    BUFFER_SEGMENTS = 500_000_000  # number of segments buffered before flushing
+    BUFFER_SEGMENTS = 1_000_000  # number of segments buffered before flushing
+    print("Flushing!")
 
     next_milestone = milestone_step
     total_reads = 0
@@ -412,9 +414,6 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
 
     dat_fh = open(dat_path, "r+b")
     segment_buffer = defaultdict(list)
-
-    import mmap
-    import os
 
     def flush_segment_buffer():
         nonlocal total_segments
