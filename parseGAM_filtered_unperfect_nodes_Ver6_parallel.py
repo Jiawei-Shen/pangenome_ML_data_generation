@@ -106,7 +106,7 @@ def initialize_output_files(stats_path, output_prefix):
         total_nodes += 1;
         node_id = int(node_id_key);
         perfect, not_perfect = int(stat.get("perfect", 0)), int(stat.get("not_perfect", 0))
-        if (perfect + not_perfect) > 0 and not_perfect > 1 and not_perfect / (perfect + not_perfect) > 0.05:
+        if (perfect + not_perfect) > 0 and not_perfect > 1 and not_perfect / (perfect + not_perfect) > 0.5:
             wanted_nodes.add(node_id);
             n_records = perfect + not_perfect
             R, C = int(stat.get("max_read_length", 1) or 1), int(stat.get("max_cigar_length", 1) or 1)
