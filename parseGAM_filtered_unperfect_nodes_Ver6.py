@@ -255,7 +255,7 @@ def initialize_output_files(stats_path, output_prefix):
             raise RuntimeError(f"Invalid maxima in stats for node {node_id}: R={R}, C={C}")
 
         # your selection rule (unchanged)
-        if (perfect + not_perfect) > 0 and not_perfect > 1 and not_perfect / (perfect + not_perfect) > 0.05:
+        if (perfect + not_perfect) > 0 and not_perfect > 1 and not_perfect / (perfect + not_perfect) > 0.1:
             wanted_nodes.add(node_id)
             n_records = perfect + not_perfect
 
