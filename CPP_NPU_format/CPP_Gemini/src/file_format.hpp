@@ -7,6 +7,7 @@
 #include <iostream>
 #include <fstream>
 #include <cstring>
+#include <atomic> // <--- ADD THIS LINE
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants for the binary format
@@ -16,9 +17,6 @@ const std::string GLOBAL_MAGIC = "MYFMT\x01";
 constexpr uint8_t GLOBAL_MAJOR = 0;
 constexpr uint8_t GLOBAL_MINOR = 5;
 
-// Define packed structs to match Python's struct layout precisely.
-// The '<' in Python's format string means little-endian. These structs assume
-// the target machine is little-endian (like x86).
 #pragma pack(push, 1)
 struct GlobalHeader {
     uint8_t major_ver;
@@ -66,7 +64,6 @@ struct BlockInfo {
     uint32_t max_cigar_len;
     uint32_t record_size;
     uint32_t block_size;
-    // Atomic counter for thread-safe position tracking if multithreading is added later
     std::atomic<uint32_t> current_pos{0};
 };
 
