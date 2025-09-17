@@ -46,22 +46,22 @@ void write_node_data(int fd, long long write_pos, const std::vector<Segment>& se
     std::vector<char> buffer(total_buffer_size);
     char* current_ptr = buffer.data();
 
-//    for (const auto& s : segments) {
-//        memcpy(current_ptr, &s.offset, sizeof(int16_t)); current_ptr += sizeof(int16_t);
-//        memcpy(current_ptr, s.seq.c_str(), s.seq.length());
-//        memset(current_ptr + s.seq.length(), 0, max_read_len - s.seq.length());
-//        current_ptr += max_read_len;
-//        memcpy(current_ptr, s.bq.c_str(), s.bq.length());
-//        memset(current_ptr + s.bq.length(), 0, max_read_len - s.bq.length());
-//        current_ptr += max_read_len;
-//        memcpy(current_ptr, s.cigar.c_str(), s.cigar.length());
-//        memset(current_ptr + s.cigar.length(), 0, max_cigar_len - s.cigar.length());
-//        current_ptr += max_cigar_len;
-//        memcpy(current_ptr, &s.rq, sizeof(int16_t)); current_ptr += sizeof(int16_t);
-//        memcpy(current_ptr, &s.strand, sizeof(char)); current_ptr += sizeof(char);
-//    }
+    for (const auto& s : segments) {
+        memcpy(current_ptr, &s.offset, sizeof(int16_t)); current_ptr += sizeof(int16_t);
+        memcpy(current_ptr, s.seq.c_str(), s.seq.length());
+        memset(current_ptr + s.seq.length(), 0, max_read_len - s.seq.length());
+        current_ptr += max_read_len;
+        memcpy(current_ptr, s.bq.c_str(), s.bq.length());
+        memset(current_ptr + s.bq.length(), 0, max_read_len - s.bq.length());
+        current_ptr += max_read_len;
+        memcpy(current_ptr, s.cigar.c_str(), s.cigar.length());
+        memset(current_ptr + s.cigar.length(), 0, max_cigar_len - s.cigar.length());
+        current_ptr += max_cigar_len;
+        memcpy(current_ptr, &s.rq, sizeof(int16_t)); current_ptr += sizeof(int16_t);
+        memcpy(current_ptr, &s.strand, sizeof(char)); current_ptr += sizeof(char);
+    }
 
-    ssize_t bytes_written = pwrite(fd, buffer.data(), buffer.size(), write_pos);
+//    ssize_t bytes_written = pwrite(fd, buffer.data(), buffer.size(), write_pos);
     if (bytes_written == -1 || static_cast<size_t>(bytes_written) != buffer.size()) {
         throw std::runtime_error("pwrite failed for a data block.");
     }
