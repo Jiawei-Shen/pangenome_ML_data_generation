@@ -185,7 +185,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
 
     # BUFFER_SEGMENTS = 400_000_000
-    BUFFER_SEGMENTS = 1_000
+    BUFFER_SEGMENTS = 100_000
     next_milestone, total_reads, total_segments = milestone_step, 0, 0
     start_time = time.perf_counter()
 
@@ -241,8 +241,14 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
                 BLOCK_HDR_SIZE
             )
         except Exception as e:
-            print(f"Error during final C++ buffer flush: {e}")
-            raise
+            print("\n--- C++ MODULE ERROR ---")
+            print(f"An exception occurred in the C++ module: {e}")
+            print("This often happens if the write position is outside the bounds of the pre-allocated file.")
+            print("Add the C++ debug prints suggested in the guide to find the problematic node ID and write position.")
+            # We will exit here, as the program state is now uncertain.
+            import sys
+            sys.exit(1)
+
         segment_buffer.clear()
         total_segments = 0
         print(f"Final C++ flush complete in {time.perf_counter() - flush_start_time:.2f} seconds.")

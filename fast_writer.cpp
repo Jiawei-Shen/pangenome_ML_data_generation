@@ -87,6 +87,9 @@ void flush_entire_buffer(
             long long base_offset = info.offset + block_header_size;
             long long write_pos = base_offset + (long long)info.current_pos * info.record_size;
 
+            // --- ADD THIS DEBUG LINE ---
+            std::cout << "DEBUG: Writing Node ID " << nid << " | Segments: " << segs.size() << " | Write Pos: " << write_pos << std::endl;
+
             // 2. C++ does the serialization and writing by calling the helper
             write_node_data(fd, write_pos, segs, info.max_read_len, info.max_cigar_len);
 
