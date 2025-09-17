@@ -1,5 +1,6 @@
 #include "cxxopts.hpp"
 #include "file_format.hpp"
+#include "vg.pb.h" // <--- THIS LINE IS CRITICAL
 #include <iostream>
 #include <string>
 
@@ -26,7 +27,6 @@ int main(int argc, char* argv[]) {
             return 0;
         }
 
-        // Check for required arguments
         if (!result.count("gam_path") || !result.count("stats_path") || !result.count("output_prefix")) {
             std::cerr << "Error: Missing required arguments: --gam_path, --stats_path, --output_prefix" << std::endl;
             std::cerr << options.help() << std::endl;
