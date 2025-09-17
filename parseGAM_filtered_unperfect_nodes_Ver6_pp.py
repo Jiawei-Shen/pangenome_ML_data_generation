@@ -7,11 +7,9 @@ import time
 import gc
 import os
 from collections import defaultdict
-from multiprocessing.pool import ThreadPool  # Using ThreadPool is more efficient here
 import vg_pb2  # Assumes you have the compiled protobuf Python file
+import multiprocessing as mp
 
-
-# ... (The rest of the script from Segment class to load_existing_output_files is unchanged) ...
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Segment container
@@ -150,7 +148,7 @@ def initialize_output_files(stats_path, output_prefix):
 
     block_infos = {}
     current_offset = GLOBAL_HEADER_SIZE
-    for nid in sorted(list(wanted_nodes)):  # Sort for deterministic layout
+    for nid in sorted(list(wanted_nodes)): # Sort for deterministic layout
         nrec = node_counts[nid]
         R, C = maxima[nid]
         rec_sz = record_size(R, C)
@@ -186,7 +184,7 @@ def load_existing_output_files(output_prefix):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PARALLEL FLUSH WORKER FUNCTIONS
+# PARALLEL FLUSH WORKER FUNCTIONS (MODIFIED)
 
 g_fd = -1  # Global variable to hold the file descriptor in each worker process
 
@@ -203,19 +201,20 @@ def flush_worker(job):
     'job' is a tuple: (buffer, write_position)
     """
     buf, write_pos = job
+    # The only work is the I/O call. All serialization is done in the main process.
     os.pwrite(g_fd, buf, write_pos)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main Pipeline (MODIFIED for memory efficiency)
+# Main Pipeline (MODIFIED)
 def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filter, use_existing, num_flush_workers):
     if use_existing:
         block_infos, dat_path, wanted_nodes = load_existing_output_files(output_prefix)
     else:
         block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
 
-    # BUFFER_SEGMENTS = 400_000_000
-    BUFFER_SEGMENTS = 1_000_000
+    BUFFER_SEGMENTS = 400_000_000
+    # BUFFER_SEGMENTS = 3_000_000
     next_milestone, total_reads, total_segments = milestone_step, 0, 0
     start_time = time.perf_counter()
 
@@ -230,57 +229,51 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         if not hasattr(os, 'pwrite'):
             raise NotImplementedError("Parallel flushing requires os.pwrite(), not available on this OS.")
 
-        print(f"Preparing {len(segment_buffer)} node blocks for memory-efficient parallel flush...")
+        print(f"Preparing {len(segment_buffer)} node blocks for parallel flush...")
         flush_start_time = time.perf_counter()
         dat_fd = dat_fh.fileno()
+        jobs = []
 
+        # PREPARATION (SERIAL): Main process calculates write positions AND serializes data.
         items_to_process = list(segment_buffer.items())
         segment_buffer.clear()
 
-        # NEW: Generator function to prepare jobs one by one
-        def generate_jobs(items):
-            for nid, segs in items:
-                info = block_infos.get(nid)
-                if not info:
-                    continue
+        for nid, segs in items_to_process:
+            info = block_infos.get(nid)
+            if not info: continue
 
-                # 1. Atomically claim the file space
-                base_offset = info["offset"] + BLOCK_HDR_SIZE
-                write_pos = base_offset + info["current_pos"] * info["record_size"]
-                info["current_pos"] += len(segs)
+            # 1. Atomically claim the file space for this node's segments.
+            base_offset = info["offset"] + BLOCK_HDR_SIZE
+            write_pos = base_offset + info["current_pos"] * info["record_size"]
+            info["current_pos"] += len(segs)
 
-                # 2. Serialize data for this single job
-                R, C = info["max_read_len"], info["max_cigar_len"]
-                n = len(segs)
-                rec_pack = make_record_struct(R, C)
-                rec_sz = rec_pack.size
-                buf = bytearray(rec_sz * n)
-                off = 0
-                for s in segs:
-                    rec_pack.pack_into(
-                        buf, off, int(s.offset), s.seq.ljust(R, b'\x00')[:R],
-                        s.bq.ljust(R, b'\x00')[:R], s.cigar.ljust(C, b'\x00')[:C],
-                        int(s.rq), s.strand if s.strand in (b'+', b'-') else b'+'
-                    )
-                    off += rec_sz
+            # 2. CPU-Bound Work: Serialize all segments into a single byte buffer.
+            #    This is now done here in the main process.
+            R, C = info["max_read_len"], info["max_cigar_len"]
+            n = len(segs)
+            rec_pack = make_record_struct(R, C)
+            rec_sz = rec_pack.size
+            buf = bytearray(rec_sz * n)
+            off = 0
+            for s in segs:
+                rec_pack.pack_into(
+                    buf, off, int(s.offset), s.seq.ljust(R, b'\x00')[:R],
+                    s.bq.ljust(R, b'\x00')[:R], s.cigar.ljust(C, b'\x00')[:C],
+                    int(s.rq), s.strand if s.strand in (b'+', b'-') else b'+'
+                )
+                off += rec_sz
 
-                # 3. Yield the completed job, releasing memory for `segs` and `buf`
-                yield (buf, write_pos)
+            # 3. Create a simple job tuple for the worker containing the pre-serialized data.
+            job = (buf, write_pos)
+            jobs.append(job)
 
-        # DISPATCH (PARALLEL): Use ThreadPool and imap_unordered for memory efficiency
-        # I'm using ThreadPool here as it's lighter-weight for I/O-bound tasks.
-        with ThreadPool(processes=num_flush_workers, initializer=init_flush_worker, initargs=(dat_fd,)) as pool:
-            # imap_unordered pulls from the generator as workers become free,
-            # ensuring we don't store all jobs in memory at once.
-            job_generator = generate_jobs(items_to_process)
-
-            # We must iterate through the result to ensure all tasks are completed.
-            for _ in pool.imap_unordered(flush_worker, job_generator):
-                pass
+        # DISPATCH (PARALLEL): Send all prepared jobs to the worker pool.
+        # Workers will ONLY execute os.pwrite.
+        with mp.Pool(processes=num_flush_workers, initializer=init_flush_worker, initargs=(dat_fd,)) as pool:
+            pool.map(flush_worker, jobs)
 
         total_segments = 0
-        print(
-            f"Parallel flush of {len(items_to_process)} blocks complete in {time.perf_counter() - flush_start_time:.2f} seconds.")
+        print(f"Parallel flush of {len(jobs)} blocks complete in {time.perf_counter() - flush_start_time:.2f} seconds.")
 
     # Main processing loop (serial)
     for raw_msg in gam_record_iter(gam_path):
