@@ -178,9 +178,12 @@ def load_existing_output_files(output_prefix):
 # Main Pipeline
 def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filter, use_existing):
     if use_existing:
+        print("Reusing existing .dat/.idx...")
         block_infos, dat_path, wanted_nodes = load_existing_output_files(output_prefix)
     else:
+        print("Initializing output files from PKL maxima...")
         block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
+        print(f"Output file created: {dat_path}")
 
     BUFFER_SEGMENTS = 1_000_000
     next_milestone, total_reads, total_segments = milestone_step, 0, 0
