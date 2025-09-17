@@ -38,6 +38,20 @@ def make_record_struct(max_read_len: int, max_cigar_len: int) -> struct.Struct:
 def record_size(max_read_len: int, max_cigar_len: int) -> int:
     return make_record_struct(max_read_len, max_cigar_len).size
 
+def to_cpp_block_infos(py_block_infos):
+    out = {}
+    for nid, info in py_block_infos.items():
+        bi = fast_writer.BlockInfo()
+        bi.offset        = int(info["offset"])
+        bi.n_records     = int(info["n_records"])
+        bi.current_pos   = int(info["current_pos"])
+        bi.max_read_len  = int(info["max_read_len"])
+        bi.max_cigar_len = int(info["max_cigar_len"])
+        bi.record_size   = int(info["record_size"])
+        bi.block_size    = int(info["block_size"])
+        out[int(nid)] = bi
+    return out
+
 # ─────────────────────────────────────────────────────────────────────────────
 # GAM parsing and Alignment Processing (Serial Helpers)
 def read_varint(stream):
@@ -184,6 +198,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     else:
         block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
 
+    block_infos_cpp = to_cpp_block_infos(block_infos)
     # BUFFER_SEGMENTS = 400_000_000
     BUFFER_SEGMENTS = 10_000
     next_milestone, total_reads, total_segments = milestone_step, 0, 0
@@ -211,7 +226,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
                 fast_writer.flush_entire_buffer(
                     dat_fd,
                     segment_buffer,
-                    block_infos,
+                    block_infos_cpp,
                     BLOCK_HDR_SIZE
                 )
             except Exception as e:
