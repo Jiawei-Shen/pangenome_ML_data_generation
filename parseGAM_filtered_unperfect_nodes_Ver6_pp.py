@@ -203,7 +203,7 @@ def flush_worker(job):
     'job' is a tuple: (buffer, write_position)
     """
     buf, write_pos = job
-    os.pwrite(g_fd, buf, write_pos)
+    # os.pwrite(g_fd, buf, write_pos)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
