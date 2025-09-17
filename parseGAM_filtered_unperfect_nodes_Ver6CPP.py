@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-"""
-GAM segment extractor with C++-accelerated packing and parallel pwrite.
-
-Requires:
-  - vg_pb2 (compiled protobuf for vg Alignment)
-  - fast_writer (pybind11 module providing Segment, BlockTable, flush_entire_buffer_parallel_dict)
-"""
-
 import argparse
 import gzip
 import pickle
@@ -15,9 +7,10 @@ import time
 import gc
 import os
 from collections import defaultdict
+import multiprocessing as mp
 
 import vg_pb2          # compiled protobuf Python file
-import fast_writer     # our C++ extension (Segment, BlockTable, flush_entire_buffer_parallel_dict)
+import fast_writer     # our C++ extension (Segment, BlockTable, prepare_write_jobs)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # File layout
@@ -28,35 +21,26 @@ GLOBAL_HEADER_SIZE = len(GLOBAL_MAGIC) + GLOBAL_VER_PACK.size
 BLOCK_HDR_PACK = struct.Struct("<I I H I I")
 BLOCK_HDR_SIZE = BLOCK_HDR_PACK.size
 
-
 def make_record_struct(max_read_len: int, max_cigar_len: int) -> struct.Struct:
-    # Matches C++: <h R s R s C s h c
     return struct.Struct(f"<h{max_read_len}s{max_read_len}s{max_cigar_len}shc")
-
 
 def record_size(max_read_len: int, max_cigar_len: int) -> int:
     return make_record_struct(max_read_len, max_cigar_len).size
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# GAM parsing and Alignment Processing (Serial Helpers)
+# Helpers for GAM parsing
 def read_varint(stream):
     value, shift_amount = 0, 0
     while True:
         b = stream.read(1)
-        if not b:
-            raise EOFError("EOF while reading varint")
+        if not b: raise EOFError("EOF while reading varint")
         v = b[0]
         value |= (v & 0x7F) << shift_amount
-        if not (v & 0x80):
-            return value
+        if not (v & 0x80): return value
         shift_amount += 7
 
-
 def file_is_gzip(path):
-    with open(path, "rb") as f:
-        return f.read(2) == b"\x1f\x8b"
-
+    with open(path, "rb") as f: return f.read(2) == b"\x1f\x8b"
 
 def gam_record_iter(path, tag="GAM"):
     open_func = gzip.open if file_is_gzip(path) else open
@@ -66,23 +50,20 @@ def gam_record_iter(path, tag="GAM"):
                 group_count = read_varint(f)
             except EOFError:
                 break
-            if group_count == 0:
-                continue
+            if group_count == 0: continue
             try:
                 tag_len = read_varint(f)
                 group_tag = f.read(tag_len).decode()
             except (EOFError, UnicodeDecodeError):
                 break
             if group_tag != tag:
-                for _ in range(group_count - 1):
-                    f.seek(read_varint(f), 1)
+                for _ in range(group_count - 1): f.seek(read_varint(f), 1)
                 continue
             for _ in range(group_count - 1):
                 try:
                     yield f.read(read_varint(f))
                 except EOFError:
                     break
-
 
 def process_alignment(raw_message, wanted_nodes, chrom_filter):
     """Return dict[nid] -> list[fast_writer.Segment] for segments overlapping wanted_nodes."""
@@ -98,8 +79,7 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
     for mapping in aln.path.mapping:
         nid = mapping.position.node_id
         if nid not in wanted_nodes:
-            for e in mapping.edit:
-                read_offset += e.to_length
+            for e in mapping.edit: read_offset += e.to_length
             continue
 
         node_offset = mapping.position.offset
@@ -123,19 +103,18 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
 
         seg = fast_writer.Segment(
             offset=int(node_offset),
-            seq="".join(seq_parts),  # str
-            bq=bytes(bq_parts).decode("latin1"),  # str (no data loss; 1:1)
-            cigar="".join(cigar_parts),  # str
+            seq="".join(seq_parts).encode(),            # bytes → std::string (no Unicode overhead)
+            bq=bytes(bq_parts),                          # bytes
+            cigar="".join(cigar_parts).encode(),         # bytes
             rq=int(mapq),
-            strand=("-" if mapping.position.is_reverse else "+")  # 1-char str
+            strand=int(strand_byte),                     # one byte
         )
         segment_dict.setdefault(nid, []).append(seg)
 
     return segment_dict
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# File Initialization
+# Output file init
 def initialize_output_files(stats_path, output_prefix):
     with open(stats_path, "rb") as fh:
         stats_data = pickle.load(fh)
@@ -158,7 +137,7 @@ def initialize_output_files(stats_path, output_prefix):
 
     block_infos = {}
     current_offset = GLOBAL_HEADER_SIZE
-    for nid in sorted(list(wanted_nodes)):  # Sort for deterministic layout
+    for nid in sorted(list(wanted_nodes)):  # deterministic layout
         nrec = node_counts[nid]
         R, C = maxima[nid]
         rec_sz = record_size(R, C)
@@ -180,8 +159,7 @@ def initialize_output_files(stats_path, output_prefix):
         f.write(GLOBAL_VER_PACK.pack(GLOBAL_MAJOR, GLOBAL_MINOR, len(block_infos), b'\x00' * 16))
         for nid, info in block_infos.items():
             f.write(BLOCK_HDR_PACK.pack(nid, info["n_records"], 0, info["max_read_len"], info["max_cigar_len"]))
-        # Pre-allocate the file
-        if current_offset > GLOBAL_HEADER_SIZE:
+        if current_offset > GLOBAL_HEADER_SIZE:  # pre-allocate file
             f.seek(current_offset - 1)
             f.write(b'\x00')
 
@@ -202,25 +180,34 @@ def initialize_output_files(stats_path, output_prefix):
 
     return block_infos, dat_path, wanted_nodes
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Multiprocess write-only worker
+def _pwrite_job(fd, pos, buf):
+    os.pwrite(fd, buf, pos)
 
-def load_existing_output_files(_output_prefix):
-    raise NotImplementedError("--use-existing is not implemented yet.")
-
+def flush_with_multiprocess_writers(dat_fd, segment_buffer, state, block_hdr_size, num_procs):
+    if not segment_buffer:
+        return
+    # Prepare write jobs in C++ (packs data; advances current_pos)
+    jobs = fast_writer.prepare_write_jobs(segment_buffer, state, block_hdr_size)
+    # Fan-out the writes across processes
+    # NOTE: On Linux, default start method is 'fork' → fd is inherited.
+    ctx = mp.get_context("fork")
+    with ctx.Pool(processes=num_procs) as pool:
+        pool.starmap(_pwrite_job, ((dat_fd, pos, buf) for (pos, buf) in jobs))
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main Pipeline
-def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filter, use_existing, num_threads):
+# Pipeline
+def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filter, use_existing, num_procs):
     if use_existing:
-        block_infos, dat_path, wanted_nodes = load_existing_output_files(output_prefix)
+        raise NotImplementedError("--use-existing is not implemented yet.")
     else:
         block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
 
-    # Build persistent C++ state ONCE (holds and updates current_pos internally)
+    # Persistent C++ state (tracks current_pos internally)
     state = fast_writer.BlockTable(block_infos)
 
-    # Tune this depending on memory; bigger = fewer flushes
-    BUFFER_SEGMENTS = 1_000_000
-
+    BUFFER_SEGMENTS = 1_000_000  # tune for your RAM & job size
     next_milestone, total_reads, total_segments = milestone_step, 0, 0
     start_time = time.perf_counter()
 
@@ -229,7 +216,6 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
 
     segment_buffer = defaultdict(list)
 
-    # Main processing loop (serial parse → batch flush to C++)
     for raw_msg in gam_record_iter(gam_path):
         segs_by_node = process_alignment(raw_msg, wanted_nodes, chrom_filter)
         total_reads += 1
@@ -239,40 +225,24 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
             total_segments += len(segs)
 
         if total_segments >= BUFFER_SEGMENTS:
-            print(f"Buffer full. Flushing {len(segment_buffer)} node blocks to disk via C++...")
+            print(f"Buffer full. Flushing {len(segment_buffer)} node blocks with {num_procs} writer processes...")
             t0 = time.perf_counter()
-            fast_writer.flush_entire_buffer_parallel_dict(
-                dat_fd,
-                segment_buffer,   # dict[int -> list[fast_writer.Segment]]
-                state,            # fast_writer.BlockTable
-                BLOCK_HDR_SIZE,
-                num_threads=num_threads,
-                sort_by_offset=True,
-            )
+            flush_with_multiprocess_writers(dat_fd, segment_buffer, state, BLOCK_HDR_SIZE, num_procs)
             segment_buffer.clear()
             total_segments = 0
-            print(f"C++ flush complete in {time.perf_counter() - t0:.2f} seconds.")
+            print(f"Flush done in {time.perf_counter() - t0:.2f} s.")
 
         if total_reads >= next_milestone:
             elapsed = time.perf_counter() - start_time
-            print(f"{total_reads:,} reads processed | {elapsed:.1f} seconds")
+            print(f"{total_reads:,} reads processed | {elapsed:.1f} s")
             next_milestone += milestone_step
 
-    # Final flush
     if segment_buffer:
-        print(f"Processing final {len(segment_buffer)} node blocks...")
+        print(f"Final flush of {len(segment_buffer)} node blocks with {num_procs} writer processes...")
         t0 = time.perf_counter()
-        fast_writer.flush_entire_buffer_parallel_dict(
-            dat_fd,
-            segment_buffer,
-            state,
-            BLOCK_HDR_SIZE,
-            num_threads=num_threads,
-            sort_by_offset=True,
-        )
+        flush_with_multiprocess_writers(dat_fd, segment_buffer, state, BLOCK_HDR_SIZE, num_procs)
         segment_buffer.clear()
-        total_segments = 0
-        print(f"Final C++ flush complete in {time.perf_counter() - t0:.2f} seconds.")
+        print(f"Final flush done in {time.perf_counter() - t0:.2f} s.")
 
     dat_fh.close()
 
@@ -280,15 +250,13 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     print("\nFinal Summary:")
     print(f"  Total reads processed: {total_reads:,}")
     print(f"  Nodes included: {len(block_infos)}")
-    print(f"  Elapsed time: {elapsed:.2f} seconds")
-
+    print(f"  Elapsed time: {elapsed:.2f} s")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Entry Point
 def main():
     parser = argparse.ArgumentParser(
-        description="GAM segment extractor with C++-accelerated writing.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description="GAM segment extractor with C++ packing and multi-process pwrite.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("gam_path", help="Path to the GAM file")
     parser.add_argument("stats_pickle", help="Path to the stats pickle with node maxima")
@@ -296,7 +264,7 @@ def main():
     parser.add_argument("--milestone", type=int, default=1_000_000, help="Progress report interval")
     parser.add_argument("--chr", default="", help="Optional chromosome name to filter on")
     parser.add_argument("--use-existing", action="store_true", help="Reuse existing initialized output files")
-    parser.add_argument("--threads", type=int, default=4, help="Number of C++ writer threads")
+    parser.add_argument("--writers", type=int, default=4, help="Number of parallel writer processes")
     args = parser.parse_args()
 
     run_pipeline(
@@ -306,9 +274,8 @@ def main():
         milestone_step=args.milestone,
         chrom_filter=args.chr,
         use_existing=args.use_existing,
-        num_threads=args.threads,
+        num_procs=args.writers,
     )
-
 
 if __name__ == "__main__":
     main()
