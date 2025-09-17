@@ -7,11 +7,12 @@ import time
 import gc
 import os
 from collections import defaultdict
-from multiprocessing.pool import ThreadPool
+from multiprocessing.pool import ThreadPool  # Using ThreadPool is more efficient here
 import vg_pb2  # Assumes you have the compiled protobuf Python file
 
 
-# ... (Code from Segment class to worker functions remains the same) ...
+# ... (The rest of the script from Segment class to load_existing_output_files is unchanged) ...
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Segment container
 class Segment:
@@ -19,20 +20,169 @@ class Segment:
 
     def __init__(self, offset, seq, bq, cigar, rq, strand):
         self.offset = offset
-        self.seq = seq
-        self.bq = bq
-        self.cigar = cigar
-        self.rq = rq
-        self.strand = strand
+        self.seq = seq  # bytes (unpadded)
+        self.bq = bq  # bytes (unpadded)
+        self.cigar = cigar  # bytes (unpadded)
+        self.rq = rq  # int (MAPQ)
+        self.strand = strand  # b'+' or b'-'
 
 
-# ... (rest of unchanged code) ...
+# ─────────────────────────────────────────────────────────────────────────────
+# File layout
+GLOBAL_MAGIC = b"MYFMT\x01"
+GLOBAL_VER_PACK = struct.Struct("<BBI16s")
+GLOBAL_MAJOR, GLOBAL_MINOR = 0, 5
+GLOBAL_HEADER_SIZE = len(GLOBAL_MAGIC) + GLOBAL_VER_PACK.size
+BLOCK_HDR_PACK = struct.Struct("<I I H I I")
+BLOCK_HDR_SIZE = BLOCK_HDR_PACK.size
+
+
+def make_record_struct(max_read_len: int, max_cigar_len: int) -> struct.Struct:
+    return struct.Struct(f"<h{max_read_len}s{max_read_len}s{max_cigar_len}shc")
+
+
+def record_size(max_read_len: int, max_cigar_len: int) -> int:
+    return make_record_struct(max_read_len, max_cigar_len).size
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GAM parsing and Alignment Processing (Serial Helpers)
+def read_varint(stream):
+    value, shift_amount = 0, 0
+    while True:
+        b = stream.read(1)
+        if not b: raise EOFError("EOF while reading varint")
+        v = b[0]
+        value |= (v & 0x7F) << shift_amount
+        if not (v & 0x80): return value
+        shift_amount += 7
+
 
 def file_is_gzip(path):
     with open(path, "rb") as f: return f.read(2) == b"\x1f\x8b"
 
 
-# ... (rest of unchanged code) ...
+def gam_record_iter(path, tag="GAM"):
+    open_func = gzip.open if file_is_gzip(path) else open
+    with open_func(path, "rb") as f:
+        while True:
+            try:
+                group_count = read_varint(f)
+            except EOFError:
+                break
+            if group_count == 0: continue
+            try:
+                tag_len = read_varint(f)
+                group_tag = f.read(tag_len).decode()
+            except (EOFError, UnicodeDecodeError):
+                break
+            if group_tag != tag:
+                for _ in range(group_count - 1): f.seek(read_varint(f), 1)
+                continue
+            for _ in range(group_count - 1):
+                try:
+                    yield f.read(read_varint(f))
+                except EOFError:
+                    break
+
+
+def process_alignment(raw_message, wanted_nodes, chrom_filter):
+    segment_dict = {}
+    aln = vg_pb2.Alignment()
+    aln.ParseFromString(raw_message)
+
+    if aln.mapping_quality <= 10 or (chrom_filter and not any(pos.name == chrom_filter for pos in aln.refpos)):
+        return segment_dict
+
+    read_sequence, read_quality, mapq, read_offset = aln.sequence, aln.quality, aln.mapping_quality, 0
+
+    for mapping in aln.path.mapping:
+        nid = mapping.position.node_id
+        if nid not in wanted_nodes:
+            for e in mapping.edit: read_offset += e.to_length
+            continue
+
+        node_offset = mapping.position.offset
+        strand_char = b"-" if mapping.position.is_reverse else b"+"
+        seq_parts, bq_parts, cigar_parts = [], bytearray(), []
+
+        for e in mapping.edit:
+            fL, tL = e.from_length, e.to_length
+            if fL == tL:
+                cigar_parts.append(f"{fL}M" if not e.sequence else f"{fL}X")
+            elif fL > 0 and tL == 0:
+                cigar_parts.append(f"{fL}D")
+            elif fL == 0 and tL > 0:
+                cigar_parts.append(f"{tL}I")
+
+            if tL > 0:
+                seq_parts.append(read_sequence[read_offset: read_offset + tL].upper())
+                bq_parts.extend(read_quality[read_offset: read_offset + tL])
+                read_offset += tL
+
+        seg = Segment(offset=node_offset, seq="".join(seq_parts).encode(), bq=bytes(bq_parts),
+                      cigar="".join(cigar_parts).encode(), rq=mapq, strand=strand_char)
+        segment_dict.setdefault(nid, []).append(seg)
+    return segment_dict
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# File Initialization (Unchanged)
+def initialize_output_files(stats_path, output_prefix):
+    with open(stats_path, "rb") as fh:
+        stats_data = pickle.load(fh)
+
+    wanted_nodes, node_counts, maxima = set(), {}, {}
+    for node_id_key, stat in stats_data.items():
+        nid = int(node_id_key)
+        perfect = int(stat.get("perfect", 0))
+        not_perfect = int(stat.get("not_perfect", 0))
+        if (perfect + not_perfect) > 0 and not_perfect > 1 and not_perfect / (perfect + not_perfect) > 0.05:
+            wanted_nodes.add(nid)
+            node_counts[nid] = perfect + not_perfect
+            R = int(stat.get("max_read_length", 1) or 1)
+            C = int(stat.get("max_cigar_length", 1) or 1)
+            maxima[nid] = (max(1, R), max(1, C))
+
+    print(f"Filtered {len(wanted_nodes)} nodes from {len(stats_data)} total.")
+    del stats_data
+    gc.collect()
+
+    block_infos = {}
+    current_offset = GLOBAL_HEADER_SIZE
+    for nid in sorted(list(wanted_nodes)):  # Sort for deterministic layout
+        nrec = node_counts[nid]
+        R, C = maxima[nid]
+        rec_sz = record_size(R, C)
+        blk_sz = BLOCK_HDR_SIZE + nrec * rec_sz
+        block_infos[nid] = {"offset": current_offset, "n_records": nrec, "current_pos": 0,
+                            "max_read_len": R, "max_cigar_len": C, "record_size": rec_sz, "block_size": blk_sz}
+        current_offset += blk_sz
+
+    dat_path = output_prefix + ".dat"
+    with open(dat_path, "wb") as f:
+        f.write(GLOBAL_MAGIC)
+        f.write(GLOBAL_VER_PACK.pack(GLOBAL_MAJOR, GLOBAL_MINOR, len(block_infos), b'\x00' * 16))
+        for nid, info in block_infos.items():
+            f.write(BLOCK_HDR_PACK.pack(nid, info["n_records"], 0, info["max_read_len"], info["max_cigar_len"]))
+        # Pre-allocate the file by seeking to the end and writing a null byte
+        if current_offset > GLOBAL_HEADER_SIZE:
+            f.seek(current_offset - 1)
+            f.write(b'\x00')
+
+    idx_path = output_prefix + ".idx"
+    with open(idx_path, "wb") as idx:
+        idx.write(struct.pack("<I", len(block_infos)))
+        for nid, info in block_infos.items():
+            idx.write(struct.pack("<I Q I I H I I", nid, info["offset"], info["block_size"],
+                                  info["n_records"], 0, info["max_read_len"], info["max_cigar_len"]))
+
+    return block_infos, dat_path, wanted_nodes
+
+
+def load_existing_output_files(output_prefix):
+    # This function remains unchanged from your provided script.
+    pass
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PARALLEL FLUSH WORKER FUNCTIONS
@@ -59,8 +209,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     else:
         block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
 
-    # BUFFER_SEGMENTS = 400_000_000
-    BUFFER_SEGMENTS = 1_000_000
+    BUFFER_SEGMENTS = 400_000_000
     next_milestone, total_reads, total_segments = milestone_step, 0, 0
     start_time = time.perf_counter()
 
