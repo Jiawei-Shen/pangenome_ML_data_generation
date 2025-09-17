@@ -215,7 +215,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
                 fast_writer.flush_entire_buffer(
                     dat_fd,
                     segment_buffer,
-                    block_infos,
+                    block_infos.items()[:10],
                     BLOCK_HDR_SIZE
                 )
             except Exception as e:
