@@ -29,6 +29,15 @@ add_executable(gam_processor
     ${PROTO_HDRS}
 )
 
+# --- CORRECTED SECTION ---
+# Tell the compiler where to find the Protobuf headers
+target_include_directories(gam_processor
+    PRIVATE
+    ${Protobuf_INCLUDE_DIRS}
+)
+# --- END CORRECTED SECTION ---
+
+
 # Link libraries to the executable
 target_link_libraries(gam_processor
     PRIVATE
