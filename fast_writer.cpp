@@ -62,9 +62,9 @@ void write_node_data(int fd, long long write_pos, const std::vector<Segment>& se
     }
 
 //    ssize_t bytes_written = pwrite(fd, buffer.data(), buffer.size(), write_pos);
-    if (bytes_written == -1 || static_cast<size_t>(bytes_written) != buffer.size()) {
-        throw std::runtime_error("pwrite failed for a data block.");
-    }
+//    if (bytes_written == -1 || static_cast<size_t>(bytes_written) != buffer.size()) {
+//        throw std::runtime_error("pwrite failed for a data block.");
+//    }
 }
 
 // NEW: The main function that loops through the entire buffer.
