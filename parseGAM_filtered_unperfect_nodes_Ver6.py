@@ -344,7 +344,8 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     total_segments = 0
     start_time = time.perf_counter()
 
-    dat_fh = open(dat_path, "r+b")
+    # dat_fh = open(dat_path, "r+b")
+    fd = os.open(dat_path, os.O_RDWR)
     segment_buffer = defaultdict(list)
 
     def flush_segment_buffer():
@@ -352,7 +353,6 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         if not segment_buffer:
             return
 
-        # Drain safely to avoid "dict changed size during iteration"
         while segment_buffer:
             nid, segs = segment_buffer.popitem()
             if not segs:
@@ -368,7 +368,6 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
             rec_pack = make_record_struct(R, C)
             rec_sz = info["record_size"]
 
-            # --- only change: preallocate once, then pack_into ---
             n = len(segs)
             buf = bytearray(rec_sz * n)
             off = 0
@@ -383,11 +382,10 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
                     s.strand if s.strand in (b'+', b'-') else b'+'
                 )
                 off += rec_sz
-            # -----------------------------------------------------
 
             pos = base_offset + info["current_pos"] * rec_sz
-            dat_fh.seek(pos, os.SEEK_SET)
-            dat_fh.write(buf)
+            # single syscall; does not affect file pointer
+            os.pwrite(fd, buf, pos)
             info["current_pos"] += n
 
         total_segments = 0
