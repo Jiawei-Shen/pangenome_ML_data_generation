@@ -1,119 +1,143 @@
-// file: fast_writer.cpp
+// fast_writer_mt.cpp (only the new bits; keep your Segment/BlockInfo/write_node_data)
+
 #include <pybind11/pybind11.h>
-#include <pybind11/stl.h> // For automatic conversions of dicts and lists
+#include <pybind11/stl.h>
+#include <thread>
+#include <future>
+#include <mutex>
 #include <vector>
-#include <string>
-#include <cstdint>
-#include <cstring>
-#include <stdexcept>
 #include <unistd.h>
-#include <unordered_map>
-#include <iostream> // <-- ADD THIS LINE
+#include <cerrno>
+#include <system_error>
 
 namespace py = pybind11;
 
-// The Segment struct remains the same
-struct Segment {
-    int16_t offset;
-    std::string seq;
-    std::string bq;
-    std::string cigar;
-    int16_t rq;
-    char strand;
-};
-
-// NEW: A struct to hold the data from the block_infos dictionary
-// pybind11 will automatically convert a Python dict with matching keys
-// into this struct.
-struct BlockInfo {
-    uint64_t offset;
-    uint32_t n_records;
-    uint32_t current_pos;
-    uint32_t max_read_len;
-    uint32_t max_cigar_len;
-    uint32_t record_size;
-    uint64_t block_size;
-};
-
-// Internal helper function for writing one node's data.
-// This is the logic from our old C++ function. It's not exposed to Python anymore.
-void write_node_data(int fd, long long write_pos, const std::vector<Segment>& segments, int max_read_len, int max_cigar_len) {
-    if (segments.empty()) {
-        return;
+// Robust full-write helper (handles partial pwrite)
+static void pwrite_full(int fd, const char* buf, size_t total, off_t pos) {
+    size_t done = 0;
+    while (done < total) {
+        ssize_t n = ::pwrite(fd, buf + done, total - done, pos + done);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            throw std::system_error(errno, std::generic_category(), "pwrite");
+        }
+        done += static_cast<size_t>(n);
     }
+}
+
+// Same as before but uses pwrite_full
+static void write_node_data_full(
+    int fd, long long write_pos,
+    const std::vector<Segment>& segments,
+    int max_read_len, int max_cigar_len)
+{
+    if (segments.empty()) return;
+
     size_t record_size = sizeof(int16_t) + max_read_len * 2 + max_cigar_len + sizeof(int16_t) + sizeof(char);
     size_t total_buffer_size = segments.size() * record_size;
     std::vector<char> buffer(total_buffer_size);
-    char* current_ptr = buffer.data();
+    char* cur = buffer.data();
 
     for (const auto& s : segments) {
-        memcpy(current_ptr, &s.offset, sizeof(int16_t)); current_ptr += sizeof(int16_t);
-        memcpy(current_ptr, s.seq.c_str(), s.seq.length());
-        memset(current_ptr + s.seq.length(), 0, max_read_len - s.seq.length());
-        current_ptr += max_read_len;
-        memcpy(current_ptr, s.bq.c_str(), s.bq.length());
-        memset(current_ptr + s.bq.length(), 0, max_read_len - s.bq.length());
-        current_ptr += max_read_len;
-        memcpy(current_ptr, s.cigar.c_str(), s.cigar.length());
-        memset(current_ptr + s.cigar.length(), 0, max_cigar_len - s.cigar.length());
-        current_ptr += max_cigar_len;
-        memcpy(current_ptr, &s.rq, sizeof(int16_t)); current_ptr += sizeof(int16_t);
-        memcpy(current_ptr, &s.strand, sizeof(char)); current_ptr += sizeof(char);
+        memcpy(cur, &s.offset, sizeof(int16_t)); cur += sizeof(int16_t);
+
+        // seq
+        size_t sl = s.seq.size(); if (sl > (size_t)max_read_len) sl = max_read_len;
+        memcpy(cur, s.seq.data(), sl);
+        memset(cur + sl, 0, max_read_len - sl);
+        cur += max_read_len;
+
+        // bq
+        size_t bl = s.bq.size(); if (bl > (size_t)max_read_len) bl = max_read_len;
+        memcpy(cur, s.bq.data(), bl);
+        memset(cur + bl, 0, max_read_len - bl);
+        cur += max_read_len;
+
+        // cigar
+        size_t cl = s.cigar.size(); if (cl > (size_t)max_cigar_len) cl = max_cigar_len;
+        memcpy(cur, s.cigar.data(), cl);
+        memset(cur + cl, 0, max_cigar_len - cl);
+        cur += max_cigar_len;
+
+        memcpy(cur, &s.rq, sizeof(int16_t)); cur += sizeof(int16_t);
+        memcpy(cur, &s.strand, sizeof(char)); cur += sizeof(char);
     }
 
-//    ssize_t bytes_written = pwrite(fd, buffer.data(), buffer.size(), write_pos);
-//    if (bytes_written == -1 || static_cast<size_t>(bytes_written) != buffer.size()) {
-//        throw std::runtime_error("pwrite failed for a data block.");
-//    }
+    pwrite_full(fd, buffer.data(), buffer.size(), write_pos);
 }
 
-// NEW: The main function that loops through the entire buffer.
-// It takes block_infos by reference (&) so it can modify current_pos.
-void flush_entire_buffer(
+// Multithreaded flush: parallelize per-node writes
+void flush_entire_buffer_mt(
     int fd,
     const std::unordered_map<uint32_t, std::vector<Segment>>& segment_buffer,
     std::unordered_map<uint32_t, BlockInfo>& block_infos,
-    const uint32_t block_header_size)
+    const uint32_t block_header_size,
+    unsigned max_workers /* e.g., std::thread::hardware_concurrency() */)
 {
-    for (const auto& pair : segment_buffer) {
-        uint32_t nid = pair.first;
-        const std::vector<Segment>& segs = pair.second;
+    if (segment_buffer.empty()) return;
+    if (max_workers == 0) max_workers = 1;
 
-        try {
-            // Use .at() to get a reference to the info struct.
-            // This will throw an error if nid is not in block_infos.
-            BlockInfo& info = block_infos.at(nid);
+    struct Job {
+        uint32_t nid;
+        const std::vector<Segment>* segs;
+        BlockInfo* info;
+        long long write_pos;
+    };
 
-            // 1. C++ calculates the metadata
-            long long base_offset = info.offset + block_header_size;
-            long long write_pos = base_offset + (long long)info.current_pos * info.record_size;
+    std::vector<Job> jobs;
+    jobs.reserve(segment_buffer.size());
 
-            // 2. C++ does the serialization and writing by calling the helper
-            write_node_data(fd, write_pos, segs, info.max_read_len, info.max_cigar_len);
+    // 1) Build jobs with a snapshot of current_pos (serial, no races)
+    for (const auto& kv : segment_buffer) {
+        uint32_t nid = kv.first;
+        auto it = block_infos.find(nid);
+        if (it == block_infos.end()) continue;
+        BlockInfo* info = &it->second;
+        if (kv.second.empty()) continue;
 
-            // 3. C++ updates the current_pos. This modification will be
-            // reflected back in the Python dictionary.
-            info.current_pos += segs.size();
+        long long base_offset = static_cast<long long>(info->offset) + block_header_size;
+        long long write_pos = base_offset + static_cast<long long>(info->current_pos) * info->record_size;
 
-        } catch (const std::out_of_range& oor) {
-            // Handle cases where a node ID from the buffer isn't in block_infos
-            // For now, we just print a warning and continue.
-            // You could also throw an exception back to Python if this is a critical error.
-            // std::cerr << "Warning: Node ID " << nid << " not found in block_infos. Skipping." << std::endl;
+        jobs.push_back(Job{nid, &kv.second, info, write_pos});
+    }
+
+    // 2) Simple thread pool via futures (work stealing could be added if needed)
+    std::vector<std::future<void>> futs;
+    futs.reserve(jobs.size());
+    std::atomic<size_t> idx{0};
+
+    auto worker = [&]() {
+        for (;;) {
+            size_t i = idx.fetch_add(1);
+            if (i >= jobs.size()) break;
+            const Job& job = jobs[i];
+            write_node_data_full(
+                fd, job.write_pos,
+                *job.segs,
+                job.info->max_read_len,
+                job.info->max_cigar_len
+            );
         }
+    };
+
+    unsigned threads = std::min<unsigned>(max_workers, jobs.size());
+    std::vector<std::thread> pool;
+    pool.reserve(threads);
+    for (unsigned t = 0; t < threads; ++t) pool.emplace_back(worker);
+    for (auto& th : pool) th.join();
+
+    // 3) Serially update current_pos after successful writes (avoids races)
+    for (const auto& job : jobs) {
+        job.info->current_pos += static_cast<uint32_t>(job.segs->size());
     }
 }
 
-// pybind11 module definition
 PYBIND11_MODULE(fast_writer, m) {
     m.doc() = "C++ module for processing and writing segment data buffers.";
 
     py::class_<Segment>(m, "Segment")
-        .def(py::init<int16_t, std::string, std::string, std::string, int16_t, char>(),
-             py::arg("offset"), py::arg("seq"), py::arg("bq"),
-             py::arg("cigar"), py::arg("rq"), py::arg("strand"));
+        .def(py::init<int16_t, std::string, std::string, std::string, int16_t, char>());
 
-    // Expose the BlockInfo struct to Python
     py::class_<BlockInfo>(m, "BlockInfo")
         .def(py::init<>())
         .def_readwrite("offset", &BlockInfo::offset)
@@ -124,9 +148,16 @@ PYBIND11_MODULE(fast_writer, m) {
         .def_readwrite("record_size", &BlockInfo::record_size)
         .def_readwrite("block_size", &BlockInfo::block_size);
 
-    // Expose the new main function
+    // Single-thread version (your original)
     m.def("flush_entire_buffer", &flush_entire_buffer,
-          "Processes the entire segment buffer and writes to disk.",
           py::arg("fd"), py::arg("segment_buffer"),
           py::arg("block_infos"), py::arg("block_header_size"));
+
+    // Multithread version — releases the GIL so threads actually run in parallel
+    m.def("flush_entire_buffer_mt",
+          &flush_entire_buffer_mt,
+          py::arg("fd"), py::arg("segment_buffer"),
+          py::arg("block_infos"), py::arg("block_header_size"),
+          py::arg("max_workers") = std::thread::hardware_concurrency(),
+          py::call_guard<py::gil_scoped_release>());
 }
