@@ -36,6 +36,8 @@ struct BlockInfo {
 
 // Internal helper function for writing one node's data.
 // This is the logic from our old C++ function. It's not exposed to Python anymore.
+// Replace the old write_node_data function with this one.
+
 void write_node_data(int fd, long long write_pos, const std::vector<Segment>& segments, int max_read_len, int max_cigar_len) {
     if (segments.empty()) {
         return;
@@ -47,15 +49,31 @@ void write_node_data(int fd, long long write_pos, const std::vector<Segment>& se
 
     for (const auto& s : segments) {
         memcpy(current_ptr, &s.offset, sizeof(int16_t)); current_ptr += sizeof(int16_t);
-        memcpy(current_ptr, s.seq.c_str(), s.seq.length());
-        memset(current_ptr + s.seq.length(), 0, max_read_len - s.seq.length());
+
+        // --- SAFER SEQUENCE HANDLING ---
+        size_t seq_len_to_copy = std::min(s.seq.length(), static_cast<size_t>(max_read_len));
+        memcpy(current_ptr, s.seq.c_str(), seq_len_to_copy);
+        if (seq_len_to_copy < max_read_len) {
+            memset(current_ptr + seq_len_to_copy, 0, max_read_len - seq_len_to_copy);
+        }
         current_ptr += max_read_len;
-        memcpy(current_ptr, s.bq.c_str(), s.bq.length());
-        memset(current_ptr + s.bq.length(), 0, max_read_len - s.bq.length());
+
+        // --- SAFER BASE QUALITY HANDLING ---
+        size_t bq_len_to_copy = std::min(s.bq.length(), static_cast<size_t>(max_read_len));
+        memcpy(current_ptr, s.bq.c_str(), bq_len_to_copy);
+        if (bq_len_to_copy < max_read_len) {
+            memset(current_ptr + bq_len_to_copy, 0, max_read_len - bq_len_to_copy);
+        }
         current_ptr += max_read_len;
-        memcpy(current_ptr, s.cigar.c_str(), s.cigar.length());
-        memset(current_ptr + s.cigar.length(), 0, max_cigar_len - s.cigar.length());
+
+        // --- SAFER CIGAR HANDLING ---
+        size_t cigar_len_to_copy = std::min(s.cigar.length(), static_cast<size_t>(max_cigar_len));
+        memcpy(current_ptr, s.cigar.c_str(), cigar_len_to_copy);
+        if (cigar_len_to_copy < max_cigar_len) {
+            memset(current_ptr + cigar_len_to_copy, 0, max_cigar_len - cigar_len_to_copy);
+        }
         current_ptr += max_cigar_len;
+
         memcpy(current_ptr, &s.rq, sizeof(int16_t)); current_ptr += sizeof(int16_t);
         memcpy(current_ptr, &s.strand, sizeof(char)); current_ptr += sizeof(char);
     }
@@ -65,7 +83,6 @@ void write_node_data(int fd, long long write_pos, const std::vector<Segment>& se
         throw std::runtime_error("pwrite failed for a data block.");
     }
 }
-
 // NEW: The main function that loops through the entire buffer.
 // It takes block_infos by reference (&) so it can modify current_pos.
 void flush_entire_buffer(
