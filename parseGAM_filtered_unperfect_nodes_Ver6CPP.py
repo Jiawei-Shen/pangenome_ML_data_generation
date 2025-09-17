@@ -184,7 +184,6 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     else:
         block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
 
-    block_infos = {377: {'offset': 3730, 'n_records': 13, 'current_pos': 0, 'max_read_len': 110, 'max_cigar_len': 21, 'record_size': 246, 'block_size': 3216}, 768: {'offset': 6946, 'n_records': 3, 'current_pos': 0, 'max_read_len': 1, 'max_cigar_len': 2, 'record_size': 9, 'block_size': 45}}
     # BUFFER_SEGMENTS = 400_000_000
     BUFFER_SEGMENTS = 10_000
     next_milestone, total_reads, total_segments = milestone_step, 0, 0

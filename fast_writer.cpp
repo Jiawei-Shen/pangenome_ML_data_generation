@@ -96,7 +96,7 @@ void flush_entire_buffer(
 
             // 3. C++ updates the current_pos. This modification will be
             // reflected back in the Python dictionary.
-            info.current_pos += segs.size();
+//            info.current_pos += segs.size();
 
         } catch (const std::out_of_range& oor) {
             // Handle cases where a node ID from the buffer isn't in block_infos
