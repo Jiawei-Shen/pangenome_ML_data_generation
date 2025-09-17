@@ -184,9 +184,9 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     else:
         block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
 
-    from itertools import islice
-
-    block_infos = dict(islice(block_infos.items(), 10))
+    # from itertools import islice
+    #
+    # block_infos = dict(islice(block_infos.items(), 10))
 
     # BUFFER_SEGMENTS = 400_000_000
     BUFFER_SEGMENTS = 10_000
