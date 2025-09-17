@@ -306,7 +306,8 @@ PYBIND11_MODULE(fast_writer, m) {
         .def_readwrite("record_size",   &BlockInfo::record_size)
         .def_readwrite("block_size",    &BlockInfo::block_size);
 
-    py::class_(BlockTable)(m, "BlockTable")
+    // ✅ FIXED: angle brackets
+    py::class_<BlockTable>(m, "BlockTable")
         .def(py::init<py::dict>())
         .def("to_py_dict", &BlockTable::to_py_dict);
 
@@ -317,23 +318,11 @@ PYBIND11_MODULE(fast_writer, m) {
           py::arg("state"),
           py::arg("block_header_size"),
           py::arg("num_threads") = (int)std::thread::hardware_concurrency(),
-          py::arg("sort_by_offset") = true,
-          R"doc(
-          Parallel pack & pwrite using Python dict of Segment lists (zero-copy).
-          Args:
-            fd: open file descriptor for the .dat file
-            segment_buffer: dict[int -> list[Segment]]
-            state: fast_writer.BlockTable holding block_infos (persistent)
-            block_header_size: size in bytes of per-block header (BLOCK_HDR_SIZE)
-            num_threads: worker threads (default: hardware_concurrency())
-            sort_by_offset: if True, writes in ascending file offset to reduce seeks
-          )doc");
+          py::arg("sort_by_offset") = true);
 
     // Legacy serial function (kept for compatibility)
     m.def("flush_entire_buffer", &flush_entire_buffer,
           py::arg("fd"), py::arg("segment_buffer"),
-          py::arg("block_infos"), py::arg("block_header_size"),
-          R"doc(
-          Serial pack & pwrite (STL-converting). Prefer flush_entire_buffer_parallel_dict.
-          )doc");
+          py::arg("block_infos"), py::arg("block_header_size"));
 }
+
