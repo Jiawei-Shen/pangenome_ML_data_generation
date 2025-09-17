@@ -183,26 +183,29 @@ PYBIND11_MODULE(fast_writer, m) {
 
     // Accept both str and bytes from Python for the string-like fields.
     py::class_<Segment>(m, "Segment")
-        // str-based constructor
+    // existing str-based ctor
         .def(py::init<int16_t, std::string, std::string, std::string, int16_t, char>(),
              py::arg("offset"), py::arg("seq"), py::arg("bq"),
              py::arg("cigar"), py::arg("rq"), py::arg("strand"))
-        // bytes + int strand overload (faster path)
+        // bytes + int strand overload **with named args**
         .def(py::init([](int16_t offset,
                          py::bytes seq,
                          py::bytes bq,
                          py::bytes cigar,
                          int16_t rq,
                          int strand) {
-            Segment s{};
-            s.offset = offset;
-            s.seq    = std::string(seq);
-            s.bq     = std::string(bq);
-            s.cigar  = std::string(cigar);
-            s.rq     = rq;
-            s.strand = static_cast<char>(strand);
-            return s;
-        }));
+                Segment s{};
+                s.offset = offset;
+                s.seq    = std::string(seq);
+                s.bq     = std::string(bq);
+                s.cigar  = std::string(cigar);
+                s.rq     = rq;
+                s.strand = static_cast<char>(strand);
+                return s;
+        }),
+        py::arg("offset"), py::arg("seq"), py::arg("bq"),
+        py::arg("cigar"), py::arg("rq"), py::arg("strand"));
+
 
     py::class_<BlockInfo>(m, "BlockInfo")
         .def(py::init<>())

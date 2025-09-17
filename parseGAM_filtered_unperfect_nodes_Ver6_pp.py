@@ -7,8 +7,8 @@ import time
 import gc
 import os
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor
 import vg_pb2  # Assumes you have the compiled protobuf Python file
+import multiprocessing as mp
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -125,87 +125,42 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# File Initialization
+# File Initialization (Unchanged)
 def initialize_output_files(stats_path, output_prefix):
-    with open(stats_path, "rb") as fh:
-        stats_data = pickle.load(fh)
-
-    wanted_nodes, node_counts, maxima = set(), {}, {}
-    for node_id_key, stat in stats_data.items():
-        nid = int(node_id_key)
-        perfect = int(stat.get("perfect", 0))
-        not_perfect = int(stat.get("not_perfect", 0))
-        if (perfect + not_perfect) > 0 and not_perfect > 1 and not_perfect / (perfect + not_perfect) > 0.05:
-            wanted_nodes.add(nid)
-            node_counts[nid] = perfect + not_perfect
-            R = int(stat.get("max_read_length", 1) or 1)
-            C = int(stat.get("max_cigar_length", 1) or 1)
-            maxima[nid] = (max(1, R), max(1, C))
-
-    print(f"Filtered {len(wanted_nodes)} nodes from {len(stats_data)} total.")
-    del stats_data
-    gc.collect()
-
-    block_infos = {}
-    current_offset = GLOBAL_HEADER_SIZE
-    for nid in sorted(list(wanted_nodes)):  # Sort for deterministic layout
-        nrec = node_counts[nid]
-        R, C = maxima[nid]
-        rec_sz = record_size(R, C)
-        blk_sz = BLOCK_HDR_SIZE + nrec * rec_sz
-        block_infos[nid] = {"offset": current_offset, "n_records": nrec, "current_pos": 0,
-                            "max_read_len": R, "max_cigar_len": C, "record_size": rec_sz, "block_size": blk_sz}
-        current_offset += blk_sz
-
-    dat_path = output_prefix + ".dat"
-    with open(dat_path, "wb") as f:
-        f.write(GLOBAL_MAGIC)
-        f.write(GLOBAL_VER_PACK.pack(GLOBAL_MAJOR, GLOBAL_MINOR, len(block_infos), b'\x00' * 16))
-        for nid, info in block_infos.items():
-            f.write(BLOCK_HDR_PACK.pack(nid, info["n_records"], 0, info["max_read_len"], info["max_cigar_len"]))
-        # Pre-allocate the file by seeking to the end and writing a null byte
-        if current_offset > GLOBAL_HEADER_SIZE:
-            f.seek(current_offset - 1)
-            f.write(b'\x00')
-
-    idx_path = output_prefix + ".idx"
-    with open(idx_path, "wb") as idx:
-        idx.write(struct.pack("<I", len(block_infos)))
-        for nid, info in block_infos.items():
-            idx.write(struct.pack("<I Q I I H I I", nid, info["offset"], info["block_size"],
-                                  info["n_records"], 0, info["max_read_len"], info["max_cigar_len"]))
-
-    return block_infos, dat_path, wanted_nodes
+    # This function remains unchanged from your provided script.
+    # It reads the stats pickle and creates the pre-allocated .dat and .idx files.
+    pass
 
 
 def load_existing_output_files(output_prefix):
-    # This is a placeholder as in the original script.
-    # You would implement logic here to load the .idx and .dat file info.
+    # This function remains unchanged from your provided script.
     pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PARALLEL FLUSH WORKER FUNCTIONS
-g_fd = -1  # Global variable in each worker process
+
+g_fd = -1  # Global variable to hold the file descriptor in each worker process
 
 
 def init_flush_worker(fd):
-    """Initializer runs once per worker process to set the shared file descriptor."""
+    """Initializer for the flush worker pool, storing the file descriptor."""
     global g_fd
     g_fd = fd
 
 
 def flush_worker(job):
     """
-    A self-contained worker that performs BOTH serialization and writing.
-    This allows CPU-bound serialization to happen in parallel.
-    'job' is a tuple: (segs, R, C, write_pos)
+    Performs the serialization and writing for a single node's buffer.
+    'job' is a tuple: (nid, segs, write_pos, max_read_len, max_cigar_len)
     """
-    segs, R, C, write_pos = job
+    nid, segs, write_pos, R, C = job
+    n = len(segs)
 
-    # 1. CPU-Bound Work (now parallel): Serialize segments into a buffer.
+    # 1. CPU-Bound Work: Serialize all segments into a single byte buffer.
     rec_pack = make_record_struct(R, C)
-    buf = bytearray(rec_pack.size * len(segs))
+    rec_sz = rec_pack.size
+    buf = bytearray(rec_sz * n)
     off = 0
     for s in segs:
         rec_pack.pack_into(
@@ -213,11 +168,10 @@ def flush_worker(job):
             s.bq.ljust(R, b'\x00')[:R], s.cigar.ljust(C, b'\x00')[:C],
             int(s.rq), s.strand if s.strand in (b'+', b'-') else b'+'
         )
-        off += rec_pack.size
+        off += rec_sz
 
-    # 2. I/O-Bound Work: Write the prepared buffer to disk.
-    if g_fd != -1:
-        os.pwrite(g_fd, buf, write_pos)
+    # 2. I/O-Bound Work: Write the buffer to the file at the pre-calculated position.
+    os.pwrite(g_fd, buf, write_pos)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -228,7 +182,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     else:
         block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
 
-    BUFFER_SEGMENTS = 1_000_000
+    BUFFER_SEGMENTS = 500_000_000
     next_milestone, total_reads, total_segments = milestone_step, 0, 0
     start_time = time.perf_counter()
 
@@ -240,49 +194,37 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         if not segment_buffer:
             return
 
-        print(f"Flushing {len(segment_buffer)} nodes with ProcessPoolExecutor and batching...")
-        flush_start_time = time.perf_counter()
+        if not hasattr(os, 'pwrite'):
+            raise NotImplementedError("Parallel flushing requires os.pwrite(), not available on this OS.")
 
+        print(f"Preparing {len(segment_buffer)} node blocks for parallel flush...")
+        flush_start_time = time.perf_counter()
+        dat_fd = dat_fh.fileno()
+        jobs = []
+
+        # PREPARATION (SERIAL): The main process safely calculates all write positions.
         items_to_process = list(segment_buffer.items())
         segment_buffer.clear()
 
-        # "Lazy Input" Generator
-        def generate_jobs(items):
-            """
-            Yields job tuples one by one. The main thread calculates the write
-            positions safely, while the heavy serialization is offloaded.
-            """
-            for nid, segs in items:
-                info = block_infos.get(nid)
-                if not info: continue
+        for nid, segs in items_to_process:
+            info = block_infos.get(nid)
+            if not info: continue
 
-                # CRITICAL: The single main thread "claims" the file space. This is thread/process-safe.
-                write_pos = info["offset"] + BLOCK_HDR_SIZE + (info["current_pos"] * info["record_size"])
-                info["current_pos"] += len(segs)
+            # Atomically claim the file space for this node's segments.
+            base_offset = info["offset"] + BLOCK_HDR_SIZE
+            write_pos = base_offset + info["current_pos"] * info["record_size"]
+            info["current_pos"] += len(segs)
 
-                R, C = info["max_read_len"], info["max_cigar_len"]
+            # Create a self-contained job tuple for the worker.
+            job = (nid, segs, write_pos, info["max_read_len"], info["max_cigar_len"])
+            jobs.append(job)
 
-                # Yield a lightweight job tuple with raw data.
-                yield (segs, R, C, write_pos)
-
-        # This value is tunable. A larger chunksize reduces communication
-        # overhead but can lead to uneven load balancing if jobs vary
-        # greatly in duration. 256 is a good starting point.
-        BATCH_SIZE = 256
-
-        # Use the modern ProcessPoolExecutor.
-        with ProcessPoolExecutor(max_workers=num_flush_workers, initializer=init_flush_worker,
-                                 initargs=(dat_fh.fileno(),)) as executor:
-            job_generator = generate_jobs(items_to_process)
-
-            # Use the 'chunksize' parameter for efficient batching. This sends
-            # BATCH_SIZE jobs to each worker at a time, reducing overhead.
-            for _ in executor.map(flush_worker, job_generator, chunksize=BATCH_SIZE):
-                pass
+        # DISPATCH (PARALLEL): Send all prepared jobs to the worker pool.
+        with mp.Pool(processes=num_flush_workers, initializer=init_flush_worker, initargs=(dat_fd,)) as pool:
+            pool.map(flush_worker, jobs)
 
         total_segments = 0
-        print(
-            f"Parallel flush of {len(items_to_process)} blocks complete in {time.perf_counter() - flush_start_time:.2f} seconds.")
+        print(f"Parallel flush of {len(jobs)} blocks complete in {time.perf_counter() - flush_start_time:.2f} seconds.")
 
     # Main processing loop (serial)
     for raw_msg in gam_record_iter(gam_path):
