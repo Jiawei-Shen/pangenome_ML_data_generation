@@ -215,7 +215,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
                     BLOCK_HDR_SIZE
                 )
             except Exception as e:
-                # print(f"Error during C++ buffer flush: {e}")
+                print(f"Error during C++ buffer flush: {e[:100]}")
                 raise
 
             # Clear the Python-side buffer after C++ is done
