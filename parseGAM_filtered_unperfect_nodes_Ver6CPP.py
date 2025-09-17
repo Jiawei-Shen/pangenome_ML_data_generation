@@ -186,7 +186,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         print(f"Output file created: {dat_path}")
 
     # BUFFER_SEGMENTS = 500_000_000
-    BUFFER_SEGMENTS = 10_000_000
+    BUFFER_SEGMENTS = 1_000_000
     next_milestone, total_reads, total_segments = milestone_step, 0, 0
     start_time = time.perf_counter()
 
