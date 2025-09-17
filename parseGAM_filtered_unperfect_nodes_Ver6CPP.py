@@ -180,58 +180,17 @@ def load_existing_output_files(output_prefix):
 # Main Pipeline
 def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filter, use_existing):
     if use_existing:
-        print("Reusing existing .dat/.idx...")
         block_infos, dat_path, wanted_nodes = load_existing_output_files(output_prefix)
     else:
-        print("Initializing output files from PKL maxima...")
         block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
-        print(f"Output file created: {dat_path}")
 
-    # BUFFER_SEGMENTS = 500_000_000
-    BUFFER_SEGMENTS = 1_000_000
+    BUFFER_SEGMENTS = 400_000_000
     next_milestone, total_reads, total_segments = milestone_step, 0, 0
     start_time = time.perf_counter()
 
     dat_fh = open(dat_path, "r+b")
-    dat_fd = dat_fh.fileno() # Get the file descriptor once
+    dat_fd = dat_fh.fileno()
     segment_buffer = defaultdict(list)
-
-    # Single-threaded flush function using the C++ module
-    def flush_segment_buffer():
-        nonlocal total_segments
-        if not segment_buffer:
-            return
-
-        print(f"Flushing {len(segment_buffer)} node blocks to disk...")
-        flush_start_time = time.perf_counter()
-
-        # Process each node's buffered segments in the main thread
-        for nid, segs in segment_buffer.items():
-            info = block_infos.get(nid)
-            if not info: continue
-
-            # 1. Python calculates the metadata (where to write, padding sizes)
-            base_offset = info["offset"] + BLOCK_HDR_SIZE
-            write_pos = base_offset + info["current_pos"] * info["record_size"]
-            info["current_pos"] += len(segs)
-
-            # 2. C++ does the heavy lifting: serialization and writing
-            try:
-                fast_writer.flush_node_buffer(
-                    dat_fd,
-                    write_pos,
-                    segs,
-                    info["max_read_len"],
-                    info["max_cigar_len"]
-                )
-            except Exception as e:
-                print(f"Error during C++ flush for node {nid}: {e}")
-                # Decide how to handle errors, e.g., exit or continue
-                raise
-
-        segment_buffer.clear()
-        total_segments = 0
-        print(f"Flush complete in {time.perf_counter() - flush_start_time:.2f} seconds.")
 
     # Main processing loop
     for raw_msg in gam_record_iter(gam_path):
@@ -242,16 +201,52 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
             segment_buffer[nid].extend(segs)
             total_segments += len(segs)
 
+        # --- FLUSH LOGIC EMBEDDED HERE ---
         if total_segments >= BUFFER_SEGMENTS:
-            flush_segment_buffer()
+            print(f"Buffer full. Flushing {len(segment_buffer)} node blocks to disk via C++...")
+            flush_start_time = time.perf_counter()
+            try:
+                # A single call to C++ to process the entire buffer.
+                fast_writer.flush_entire_buffer(
+                    dat_fd,
+                    segment_buffer,
+                    block_infos,
+                    BLOCK_HDR_SIZE
+                )
+            except Exception as e:
+                print(f"Error during C++ buffer flush: {e}")
+                raise
+
+            # Clear the Python-side buffer after C++ is done
+            segment_buffer.clear()
+            total_segments = 0
+            print(f"C++ flush complete in {time.perf_counter() - flush_start_time:.2f} seconds.")
+        # --- END OF EMBEDDED FLUSH LOGIC ---
 
         if total_reads >= next_milestone:
             elapsed = time.perf_counter() - start_time
             print(f"{total_reads:,} reads processed | {elapsed:.1f} seconds")
             next_milestone += milestone_step
 
-    # Final flush before exiting
-    flush_segment_buffer()
+    # --- FINAL FLUSH LOGIC EMBEDDED HERE ---
+    if segment_buffer:
+        print(f"Processing final {len(segment_buffer)} node blocks...")
+        flush_start_time = time.perf_counter()
+        try:
+            fast_writer.flush_entire_buffer(
+                dat_fd,
+                segment_buffer,
+                block_infos,
+                BLOCK_HDR_SIZE
+            )
+        except Exception as e:
+            print(f"Error during final C++ buffer flush: {e}")
+            raise
+        segment_buffer.clear()
+        total_segments = 0
+        print(f"Final C++ flush complete in {time.perf_counter() - flush_start_time:.2f} seconds.")
+    # --- END OF FINAL FLUSH LOGIC ---
+
     dat_fh.close()
 
     elapsed = time.perf_counter() - start_time
@@ -259,7 +254,6 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     print(f"  Total reads processed: {total_reads:,}")
     print(f"  Nodes included: {len(block_infos)}")
     print(f"  Elapsed time: {elapsed:.2f} seconds")
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry Point
 def main():
