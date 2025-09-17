@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <unistd.h>
 #include <unordered_map>
+#include <iostream> // <-- ADD THIS LINE
 
 namespace py = pybind11;
 
