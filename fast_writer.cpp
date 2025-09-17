@@ -92,11 +92,11 @@ void flush_entire_buffer(
             std::cout << "DEBUG: Writing Node ID " << nid << " | Segments: " << segs.size() << " | Write Pos: " << write_pos << std::endl;
 
             // 2. C++ does the serialization and writing by calling the helper
-            write_node_data(fd, write_pos, segs, info.max_read_len, info.max_cigar_len);
+//            write_node_data(fd, write_pos, segs, info.max_read_len, info.max_cigar_len);
 
             // 3. C++ updates the current_pos. This modification will be
             // reflected back in the Python dictionary.
-//            info.current_pos += segs.size();
+            info.current_pos += segs.size();
 
         } catch (const std::out_of_range& oor) {
             // Handle cases where a node ID from the buffer isn't in block_infos
