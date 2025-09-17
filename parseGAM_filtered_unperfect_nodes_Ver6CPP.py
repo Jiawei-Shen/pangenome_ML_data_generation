@@ -12,16 +12,16 @@ import fast_writer # Our new C++ module
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Segment container
-class Segment:
-    __slots__ = ('offset', 'seq', 'bq', 'cigar', 'rq', 'strand')
-
-    def __init__(self, offset, seq, bq, cigar, rq, strand):
-        self.offset = offset
-        self.seq = seq      # bytes (unpadded)
-        self.bq = bq        # bytes (unpadded)
-        self.cigar = cigar  # bytes (unpadded)
-        self.rq = rq        # int (MAPQ)
-        self.strand = strand[0] # Pass the integer value of the byte
+# class Segment:
+#     __slots__ = ('offset', 'seq', 'bq', 'cigar', 'rq', 'strand')
+#
+#     def __init__(self, offset, seq, bq, cigar, rq, strand):
+#         self.offset = offset
+#         self.seq = seq      # bytes (unpadded)
+#         self.bq = bq        # bytes (unpadded)
+#         self.cigar = cigar  # bytes (unpadded)
+#         self.rq = rq        # int (MAPQ)
+#         self.strand = strand[0] # Pass the integer value of the byte
 
 # ─────────────────────────────────────────────────────────────────────────────
 # File layout
@@ -110,8 +110,10 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
                 bq_parts.extend(read_quality[read_offset: read_offset + tL])
                 read_offset += tL
 
-        seg = Segment(offset=node_offset, seq="".join(seq_parts).encode(), bq=bytes(bq_parts),
-                      cigar="".join(cigar_parts).encode(), rq=mapq, strand=strand_char)
+        # seg = Segment(offset=node_offset, seq="".join(seq_parts).encode(), bq=bytes(bq_parts),
+        #               cigar="".join(cigar_parts).encode(), rq=mapq, strand=strand_char)
+        seg = fast_writer.Segment(offset=node_offset, seq="".join(seq_parts), bq=bq_parts.decode('ascii', 'ignore'),
+                                  cigar="".join(cigar_parts), rq=mapq, strand=ord(strand_char))
         segment_dict.setdefault(nid, []).append(seg)
     return segment_dict
 

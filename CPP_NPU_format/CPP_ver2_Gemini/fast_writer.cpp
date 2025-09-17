@@ -78,7 +78,10 @@ PYBIND11_MODULE(fast_writer, m) {
     m.doc() = "C++ module for serializing and writing segment data.";
 
     py::class_<Segment>(m, "Segment")
-        .def(py::init<>())
+        // ADD THIS CONSTRUCTOR:
+        .def(py::init<int16_t, std::string, std::string, std::string, int16_t, char>(),
+            py::arg("offset"), py::arg("seq"), py::arg("bq"),
+            py::arg("cigar"), py::arg("rq"), py::arg("strand"))
         .def_readwrite("offset", &Segment::offset)
         .def_readwrite("seq", &Segment::seq)
         .def_readwrite("bq", &Segment::bq)
