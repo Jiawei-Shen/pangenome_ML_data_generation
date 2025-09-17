@@ -123,11 +123,11 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
 
         seg = fast_writer.Segment(
             offset=int(node_offset),
-            seq="".join(seq_parts).encode(),            # bytes → std::string (no extra decode)
-            bq=bytes(bq_parts),                          # bytes
-            cigar="".join(cigar_parts).encode(),         # bytes
+            seq="".join(seq_parts),  # str
+            bq=bytes(bq_parts).decode("latin1"),  # str (no data loss; 1:1)
+            cigar="".join(cigar_parts),  # str
             rq=int(mapq),
-            strand=int(strand_byte),                     # single byte → char
+            strand=("-" if mapping.position.is_reverse else "+")  # 1-char str
         )
         segment_dict.setdefault(nid, []).append(seg)
 
