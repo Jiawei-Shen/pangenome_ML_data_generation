@@ -185,90 +185,50 @@ def initialize_output_files(stats_path, output_prefix):
     with open(stats_path, "rb") as fh:
         stats_data = pickle.load(fh)
 
-    # Expecting: stats_data[node_id] has keys:
-    #   perfect, not_perfect, max_read_length, max_cigar_length
-    wanted_nodes = set()
-    node_counts = {}
-    maxima = {}
-    total_nodes = 0
-
+    wanted_nodes, node_counts, maxima = set(), {}, {}
     for node_id_key, stat in stats_data.items():
-        total_nodes += 1
         nid = int(node_id_key)
         perfect = int(stat.get("perfect", 0))
         not_perfect = int(stat.get("not_perfect", 0))
-        # Selection rule (unchanged)
-        if (perfect + not_perfect) > 0 and not_perfect > 1 and not_perfect / (perfect + not_perfect) > 0.08:
+        if (perfect + not_perfect) > 0 and not_perfect > 1 and not_perfect / (perfect + not_perfect) > 0.05:
             wanted_nodes.add(nid)
             node_counts[nid] = perfect + not_perfect
-            # Pull maxima directly from PKL (fallback to 1 if missing/bad)
             R = int(stat.get("max_read_length", 1) or 1)
             C = int(stat.get("max_cigar_length", 1) or 1)
-            if R <= 0: R = 1
-            if C <= 0: C = 1
-            maxima[nid] = (R, C)
+            maxima[nid] = (max(1, R), max(1, C))
 
-    print(f"Filtered {len(wanted_nodes)} nodes from {total_nodes} total nodes "
-          f"({(len(wanted_nodes) / max(total_nodes,1)):.2%} selected).")
+    print(f"Filtered {len(wanted_nodes)} nodes from {len(stats_data)} total.")
     del stats_data
     gc.collect()
 
-    # lay out blocks using maxima from PKL
     block_infos = {}
     current_offset = GLOBAL_HEADER_SIZE
-    for nid in wanted_nodes:
+    for nid in sorted(list(wanted_nodes)): # Sort for deterministic layout
         nrec = node_counts[nid]
         R, C = maxima[nid]
         rec_sz = record_size(R, C)
         blk_sz = BLOCK_HDR_SIZE + nrec * rec_sz
-
-        block_infos[nid] = {
-            "offset": current_offset,
-            "n_records": nrec,
-            "current_pos": 0,
-            "max_read_len": R,
-            "max_cigar_len": C,
-            "record_size": rec_sz,
-            "block_size": blk_sz,
-        }
+        block_infos[nid] = {"offset": current_offset, "n_records": nrec, "current_pos": 0,
+                            "max_read_len": R, "max_cigar_len": C, "record_size": rec_sz, "block_size": blk_sz}
         current_offset += blk_sz
 
     dat_path = output_prefix + ".dat"
-
-    # write .dat
     with open(dat_path, "wb") as f:
         f.write(GLOBAL_MAGIC)
         f.write(GLOBAL_VER_PACK.pack(GLOBAL_MAJOR, GLOBAL_MINOR, len(block_infos), b'\x00' * 16))
-
         for nid, info in block_infos.items():
-            nrec = info["n_records"]
-            R = info["max_read_len"]
-            C = info["max_cigar_len"]
+            f.write(BLOCK_HDR_PACK.pack(nid, info["n_records"], 0, info["max_read_len"], info["max_cigar_len"]))
+        # Pre-allocate the file by seeking to the end and writing a null byte
+        if current_offset > GLOBAL_HEADER_SIZE:
+            f.seek(current_offset - 1)
+            f.write(b'\x00')
 
-            f.write(BLOCK_HDR_PACK.pack(nid, nrec, 0, R, C))
-
-            rec_pack = make_record_struct(R, C)
-            blank = rec_pack.pack(0, b'\x00'*R, b'\x00'*R, b'\x00'*C, 0, b'+')
-            for _ in range(nrec):
-                f.write(blank)
-
-    # write .idx
     idx_path = output_prefix + ".idx"
     with open(idx_path, "wb") as idx:
         idx.write(struct.pack("<I", len(block_infos)))
-        # node_id (u32), offset (u64), block_size (u32), n_records (u32),
-        # flags (u16), max_read_len (u32), max_cigar_len (u32)  → 30 bytes per entry
         for nid, info in block_infos.items():
-            idx.write(struct.pack(
-                "<I Q I I H I I",
-                nid,
-                info["offset"],
-                info["block_size"],
-                info["n_records"],
-                0,
-                info["max_read_len"],
-                info["max_cigar_len"]
-            ))
+            idx.write(struct.pack("<I Q I I H I I", nid, info["offset"], info["block_size"],
+                                  info["n_records"], 0, info["max_read_len"], info["max_cigar_len"]))
 
     return block_infos, dat_path, wanted_nodes
 
