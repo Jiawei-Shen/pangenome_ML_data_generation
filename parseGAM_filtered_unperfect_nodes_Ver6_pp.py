@@ -240,7 +240,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         if not segment_buffer:
             return
 
-        print(f"Flushing {len(segment_buffer)} nodes with ProcessPoolExecutor and lazy input...")
+        print(f"Flushing {len(segment_buffer)} nodes with ProcessPoolExecutor and batching...")
         flush_start_time = time.perf_counter()
 
         items_to_process = list(segment_buffer.items())
@@ -265,16 +265,19 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
                 # Yield a lightweight job tuple with raw data.
                 yield (segs, R, C, write_pos)
 
+        # This value is tunable. A larger chunksize reduces communication
+        # overhead but can lead to uneven load balancing if jobs vary
+        # greatly in duration. 256 is a good starting point.
+        BATCH_SIZE = 256
+
         # Use the modern ProcessPoolExecutor.
-        # It handles shutdown automatically and is the recommended API.
         with ProcessPoolExecutor(max_workers=num_flush_workers, initializer=init_flush_worker,
                                  initargs=(dat_fh.fileno(),)) as executor:
-            # executor.map is lazy. It pulls from generate_jobs as workers become available.
-            # This keeps memory low and distributes the CPU-intensive serialization work.
             job_generator = generate_jobs(items_to_process)
 
-            # We must iterate through the results to ensure all tasks are completed before exiting the 'with' block.
-            for _ in executor.map(flush_worker, job_generator):
+            # Use the 'chunksize' parameter for efficient batching. This sends
+            # BATCH_SIZE jobs to each worker at a time, reducing overhead.
+            for _ in executor.map(flush_worker, job_generator, chunksize=BATCH_SIZE):
                 pass
 
         total_segments = 0
