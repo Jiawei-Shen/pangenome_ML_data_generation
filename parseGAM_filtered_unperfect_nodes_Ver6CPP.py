@@ -223,12 +223,12 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
             flush_start_time = time.perf_counter()
             try:
                 # A single call to C++ to process the entire buffer.
-                fast_writer.flush_entire_buffer_mt(
+                fast_writer.flush_entire_buffer_parallel_dict(
                     dat_fd,
                     segment_buffer,
                     block_infos_cpp,  # or your C++ state object if you built one
                     BLOCK_HDR_SIZE,
-                    max_workers=4  # tune: 2–8 is typical; SSDs like 2–4, HDDs often 1–2
+                    num_threads=4  # tune: 2–8 is typical; SSDs like 2–4, HDDs often 1–2
                 )
 
             except Exception as e:
