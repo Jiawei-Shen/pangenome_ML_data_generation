@@ -7,11 +7,9 @@ import time
 import gc
 import os
 from collections import defaultdict
-from multiprocessing.pool import ThreadPool  # Using ThreadPool is more efficient here
+from concurrent.futures import ProcessPoolExecutor
 import vg_pb2  # Assumes you have the compiled protobuf Python file
 
-
-# ... (The rest of the script from Segment class to load_existing_output_files is unchanged) ...
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Segment container
@@ -127,7 +125,7 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# File Initialization (Unchanged)
+# File Initialization
 def initialize_output_files(stats_path, output_prefix):
     with open(stats_path, "rb") as fh:
         stats_data = pickle.load(fh)
@@ -181,35 +179,55 @@ def initialize_output_files(stats_path, output_prefix):
 
 
 def load_existing_output_files(output_prefix):
-    # This function remains unchanged from your provided script.
+    # This is a placeholder as in the original script.
+    # You would implement logic here to load the .idx and .dat file info.
     pass
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PARALLEL FLUSH WORKER FUNCTIONS
-
-g_fd = -1
+g_fd = -1  # Global variable in each worker process
 
 
 def init_flush_worker(fd):
+    """Initializer runs once per worker process to set the shared file descriptor."""
     global g_fd
     g_fd = fd
 
 
 def flush_worker(job):
-    buf, write_pos = job
-    os.pwrite(g_fd, buf, write_pos)
+    """
+    A self-contained worker that performs BOTH serialization and writing.
+    This allows CPU-bound serialization to happen in parallel.
+    'job' is a tuple: (segs, R, C, write_pos)
+    """
+    segs, R, C, write_pos = job
+
+    # 1. CPU-Bound Work (now parallel): Serialize segments into a buffer.
+    rec_pack = make_record_struct(R, C)
+    buf = bytearray(rec_pack.size * len(segs))
+    off = 0
+    for s in segs:
+        rec_pack.pack_into(
+            buf, off, int(s.offset), s.seq.ljust(R, b'\x00')[:R],
+            s.bq.ljust(R, b'\x00')[:R], s.cigar.ljust(C, b'\x00')[:C],
+            int(s.rq), s.strand if s.strand in (b'+', b'-') else b'+'
+        )
+        off += rec_pack.size
+
+    # 2. I/O-Bound Work: Write the prepared buffer to disk.
+    if g_fd != -1:
+        os.pwrite(g_fd, buf, write_pos)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main Pipeline (MODIFIED for Batched Processing)
+# Main Pipeline
 def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filter, use_existing, num_flush_workers):
-    # ... (initialization code is the same) ...
     if use_existing:
         block_infos, dat_path, wanted_nodes = load_existing_output_files(output_prefix)
     else:
         block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
 
-    # BUFFER_SEGMENTS = 400_000_000
     BUFFER_SEGMENTS = 1_000_000
     next_milestone, total_reads, total_segments = milestone_step, 0, 0
     start_time = time.perf_counter()
@@ -222,59 +240,48 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         if not segment_buffer:
             return
 
-        if not hasattr(os, 'pwrite'):
-            raise NotImplementedError("Parallel flushing requires os.pwrite(), not available on this OS.")
-
-        print(f"Preparing {len(segment_buffer)} node blocks for batched parallel flush...")
+        print(f"Flushing {len(segment_buffer)} nodes with ProcessPoolExecutor and lazy input...")
         flush_start_time = time.perf_counter()
-        dat_fd = dat_fh.fileno()
 
         items_to_process = list(segment_buffer.items())
         segment_buffer.clear()
 
-        # Helper to yield batches of items
-        def chunker(seq, size):
-            return (seq[pos:pos + size] for pos in range(0, len(seq), size))
+        # "Lazy Input" Generator
+        def generate_jobs(items):
+            """
+            Yields job tuples one by one. The main thread calculates the write
+            positions safely, while the heavy serialization is offloaded.
+            """
+            for nid, segs in items:
+                info = block_infos.get(nid)
+                if not info: continue
 
-        # Tune this based on your system. A few hundred to a few thousand is a good start.
-        BATCH_SIZE = 1024
+                # CRITICAL: The single main thread "claims" the file space. This is thread/process-safe.
+                write_pos = info["offset"] + BLOCK_HDR_SIZE + (info["current_pos"] * info["record_size"])
+                info["current_pos"] += len(segs)
 
-        # Create the pool once for the entire flush operation
-        with ThreadPool(processes=num_flush_workers, initializer=init_flush_worker, initargs=(dat_fd,)) as pool:
-            for item_batch in chunker(items_to_process, BATCH_SIZE):
-                jobs_batch = []
-                # SERIAL: Prepare one small batch of jobs
-                for nid, segs in item_batch:
-                    info = block_infos.get(nid)
-                    if not info: continue
+                R, C = info["max_read_len"], info["max_cigar_len"]
 
-                    base_offset = info["offset"] + BLOCK_HDR_SIZE
-                    write_pos = base_offset + info["current_pos"] * info["record_size"]
-                    info["current_pos"] += len(segs)
+                # Yield a lightweight job tuple with raw data.
+                yield (segs, R, C, write_pos)
 
-                    R, C = info["max_read_len"], info["max_cigar_len"]
-                    rec_pack = make_record_struct(R, C)
-                    buf = bytearray(rec_pack.size * len(segs))
-                    off = 0
-                    for s in segs:
-                        rec_pack.pack_into(
-                            buf, off, int(s.offset), s.seq.ljust(R, b'\x00')[:R],
-                            s.bq.ljust(R, b'\x00')[:R], s.cigar.ljust(C, b'\x00')[:C],
-                            int(s.rq), s.strand if s.strand in (b'+', b'-') else b'+'
-                        )
-                        off += rec_pack.size
-                    jobs_batch.append((buf, write_pos))
+        # Use the modern ProcessPoolExecutor.
+        # It handles shutdown automatically and is the recommended API.
+        with ProcessPoolExecutor(max_workers=num_flush_workers, initializer=init_flush_worker,
+                                 initargs=(dat_fh.fileno(),)) as executor:
+            # executor.map is lazy. It pulls from generate_jobs as workers become available.
+            # This keeps memory low and distributes the CPU-intensive serialization work.
+            job_generator = generate_jobs(items_to_process)
 
-                # DISPATCH: Send the current batch to the workers
-                # The workers will process this batch while the main thread
-                # prepares the next one.
-                pool.map(flush_worker, jobs_batch)
+            # We must iterate through the results to ensure all tasks are completed before exiting the 'with' block.
+            for _ in executor.map(flush_worker, job_generator):
+                pass
 
         total_segments = 0
         print(
             f"Parallel flush of {len(items_to_process)} blocks complete in {time.perf_counter() - flush_start_time:.2f} seconds.")
 
-    # ... (The rest of the main loop and main function are unchanged) ...
+    # Main processing loop (serial)
     for raw_msg in gam_record_iter(gam_path):
         segs_by_node = process_alignment(raw_msg, wanted_nodes, chrom_filter)
         total_reads += 1
@@ -301,12 +308,13 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     print(f"  Elapsed time: {elapsed:.2f} seconds")
 
 
-if __name__ == "__main__":
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry Point
+def main():
     parser = argparse.ArgumentParser(
         description="GAM segment extractor with parallel buffer flushing.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    # ... (arguments are the same) ...
     parser.add_argument("gam_path", help="Path to the GAM file")
     parser.add_argument("stats_pickle", help="Path to the stats pickle with node maxima")
     parser.add_argument("output_prefix", help="Prefix for output files (.dat, .idx)")
@@ -326,3 +334,7 @@ if __name__ == "__main__":
         use_existing=args.use_existing,
         num_flush_workers=args.flush_workers
     )
+
+
+if __name__ == "__main__":
+    main()
