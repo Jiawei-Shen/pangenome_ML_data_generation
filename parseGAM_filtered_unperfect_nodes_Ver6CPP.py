@@ -7,10 +7,9 @@ import time
 import gc
 import os
 from collections import defaultdict
-import multiprocessing as mp
 
 import vg_pb2
-import fast_writer  # Segment, BlockTable, pack_node
+import fast_writer  # Segment, BlockTable, flush_entire_buffer_parallel_dict
 
 # ─────────────────────────────────────────────────────────────────────────────
 # File layout
@@ -101,11 +100,11 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
 
         seg = fast_writer.Segment(
             offset=int(node_offset),
-            seq="".join(seq_parts).encode(),
+            seq="".join(seq_parts).encode(),        # bytes → std::string (no Unicode overhead)
             bq=bytes(bq_parts),
             cigar="".join(cigar_parts).encode(),
             rq=int(mapq),
-            strand=int(strand_byte),
+            strand=int(strand_byte),                # one byte
         )
         segment_dict.setdefault(nid, []).append(seg)
 
@@ -135,7 +134,7 @@ def initialize_output_files(stats_path, output_prefix):
 
     block_infos = {}
     current_offset = GLOBAL_HEADER_SIZE
-    for nid in sorted(list(wanted_nodes)):
+    for nid in sorted(list(wanted_nodes)):  # deterministic layout
         nrec = node_counts[nid]
         R, C = maxima[nid]
         rec_sz = record_size(R, C)
@@ -157,7 +156,7 @@ def initialize_output_files(stats_path, output_prefix):
         f.write(GLOBAL_VER_PACK.pack(GLOBAL_MAJOR, GLOBAL_MINOR, len(block_infos), b'\x00' * 16))
         for nid, info in block_infos.items():
             f.write(BLOCK_HDR_PACK.pack(nid, info["n_records"], 0, info["max_read_len"], info["max_cigar_len"]))
-        if current_offset > GLOBAL_HEADER_SIZE:
+        if current_offset > GLOBAL_HEADER_SIZE:  # pre-allocate
             f.seek(current_offset - 1)
             f.write(b'\x00')
 
@@ -167,43 +166,30 @@ def initialize_output_files(stats_path, output_prefix):
         for nid, info in block_infos.items():
             idx.write(struct.pack(
                 "<I Q I I H I I",
-                nid, info["offset"], info["block_size"],
-                info["n_records"], 0,
-                info["max_read_len"], info["max_cigar_len"],
+                nid,
+                info["offset"],
+                info["block_size"],
+                info["n_records"],
+                0,
+                info["max_read_len"],
+                info["max_cigar_len"],
             ))
 
     return block_infos, dat_path, wanted_nodes
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MP write-only worker
-def _pwrite_job(fd, pos, buf):
-    os.pwrite(fd, buf, pos)
-
-def flush_with_multiprocess_writers(dat_fd, segment_buffer, state, block_hdr_size, num_procs, chunksize=64):
-    if not segment_buffer:
-        return
-
-    # Lazily generate (fd, pos, buf) tuples so we never materialize a huge list.
-    def _job_iter():
-        for nid, segs in segment_buffer.items():
-            pos, buf = fast_writer.pack_node(int(nid), segs, state, block_hdr_size)
-            if buf:  # skip empty
-                yield (dat_fd, pos, buf)
-
-    ctx = mp.get_context("fork")  # Linux: fd inherited
-    with ctx.Pool(processes=num_procs) as pool:
-        pool.starmap(_pwrite_job, _job_iter(), chunksize=chunksize)
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Pipeline
-def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filter, use_existing, num_procs):
+def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filter, use_existing, num_threads):
     if use_existing:
         raise NotImplementedError("--use-existing is not implemented yet.")
     block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
 
-    state = fast_writer.BlockTable(block_infos)  # persistent; updates current_pos
+    # Persistent C++ state (tracks current_pos)
+    state = fast_writer.BlockTable(block_infos)
 
-    BUFFER_SEGMENTS = 1_000_000  # tune
+    # Tune this for your memory; fewer flushes = better throughput
+    BUFFER_SEGMENTS = 1_000_000
+
     next_milestone, total_reads, total_segments = milestone_step, 0, 0
     start_time = time.perf_counter()
 
@@ -221,12 +207,19 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
             total_segments += len(segs)
 
         if total_segments >= BUFFER_SEGMENTS:
-            print(f"Buffer full. Flushing {len(segment_buffer)} node blocks with {num_procs} writer processes...")
+            print(f"Buffer full. Flushing {len(segment_buffer)} node blocks via C++ threads ({num_threads})...")
             t0 = time.perf_counter()
-            flush_with_multiprocess_writers(dat_fd, segment_buffer, state, BLOCK_HDR_SIZE, num_procs, chunksize=64)
+            fast_writer.flush_entire_buffer_parallel_dict(
+                dat_fd,
+                segment_buffer,   # dict[int -> list[Segment]]
+                state,            # BlockTable
+                BLOCK_HDR_SIZE,
+                num_threads=num_threads,
+                sort_by_offset=True,
+            )
             segment_buffer.clear()
             total_segments = 0
-            print(f"Flush done in {time.perf_counter() - t0:.2f} s.")
+            print(f"C++ flush complete in {time.perf_counter() - t0:.2f} s.")
 
         if total_reads >= next_milestone:
             elapsed = time.perf_counter() - start_time
@@ -234,9 +227,16 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
             next_milestone += milestone_step
 
     if segment_buffer:
-        print(f"Final flush of {len(segment_buffer)} node blocks with {num_procs} writer processes...")
+        print(f"Final flush of {len(segment_buffer)} node blocks via C++ threads ({num_threads})...")
         t0 = time.perf_counter()
-        flush_with_multiprocess_writers(dat_fd, segment_buffer, state, BLOCK_HDR_SIZE, num_procs, chunksize=64)
+        fast_writer.flush_entire_buffer_parallel_dict(
+            dat_fd,
+            segment_buffer,
+            state,
+            BLOCK_HDR_SIZE,
+            num_threads=num_threads,
+            sort_by_offset=True,
+        )
         segment_buffer.clear()
         print(f"Final flush done in {time.perf_counter() - t0:.2f} s.")
 
@@ -251,7 +251,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="GAM segment extractor with C++ packing & multi-process pwrite.",
+        description="GAM segment extractor with C++ pack+write (parallel pwrite).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("gam_path")
@@ -260,7 +260,7 @@ def main():
     parser.add_argument("--milestone", type=int, default=1_000_000)
     parser.add_argument("--chr", default="")
     parser.add_argument("--use-existing", action="store_true")
-    parser.add_argument("--writers", type=int, default=4, help="Number of writer processes")
+    parser.add_argument("--threads", type=int, default=4, help="C++ writer threads")
     args = parser.parse_args()
 
     run_pipeline(
@@ -270,7 +270,7 @@ def main():
         milestone_step=args.milestone,
         chrom_filter=args.chr,
         use_existing=args.use_existing,
-        num_procs=args.writers,
+        num_threads=args.threads,
     )
 
 if __name__ == "__main__":
