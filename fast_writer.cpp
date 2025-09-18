@@ -121,9 +121,6 @@ static void do_job(int fd, const Job& j) {
         std::memcpy(p, &s->rq, sizeof(int16_t)); p += sizeof(int16_t);
         *p++ = s->strand;
     }
-        // DEBUG: print write position and size
-    std::fprintf(stderr, "DEBUG pwrite: nid=%u offset=%lld bytes=%zu\n",
-                 j.nid, static_cast<long long>(j.write_pos), buf.size());
 
     ssize_t wrote = pwrite(fd, buf.data(), buf.size(), j.write_pos);
 
