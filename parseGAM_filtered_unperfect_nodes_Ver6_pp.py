@@ -276,7 +276,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     else:
         block_infos, dat_path, wanted_nodes, total_size = initialize_output_files(stats_path, output_prefix)
 
-    BUFFER_SEGMENTS = 10_000_000  # total segments batched before a flush
+    BUFFER_SEGMENTS = 2_000_000  # total segments batched before a flush
     next_milestone = milestone_step
     total_reads = 0
     total_segments = 0
