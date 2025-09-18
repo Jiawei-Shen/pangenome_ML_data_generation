@@ -9,7 +9,7 @@ import os
 from collections import defaultdict
 
 import vg_pb2
-import fast_writer  # Segment, BlockTable, flush_entire_buffer_parallel_dict
+import fast_writer  # Segment, BlockTable, MappedFile, flush_entire_buffer_parallel_mmap
 
 # ─────────────────────────────────────────────────────────────────────────────
 # File layout
@@ -49,7 +49,8 @@ def gam_record_iter(path, tag="GAM"):
                 group_count = read_varint(f)
             except EOFError:
                 break
-            if group_count == 0: continue
+            if group_count == 0:
+                continue
             try:
                 tag_len = read_varint(f)
                 group_tag = f.read(tag_len).decode()
@@ -78,7 +79,8 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
     for mapping in aln.path.mapping:
         nid = mapping.position.node_id
         if nid not in wanted_nodes:
-            for e in mapping.edit: read_offset += e.to_length
+            for e in mapping.edit:
+                read_offset += e.to_length
             continue
 
         node_offset = mapping.position.offset
@@ -93,6 +95,7 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
                 cigar_parts.append(f"{fL}D")
             elif fL == 0 and tL > 0:
                 cigar_parts.append(f"{tL}I")
+
             if tL > 0:
                 seq_parts.append(read_sequence[read_offset: read_offset + tL].upper())
                 bq_parts.extend(read_quality[read_offset: read_offset + tL])
@@ -100,11 +103,11 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
 
         seg = fast_writer.Segment(
             offset=int(node_offset),
-            seq="".join(seq_parts).encode(),        # bytes → std::string (no Unicode overhead)
+            seq="".join(seq_parts).encode(),      # bytes → C++ std::string (raw)
             bq=bytes(bq_parts),
             cigar="".join(cigar_parts).encode(),
             rq=int(mapq),
-            strand=int(strand_byte),                # one byte
+            strand=int(strand_byte),
         )
         segment_dict.setdefault(nid, []).append(seg)
 
@@ -156,9 +159,7 @@ def initialize_output_files(stats_path, output_prefix):
         f.write(GLOBAL_VER_PACK.pack(GLOBAL_MAJOR, GLOBAL_MINOR, len(block_infos), b'\x00' * 16))
         for nid, info in block_infos.items():
             f.write(BLOCK_HDR_PACK.pack(nid, info["n_records"], 0, info["max_read_len"], info["max_cigar_len"]))
-        if current_offset > GLOBAL_HEADER_SIZE:  # pre-allocate
-            f.seek(current_offset - 1)
-            f.write(b'\x00')
+        # We *used to* pre-allocate by seeking; we now mmap+posix_fallocate in C++.
 
     idx_path = output_prefix + ".idx"
     with open(idx_path, "wb") as idx:
@@ -175,71 +176,79 @@ def initialize_output_files(stats_path, output_prefix):
                 info["max_cigar_len"],
             ))
 
-    return block_infos, dat_path, wanted_nodes
+    # Return total file size for mmap (final end offset)
+    total_size = current_offset
+    return block_infos, dat_path, wanted_nodes, total_size
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Pipeline
 def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filter, use_existing, num_threads):
     if use_existing:
         raise NotImplementedError("--use-existing is not implemented yet.")
-    block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
+    block_infos, dat_path, wanted_nodes, total_size = initialize_output_files(stats_path, output_prefix)
 
     # Persistent C++ state (tracks current_pos)
     state = fast_writer.BlockTable(block_infos)
 
-    # Tune this for your memory; fewer flushes = better throughput
-    BUFFER_SEGMENTS = 2_000_000
+    # Tune these two knobs:
+    BUFFER_SEGMENTS = 1_000_000         # flush by total segments
+    MAX_NODES_PER_FLUSH = 50_000        # also flush by node count to avoid 700k tiny writes
 
     next_milestone, total_reads, total_segments = milestone_step, 0, 0
     start_time = time.perf_counter()
 
+    # Open + mmap the final file size (C++ ensures allocation)
     dat_fh = open(dat_path, "r+b", buffering=0)
     dat_fd = dat_fh.fileno()
+    mf = fast_writer.MappedFile(dat_fd, int(total_size))
 
     segment_buffer = defaultdict(list)
 
-    for raw_msg in gam_record_iter(gam_path):
-        segs_by_node = process_alignment(raw_msg, wanted_nodes, chrom_filter)
-        total_reads += 1
+    # Optional speedup: reduce Python GC overhead during hot loop
+    gc.disable()
+    try:
+        for raw_msg in gam_record_iter(gam_path):
+            segs_by_node = process_alignment(raw_msg, wanted_nodes, chrom_filter)
+            total_reads += 1
 
-        for nid, segs in segs_by_node.items():
-            segment_buffer[nid].extend(segs)
-            total_segments += len(segs)
+            for nid, segs in segs_by_node.items():
+                segment_buffer[nid].extend(segs)
+                total_segments += len(segs)
 
-        if total_segments >= BUFFER_SEGMENTS:
-            print(f"Buffer full. Flushing {len(segment_buffer)} node blocks via C++ threads ({num_threads})...")
+            if total_segments >= BUFFER_SEGMENTS or len(segment_buffer) >= MAX_NODES_PER_FLUSH:
+                print(f"Buffer full. Flushing {len(segment_buffer):,} node blocks via C++ mmap threads ({num_threads})...")
+                t0 = time.perf_counter()
+                fast_writer.flush_entire_buffer_parallel_mmap(
+                    mf,
+                    segment_buffer,   # dict[int -> list[Segment]]
+                    state,            # BlockTable
+                    BLOCK_HDR_SIZE,
+                    num_threads=num_threads,
+                    sort_by_offset=False,
+                )
+                segment_buffer.clear()
+                total_segments = 0
+                print(f"C++ flush complete in {time.perf_counter() - t0:.2f} s.")
+
+            if total_reads >= next_milestone:
+                elapsed = time.perf_counter() - start_time
+                print(f"{total_reads:,} reads processed | {elapsed:.1f} s")
+                next_milestone += milestone_step
+
+        if segment_buffer:
+            print(f"Final flush of {len(segment_buffer):,} node blocks via C++ mmap threads ({num_threads})...")
             t0 = time.perf_counter()
-            fast_writer.flush_entire_buffer_parallel_dict(
-                dat_fd,
-                segment_buffer,   # dict[int -> list[Segment]]
-                state,            # BlockTable
-                BLOCK_HDR_SIZE,
-                num_threads=num_threads,
-                sort_by_offset=True,
+            fast_writer.flush_entire_buffer_parallel_mmap(
+                mf, segment_buffer, state, BLOCK_HDR_SIZE,
+                num_threads=num_threads, sort_by_offset=False
             )
             segment_buffer.clear()
-            total_segments = 0
-            print(f"C++ flush complete in {time.perf_counter() - t0:.2f} s.")
+            print(f"Final flush done in {time.perf_counter() - t0:.2f} s.")
+    finally:
+        gc.enable()
 
-        if total_reads >= next_milestone:
-            elapsed = time.perf_counter() - start_time
-            print(f"{total_reads:,} reads processed | {elapsed:.1f} s")
-            next_milestone += milestone_step
-
-    if segment_buffer:
-        print(f"Final flush of {len(segment_buffer)} node blocks via C++ threads ({num_threads})...")
-        t0 = time.perf_counter()
-        fast_writer.flush_entire_buffer_parallel_dict(
-            dat_fd,
-            segment_buffer,
-            state,
-            BLOCK_HDR_SIZE,
-            num_threads=num_threads,
-            sort_by_offset=True,
-        )
-        segment_buffer.clear()
-        print(f"Final flush done in {time.perf_counter() - t0:.2f} s.")
-
+    # Optionally push dirty pages asynchronously
+    mf.msync_async()
     dat_fh.close()
 
     elapsed = time.perf_counter() - start_time
@@ -251,7 +260,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="GAM segment extractor with C++ pack+write (parallel pwrite).",
+        description="GAM segment extractor with C++ pack+write (mmap + threads).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("gam_path")
