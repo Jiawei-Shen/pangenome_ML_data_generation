@@ -312,28 +312,23 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         if not segment_buffer:
             return
 
-        # Snapshot & clear early to minimize peak memory and avoid dict-mutation issues.
-        items = list(segment_buffer.items())
-        segment_buffer.clear()
-
-        # Quick stats for logging
-        n_nodes = sum(1 for _, segs in items if segs)
-        n_segs = sum(len(segs) for _, segs in items if segs)
-
-        t0 = time.perf_counter()
+        n_nodes = len(segment_buffer)
+        n_segs = sum(len(v) for v in segment_buffer.values())
         print(f"[flush] start: nodes={n_nodes:,}, segs={n_segs:,}")
+        t0 = time.perf_counter()
 
         jobs = []
         planned_bytes = 0
 
-        for nid, segs in items:
+        # Pop items until buffer is empty
+        while segment_buffer:
+            nid, segs = segment_buffer.popitem()
             if not segs:
                 continue
             info = block_infos.get(nid)
             if not info:
                 continue
 
-            # Overflow guard
             if info["current_pos"] + len(segs) > info["n_records"]:
                 raise RuntimeError(
                     f"Block overflow for node {nid}: "
@@ -345,9 +340,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
             rec_pack = make_record_struct(R, C)
             rec_sz = rec_pack.size
 
-            # Parent packs buffer
-            n = len(segs)
-            buf = bytearray(rec_sz * n)
+            buf = bytearray(rec_sz * len(segs))
             off = 0
             for s in segs:
                 rec_pack.pack_into(
@@ -362,25 +355,22 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
                 off += rec_sz
 
             write_pos = base_offset + info["current_pos"] * rec_sz
-            info["current_pos"] += n
+            info["current_pos"] += len(segs)
 
             planned_bytes += len(buf)
-            jobs.append((write_pos, bytes(buf)))  # send immutable bytes
+            jobs.append((write_pos, bytes(buf)))
 
         t_pack = time.perf_counter()
         if jobs:
-            print(f"[flush] packed {_fmt_bytes(planned_bytes)} across {len(jobs):,} jobs; dispatching to pool...")
-            # Larger chunksize reduces scheduling overhead
+            print(f"[flush] dispatching {len(jobs):,} jobs, total≈{planned_bytes / 1e6:.2f} MB")
             pool.map(flush_worker_map, jobs, chunksize=32)
 
         t_end = time.perf_counter()
         print(
-            f"[flush] done: nodes={n_nodes:,}, segs={n_segs:,}, "
-            f"bytes≈{_fmt_bytes(planned_bytes)}, "
+            f"[flush] done: segs={n_segs:,}, "
             f"pack={t_pack - t0:.3f}s, io={t_end - t_pack:.3f}s, total={t_end - t0:.3f}s"
         )
 
-        # reset per-batch counter
         total_segments = 0
 
     try:
