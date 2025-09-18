@@ -1,6 +1,6 @@
 // fast_writer.cpp
 #include <pybind11/pybind11.h>
-#include <pybind11/stl.h>       // for BlockInfo dict build only
+#include <pybind11/stl.h>       // only for building BlockTable from a Python dict
 #include <pybind11/pytypes.h>
 #include <cstdint>
 #include <cstring>
@@ -8,10 +8,7 @@
 #include <vector>
 #include <unordered_map>
 #include <stdexcept>
-#include <algorithm>
 #include <unistd.h>             // pwrite
-#include <mutex>
-#include <thread>
 
 namespace py = pybind11;
 
@@ -95,99 +92,88 @@ static inline size_t record_size_for(int R, int C) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Prepare write jobs (pack in C++; write will be done by Python processes)
+// Pack ONE node (no I/O). Returns (write_pos:int, buf:bytes).
+//
+// Args:
+//   nid                : node id
+//   segments_for_node  : Python list[Segment] for this nid
+//   state              : BlockTable (updates current_pos)
+//   block_header_size  : size of per-block header
+//
+// This function packs under released GIL and only touches Python to return bytes.
+py::tuple pack_node(uint32_t nid, py::list segments_for_node, BlockTable& state, uint32_t block_header_size) {
+    // Look up block info
+    auto it = state.m.find(nid);
+    if (it == state.m.end()) {
+        throw std::runtime_error("nid not found in BlockTable: " + std::to_string(nid));
+    }
+    BlockInfo& info = it->second;
 
-struct PrepJob {
-    long long write_pos;
-    int R, C;
-    std::vector<const Segment*> seg_ptrs;  // no copies
-    std::vector<py::object> keep_alive;    // keep Segment Python wrappers alive
-};
-
-// Returns list[(write_pos:int, buf:bytes)]
-py::list prepare_write_jobs(py::dict segment_buffer, BlockTable& state, uint32_t block_header_size) {
-    // Phase 1 (with GIL): collect jobs, compute write_pos, bump current_pos
-    std::vector<PrepJob> jobs;
-    jobs.reserve(py::len(segment_buffer));
-
-    for (auto kv : segment_buffer) {
-        uint32_t nid = py::cast<uint32_t>(kv.first);
-        auto it = state.m.find(nid);
-        if (it == state.m.end()) continue;
-        BlockInfo& info = it->second;
-
-        py::list lst = py::cast<py::list>(kv.second);
-        size_t n = py::len(lst);
-        if (n == 0) continue;
-
-        if (info.current_pos + n > info.n_records) {
-            throw std::runtime_error("Too many records for nid " + std::to_string(nid));
-        }
-
-        long long base = static_cast<long long>(info.offset) + block_header_size;
-        long long write_pos = base + static_cast<long long>(info.current_pos) * info.record_size;
-
-        PrepJob j;
-        j.write_pos = write_pos;
-        j.R = static_cast<int>(info.max_read_len);
-        j.C = static_cast<int>(info.max_cigar_len);
-        j.seg_ptrs.reserve(n);
-        j.keep_alive.reserve(n);
-
-        for (auto obj : lst) {
-            py::object o = py::reinterpret_borrow<py::object>(obj);
-            const Segment& s = o.cast<const Segment&>();
-            j.keep_alive.emplace_back(std::move(o));
-            j.seg_ptrs.push_back(&s);
-        }
-
-        info.current_pos += static_cast<uint32_t>(n);  // reserve file space for next flush
-        jobs.emplace_back(std::move(j));
+    const size_t n = py::len(segments_for_node);
+    if (n == 0) {
+        // Return empty buffer and a dummy position (won't be used)
+        return py::make_tuple(py::int_(0), py::bytes());
     }
 
-    // Phase 2 (no GIL): pack each job into a Python bytes object
+    if (info.current_pos + n > info.n_records) {
+        throw std::runtime_error("Too many records for nid " + std::to_string(nid));
+    }
+
+    // Compute write position and reserve space
+    const long long base = static_cast<long long>(info.offset) + block_header_size;
+    const long long write_pos = base + static_cast<long long>(info.current_pos) * info.record_size;
+    info.current_pos += static_cast<uint32_t>(n);
+
+    // Collect pointers to underlying C++ Segment (keep Python refs alive during packing)
+    std::vector<const Segment*> seg_ptrs;
+    std::vector<py::object> keep_alive;
+    seg_ptrs.reserve(n);
+    keep_alive.reserve(n);
+
+    for (auto obj : segments_for_node) {
+        py::object o = py::reinterpret_borrow<py::object>(obj);
+        const Segment& s = o.cast<const Segment&>();
+        keep_alive.emplace_back(std::move(o));
+        seg_ptrs.push_back(&s);
+    }
+
+    // Pack under no GIL
     py::gil_scoped_release nogil;
 
-    py::list out;  // list of (write_pos, bytes)
-    for (auto& j : jobs) {
-        const size_t rec_sz = record_size_for(j.R, j.C);
-        const size_t total  = j.seg_ptrs.size() * rec_sz;
+    const int R = static_cast<int>(info.max_read_len);
+    const int C = static_cast<int>(info.max_cigar_len);
+    const size_t rec_sz = record_size_for(R, C);
+    std::string buf;
+    buf.resize(seg_ptrs.size() * rec_sz);
 
-        std::string buf;
-        buf.resize(total);
-        char* p = buf.data();
-
-        for (const Segment* s : j.seg_ptrs) {
-            std::memcpy(p, &s->offset, sizeof(int16_t)); p += sizeof(int16_t);
-            cp_field(p, s->seq,   j.R);
-            cp_field(p, s->bq,    j.R);
-            cp_field(p, s->cigar, j.C);
-            std::memcpy(p, &s->rq, sizeof(int16_t)); p += sizeof(int16_t);
-            *p++ = s->strand;
-        }
-
-        // back under GIL to create Python objects
-        py::gil_scoped_acquire with_gil;
-        out.append(py::make_tuple(py::int_(j.write_pos), py::bytes(buf)));
-        // 'buf' freed after py::bytes owns a copy
+    char* p = buf.data();
+    for (const Segment* s : seg_ptrs) {
+        std::memcpy(p, &s->offset, sizeof(int16_t)); p += sizeof(int16_t);
+        cp_field(p, s->seq,   R);
+        cp_field(p, s->bq,    R);
+        cp_field(p, s->cigar, C);
+        std::memcpy(p, &s->rq, sizeof(int16_t)); p += sizeof(int16_t);
+        *p++ = s->strand;
     }
 
-    return out;
+    // Back to Python objects
+    py::gil_scoped_acquire with_gil;
+    return py::make_tuple(py::int_(write_pos), py::bytes(buf));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Module
 
 PYBIND11_MODULE(fast_writer, m) {
-    m.doc() = "C++ packer for GAM-derived segments producing write jobs for multiprocessing pwrite.";
+    m.doc() = "C++ packer for GAM-derived segments; exposes per-node pack_node for MP writers.";
 
-    // Accept both str and bytes from Python for the string-like fields.
+    // Segment: support both str and bytes inputs
     py::class_<Segment>(m, "Segment")
-    // existing str-based ctor
+        // str-based ctor
         .def(py::init<int16_t, std::string, std::string, std::string, int16_t, char>(),
              py::arg("offset"), py::arg("seq"), py::arg("bq"),
              py::arg("cigar"), py::arg("rq"), py::arg("strand"))
-        // bytes + int strand overload **with named args**
+        // bytes + int strand overload (faster path)
         .def(py::init([](int16_t offset,
                          py::bytes seq,
                          py::bytes bq,
@@ -202,10 +188,9 @@ PYBIND11_MODULE(fast_writer, m) {
                 s.rq     = rq;
                 s.strand = static_cast<char>(strand);
                 return s;
-        }),
-        py::arg("offset"), py::arg("seq"), py::arg("bq"),
-        py::arg("cigar"), py::arg("rq"), py::arg("strand"));
-
+            }),
+            py::arg("offset"), py::arg("seq"), py::arg("bq"),
+            py::arg("cigar"), py::arg("rq"), py::arg("strand"));
 
     py::class_<BlockInfo>(m, "BlockInfo")
         .def(py::init<>())
@@ -221,12 +206,13 @@ PYBIND11_MODULE(fast_writer, m) {
         .def(py::init<py::dict>())
         .def("to_py_dict", &BlockTable::to_py_dict);
 
-    m.def("prepare_write_jobs", &prepare_write_jobs,
-          py::arg("segment_buffer"),
+    m.def("pack_node", &pack_node,
+          py::arg("nid"),
+          py::arg("segments_for_node"),
           py::arg("state"),
           py::arg("block_header_size"),
           R"doc(
-              Serialize per-node segments into bytes and return a list of (write_pos:int, buf:bytes).
-              Also advances state.current_pos accordingly.
+              Pack one node's segments to bytes and return (write_pos:int, buf:bytes).
+              Advances state.current_pos for that node.
           )doc");
 }
