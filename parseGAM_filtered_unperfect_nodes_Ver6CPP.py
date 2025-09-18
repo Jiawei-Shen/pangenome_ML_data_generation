@@ -112,7 +112,7 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Output init
-def initialize_output_files(stats_path, output_prefix):
+def initialize_output_files(stats_path, output_prefix, alt_threshold):
     with open(stats_path, "rb") as fh:
         stats_data = pickle.load(fh)
 
@@ -121,7 +121,7 @@ def initialize_output_files(stats_path, output_prefix):
         nid = int(node_id_key)
         perfect = int(stat.get("perfect", 0))
         not_perfect = int(stat.get("not_perfect", 0))
-        if (perfect + not_perfect) > 0 and not_perfect > 1 and not_perfect / (perfect + not_perfect) > 0.05:
+        if (perfect + not_perfect) > 0 and not_perfect > 1 and not_perfect / (perfect + not_perfect) > alt_threshold:
             wanted_nodes.add(nid)
             node_counts[nid] = perfect + not_perfect
             R = int(stat.get("max_read_length", 1) or 1)
@@ -179,16 +179,16 @@ def initialize_output_files(stats_path, output_prefix):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Pipeline
-def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filter, use_existing, num_threads):
+def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filter, use_existing, num_threads, buffer_segments, alt_threshold):
     if use_existing:
         raise NotImplementedError("--use-existing is not implemented yet.")
-    block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
+    block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix, alt_threshold)
 
     # Persistent C++ state (tracks current_pos)
     state = fast_writer.BlockTable(block_infos)
 
     # Tune this for your memory; fewer flushes = better throughput
-    BUFFER_SEGMENTS = 50_000_000
+    BUFFER_SEGMENTS = buffer_segments
 
     next_milestone, total_reads, total_segments = milestone_step, 0, 0
     start_time = time.perf_counter()
@@ -257,6 +257,8 @@ def main():
     parser.add_argument("gam_path")
     parser.add_argument("stats_pickle")
     parser.add_argument("output_prefix")
+    parser.add_argument("--buffer", type=int, default=50_000_000)
+    parser.add_argument("--alt", type=float, default=0.05, help="ALT fraction threshold (0–1) replacing 0.05")
     parser.add_argument("--milestone", type=int, default=1_000_000)
     parser.add_argument("--chr", default="")
     parser.add_argument("--use-existing", action="store_true")
@@ -271,6 +273,8 @@ def main():
         chrom_filter=args.chr,
         use_existing=args.use_existing,
         num_threads=args.threads,
+        buffer_segments=args.buffer,
+        alt_threshold=args.alt,
     )
 
 if __name__ == "__main__":
