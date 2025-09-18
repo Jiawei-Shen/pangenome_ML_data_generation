@@ -122,10 +122,10 @@ static void do_job(int fd, const Job& j) {
         *p++ = s->strand;
     }
 
-    ssize_t wrote = pwrite(fd, buf.data(), buf.size(), j.write_pos);
-    if (wrote < 0 || static_cast<size_t>(wrote) != buf.size()) {
-        throw std::runtime_error("pwrite failed for nid " + std::to_string(j.nid));
-    }
+//    ssize_t wrote = pwrite(fd, buf.data(), buf.size(), j.write_pos);
+//    if (wrote < 0 || static_cast<size_t>(wrote) != buf.size()) {
+//        throw std::runtime_error("pwrite failed for nid " + std::to_string(j.nid));
+//    }
 }
 
 // Main entry: build jobs (with GIL), then release GIL and run parallel pack+writes
