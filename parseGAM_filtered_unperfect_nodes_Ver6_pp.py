@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Option B: parent packs buffers; workers only do os.pwrite at fixed offsets.
+# Option B (mmap version): parent packs buffers; workers write to mmap at fixed offsets.
 
 import argparse
 import gzip
@@ -8,6 +8,7 @@ import struct
 import time
 import gc
 import os
+import mmap
 from collections import defaultdict
 import multiprocessing as mp
 import vg_pb2  # compiled protobuf for VG Alignment
@@ -116,7 +117,6 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
     for mapping in aln.path.mapping:
         nid = mapping.position.node_id
         if nid not in wanted_nodes:
-            # Skip over edits to keep read_off correct
             for e in mapping.edit:
                 read_off += e.to_length
             continue
@@ -208,10 +208,8 @@ def initialize_output_files(stats_path, output_prefix):
         # Pre-allocate the payload region
         if current_offset > GLOBAL_HEADER_SIZE:
             try:
-                # Best: fallocate (may not exist on all FS)
                 os.posix_fallocate(f.fileno(), 0, current_offset)
             except Exception:
-                # Fallback: seek and write a single zero at end-1
                 f.seek(current_offset - 1)
                 f.write(b"\x00")
 
@@ -233,7 +231,8 @@ def initialize_output_files(stats_path, output_prefix):
                 )
             )
 
-    return block_infos, dat_path, wanted_nodes
+    total_size = current_offset  # final byte length of the .dat file
+    return block_infos, dat_path, wanted_nodes, total_size
 
 
 def load_existing_output_files(output_prefix):
@@ -241,28 +240,41 @@ def load_existing_output_files(output_prefix):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Worker: only pwrite
-g_fd = -1  # per-process global FD
+# Worker: mmap writer
+g_map = None  # type: mmap.mmap
+g_map_len = 0
+g_dat_path = None
 
 
-def init_flush_worker(fd):
-    global g_fd
-    g_fd = fd
+def init_flush_worker_map(dat_path: str, map_len: int):
+    """Each worker opens and mmaps the file for write access."""
+    global g_map, g_map_len, g_dat_path
+    g_dat_path = dat_path
+    g_map_len = map_len
+    # r+b required; size must be already preallocated
+    fh = open(dat_path, "r+b", buffering=0)
+    # ACCESS_WRITE maps file for read/write and keeps changes visible to other processes
+    g_map = mmap.mmap(fh.fileno(), map_len, access=mmap.ACCESS_WRITE)
+    # We intentionally keep fh open (mapped file keeps FD ref); OS will close on process exit.
 
 
-def flush_worker(job):
-    """job: (write_pos:int, buf:bytes)"""
+def flush_worker_map(job):
+    """job: (write_pos:int, buf:bytes) → write into mmap slice."""
     write_pos, buf = job
-    os.pwrite(g_fd, buf, write_pos)
+    end_pos = write_pos + len(buf)
+    if end_pos > g_map_len:
+        raise RuntimeError(f"mmap write out of bounds: [{write_pos}, {end_pos}) > {g_map_len}")
+    g_map[write_pos:end_pos] = buf
+    # Rely on OS page cache; explicit flush not needed per write. Parent will flush at end.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main pipeline
 def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filter, use_existing, num_flush_workers):
     if use_existing:
-        block_infos, dat_path, wanted_nodes = load_existing_output_files(output_prefix)
+        block_infos, dat_path, wanted_nodes, total_size = load_existing_output_files(output_prefix)
     else:
-        block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
+        block_infos, dat_path, wanted_nodes, total_size = initialize_output_files(stats_path, output_prefix)
 
     BUFFER_SEGMENTS = 2_000_000  # total segments batched before a flush
     next_milestone = milestone_step
@@ -270,15 +282,11 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     total_segments = 0
     start_time = time.perf_counter()
 
-    # Open once; we won't use high-level writes further, only the FD
-    dat_fh = open(dat_path, "r+b")
-    dat_fd = dat_fh.fileno()
-    try:
-        os.set_inheritable(dat_fd, True)
-    except Exception:
-        pass
+    # Parent opens file too (so we can flush at end)
+    dat_fh = open(dat_path, "r+b", buffering=0)
 
-    # Prefer "fork" on Linux; fall back if unavailable
+    # Prefer "fork" on Linux; fall back if unavailable (spawn will still work because
+    # each worker mmaps the path independently).
     try:
         mpc = mp.get_context("fork")
     except ValueError:
@@ -286,8 +294,8 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
 
     pool = mpc.Pool(
         processes=num_flush_workers,
-        initializer=init_flush_worker,
-        initargs=(dat_fd,),
+        initializer=init_flush_worker_map,
+        initargs=(dat_path, total_size),
     )
 
     segment_buffer = defaultdict(list)
@@ -296,8 +304,6 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         nonlocal total_segments
         if not segment_buffer:
             return
-        if not hasattr(os, "pwrite"):
-            raise NotImplementedError("os.pwrite() not available on this OS.")
 
         items = list(segment_buffer.items())
         segment_buffer.clear()
@@ -342,11 +348,10 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
             write_pos = base_offset + info["current_pos"] * rec_sz
             info["current_pos"] += n
 
-            jobs.append((write_pos, bytes(buf)))  # send immutable bytes
+            jobs.append((write_pos, bytes(buf)))
 
         if jobs:
-            # Larger chunksize reduces scheduling overhead
-            pool.map(flush_worker, jobs, chunksize=32)
+            pool.map(flush_worker_map, jobs, chunksize=32)
         total_segments = 0
 
     try:
@@ -371,6 +376,18 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     finally:
         pool.close()
         pool.join()
+
+        # Parent-side final flush to ensure all dirty pages are persisted
+        try:
+            # Map briefly and flush; or fsync the file descriptor.
+            with mmap.mmap(dat_fh.fileno(), length=0, access=mmap.ACCESS_READ) as m:
+                m.flush()
+        except Exception:
+            try:
+                os.fsync(dat_fh.fileno())
+            except Exception:
+                pass
+
         dat_fh.close()
 
     elapsed = time.perf_counter() - start_time
@@ -384,7 +401,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
 # CLI
 def main():
     p = argparse.ArgumentParser(
-        description="GAM segment extractor with parallel pwrite (parent packs).",
+        description="GAM segment extractor with parallel mmap writes (parent packs).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("gam_path", help="Path to the GAM file")
@@ -393,7 +410,7 @@ def main():
     p.add_argument("--milestone", type=int, default=1_000_000, help="Progress report interval")
     p.add_argument("--chr", default="", help="Optional chromosome name to filter on")
     p.add_argument("--use-existing", action="store_true", help="Reuse existing initialized output files")
-    p.add_argument("--flush-workers", type=int, default=4, help="Workers for I/O (pwrite)")
+    p.add_argument("--flush-workers", type=int, default=4, help="Workers for I/O (mmap slice writes)")
     args = p.parse_args()
 
     run_pipeline(
