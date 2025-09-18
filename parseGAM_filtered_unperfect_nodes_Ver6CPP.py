@@ -188,7 +188,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     state = fast_writer.BlockTable(block_infos)
 
     # Tune this for your memory; fewer flushes = better throughput
-    BUFFER_SEGMENTS = 20_000_000
+    BUFFER_SEGMENTS = 50_000_000
 
     next_milestone, total_reads, total_segments = milestone_step, 0, 0
     start_time = time.perf_counter()
