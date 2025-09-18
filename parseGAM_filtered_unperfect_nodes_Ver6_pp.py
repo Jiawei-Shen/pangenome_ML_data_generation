@@ -312,63 +312,74 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         if not segment_buffer:
             return
 
+        # Summary before we mutate/empty the buffer
         n_nodes = len(segment_buffer)
         n_segs = sum(len(v) for v in segment_buffer.values())
         print(f"[flush] start: nodes={n_nodes:,}, segs={n_segs:,}")
         t0 = time.perf_counter()
 
-        jobs = []
         planned_bytes = 0
+        n_jobs = 0
 
-        # Pop items until buffer is empty
-        while segment_buffer:
-            nid, segs = segment_buffer.popitem()
-            if not segs:
-                continue
-            info = block_infos.get(nid)
-            if not info:
-                continue
+        def job_generator():
+            nonlocal planned_bytes, n_jobs
+            # Pop items lazily so memory is freed immediately
+            while segment_buffer:
+                nid, segs = segment_buffer.popitem()
+                if not segs:
+                    continue
+                info = block_infos.get(nid)
+                if not info:
+                    continue
 
-            if info["current_pos"] + len(segs) > info["n_records"]:
-                raise RuntimeError(
-                    f"Block overflow for node {nid}: "
-                    f"{info['current_pos']} + {len(segs)} > {info['n_records']}"
-                )
+                # Capacity guard
+                if info["current_pos"] + len(segs) > info["n_records"]:
+                    raise RuntimeError(
+                        f"Block overflow for node {nid}: "
+                        f"{info['current_pos']} + {len(segs)} > {info['n_records']}"
+                    )
 
-            base_offset = info["offset"] + BLOCK_HDR_SIZE
-            R, C = info["max_read_len"], info["max_cigar_len"]
-            rec_pack = make_record_struct(R, C)
-            rec_sz = rec_pack.size
+                base_offset = info["offset"] + BLOCK_HDR_SIZE
+                R, C = info["max_read_len"], info["max_cigar_len"]
+                rec_pack = make_record_struct(R, C)
+                rec_sz = rec_pack.size
 
-            buf = bytearray(rec_sz * len(segs))
-            off = 0
-            for s in segs:
-                rec_pack.pack_into(
-                    buf, off,
-                    int(s.offset),
-                    s.seq.ljust(R, b"\x00")[:R],
-                    s.bq.ljust(R, b"\x00")[:R],
-                    s.cigar.ljust(C, b"\x00")[:C],
-                    int(s.rq),
-                    s.strand if s.strand in (b"+", b"-") else b"+",
-                )
-                off += rec_sz
+                # Pack a single node’s batch into one contiguous buffer
+                n = len(segs)
+                buf = bytearray(rec_sz * n)
+                off = 0
+                for s in segs:
+                    rec_pack.pack_into(
+                        buf, off,
+                        int(s.offset),
+                        s.seq.ljust(R, b"\x00")[:R],
+                        s.bq.ljust(R, b"\x00")[:R],
+                        s.cigar.ljust(C, b"\x00")[:C],
+                        int(s.rq),
+                        s.strand if s.strand in (b"+", b"-") else b"+",
+                    )
+                    off += rec_sz
 
-            write_pos = base_offset + info["current_pos"] * rec_sz
-            info["current_pos"] += len(segs)
+                write_pos = base_offset + info["current_pos"] * rec_sz
+                info["current_pos"] += n
 
-            planned_bytes += len(buf)
-            jobs.append((write_pos, bytes(buf)))
+                planned_bytes += len(buf)
+                n_jobs += 1
 
-        t_pack = time.perf_counter()
-        if jobs:
-            print(f"[flush] dispatching {len(jobs):,} jobs, total≈{planned_bytes / 1e6:.2f} MB")
-            pool.map(flush_worker_map, jobs, chunksize=32)
+                # Yield lazily: once yielded, the pool can consume it immediately
+                yield (write_pos, bytes(buf))
 
+        t_pack_start = time.perf_counter()
+        # Stream jobs to workers; consume the iterator to drive execution
+        # chunksize>1 reduces scheduling overhead but still streams lazily.
+        for _ in pool.imap_unordered(flush_worker_map, job_generator(), chunksize=32):
+            pass
         t_end = time.perf_counter()
+
         print(
-            f"[flush] done: segs={n_segs:,}, "
-            f"pack={t_pack - t0:.3f}s, io={t_end - t_pack:.3f}s, total={t_end - t0:.3f}s"
+            f"[flush] done: nodes={n_nodes:,}, segs={n_segs:,}, "
+            f"jobs={n_jobs:,}, bytes≈{_fmt_bytes(planned_bytes)}, "
+            f"total={t_end - t0:.3f}s (dispatch+io={t_end - t_pack_start:.3f}s)"
         )
 
         total_segments = 0
