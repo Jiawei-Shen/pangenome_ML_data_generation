@@ -300,15 +300,32 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
 
     segment_buffer = defaultdict(list)
 
+    def _fmt_bytes(n):
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if n < 1024:
+                return f"{n:.1f}{unit}"
+            n /= 1024
+        return f"{n:.1f}PB"
+
     def flush_segment_buffer_parallel():
         nonlocal total_segments
         if not segment_buffer:
             return
 
+        # Snapshot & clear early to minimize peak memory and avoid dict-mutation issues.
         items = list(segment_buffer.items())
         segment_buffer.clear()
 
+        # Quick stats for logging
+        n_nodes = sum(1 for _, segs in items if segs)
+        n_segs = sum(len(segs) for _, segs in items if segs)
+
+        t0 = time.perf_counter()
+        print(f"[flush] start: nodes={n_nodes:,}, segs={n_segs:,}")
+
         jobs = []
+        planned_bytes = 0
+
         for nid, segs in items:
             if not segs:
                 continue
@@ -334,8 +351,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
             off = 0
             for s in segs:
                 rec_pack.pack_into(
-                    buf,
-                    off,
+                    buf, off,
                     int(s.offset),
                     s.seq.ljust(R, b"\x00")[:R],
                     s.bq.ljust(R, b"\x00")[:R],
@@ -348,10 +364,23 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
             write_pos = base_offset + info["current_pos"] * rec_sz
             info["current_pos"] += n
 
-            jobs.append((write_pos, bytes(buf)))
+            planned_bytes += len(buf)
+            jobs.append((write_pos, bytes(buf)))  # send immutable bytes
 
+        t_pack = time.perf_counter()
         if jobs:
+            print(f"[flush] packed {_fmt_bytes(planned_bytes)} across {len(jobs):,} jobs; dispatching to pool...")
+            # Larger chunksize reduces scheduling overhead
             pool.map(flush_worker_map, jobs, chunksize=32)
+
+        t_end = time.perf_counter()
+        print(
+            f"[flush] done: nodes={n_nodes:,}, segs={n_segs:,}, "
+            f"bytes≈{_fmt_bytes(planned_bytes)}, "
+            f"pack={t_pack - t0:.3f}s, io={t_end - t_pack:.3f}s, total={t_end - t0:.3f}s"
+        )
+
+        # reset per-batch counter
         total_segments = 0
 
     try:
