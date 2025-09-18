@@ -1,277 +1,271 @@
-#!/usr/bin/env python3
-import argparse
-import gzip
-import pickle
-import struct
-import time
-import gc
-import os
-from collections import defaultdict
+// fast_writer.cpp
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>       // only for building BlockTable from a Python dict
+#include <pybind11/pytypes.h>
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <vector>
+#include <unordered_map>
+#include <stdexcept>
+#include <algorithm>
+#include <thread>
+#include <unistd.h>             // pwrite
 
-import vg_pb2
-import fast_writer  # Segment, BlockTable, flush_entire_buffer_parallel_dict
+namespace py = pybind11;
 
-# ─────────────────────────────────────────────────────────────────────────────
-# File layout
-GLOBAL_MAGIC = b"MYFMT\x01"
-GLOBAL_VER_PACK = struct.Struct("<BBI16s")
-GLOBAL_MAJOR, GLOBAL_MINOR = 0, 5
-GLOBAL_HEADER_SIZE = len(GLOBAL_MAGIC) + GLOBAL_VER_PACK.size
-BLOCK_HDR_PACK = struct.Struct("<I I H I I")
-BLOCK_HDR_SIZE = BLOCK_HDR_PACK.size
+// ─────────────────────────────────────────────────────────────────────────────
+// Data types
 
-def make_record_struct(max_read_len: int, max_cigar_len: int) -> struct.Struct:
-    return struct.Struct(f"<h{max_read_len}s{max_read_len}s{max_cigar_len}shc")
+struct Segment {
+    int16_t offset;
+    std::string seq;    // raw bytes
+    std::string bq;     // raw bytes
+    std::string cigar;  // raw bytes
+    int16_t rq;
+    char strand;
+};
 
-def record_size(max_read_len: int, max_cigar_len: int) -> int:
-    return make_record_struct(max_read_len, max_cigar_len).size
+struct BlockInfo {
+    uint64_t offset;
+    uint32_t n_records;
+    uint32_t current_pos;
+    uint32_t max_read_len;
+    uint32_t max_cigar_len;
+    uint32_t record_size;
+    uint64_t block_size;
+};
 
-# ─────────────────────────────────────────────────────────────────────────────
-# GAM parsing helpers
-def read_varint(stream):
-    value, shift_amount = 0, 0
-    while True:
-        b = stream.read(1)
-        if not b: raise EOFError("EOF while reading varint")
-        v = b[0]
-        value |= (v & 0x7F) << shift_amount
-        if not (v & 0x80): return value
-        shift_amount += 7
+// Holds block_infos persistently in C++
+struct BlockTable {
+    std::unordered_map<uint32_t, BlockInfo> m;
 
-def file_is_gzip(path):
-    with open(path, "rb") as f: return f.read(2) == b"\x1f\x8b"
+    explicit BlockTable(py::dict py_bi) {
+        m.reserve(py::len(py_bi));
+        for (auto kv : py_bi) {
+            uint32_t nid = py::cast<uint32_t>(kv.first);
+            py::dict d   = py::cast<py::dict>(kv.second);
 
-def gam_record_iter(path, tag="GAM"):
-    open_func = gzip.open if file_is_gzip(path) else open
-    with open_func(path, "rb") as f:
-        while True:
-            try:
-                group_count = read_varint(f)
-            except EOFError:
-                break
-            if group_count == 0: continue
-            try:
-                tag_len = read_varint(f)
-                group_tag = f.read(tag_len).decode()
-            except (EOFError, UnicodeDecodeError):
-                break
-            if group_tag != tag:
-                for _ in range(group_count - 1): f.seek(read_varint(f), 1)
-                continue
-            for _ in range(group_count - 1):
-                try:
-                    yield f.read(read_varint(f))
-                except EOFError:
-                    break
+            BlockInfo bi{};
+            bi.offset        = py::cast<uint64_t>(d["offset"]);
+            bi.n_records     = py::cast<uint32_t>(d["n_records"]);
+            bi.current_pos   = py::cast<uint32_t>(d["current_pos"]);
+            bi.max_read_len  = py::cast<uint32_t>(d["max_read_len"]);
+            bi.max_cigar_len = py::cast<uint32_t>(d["max_cigar_len"]);
+            bi.record_size   = py::cast<uint32_t>(d["record_size"]);
+            bi.block_size    = py::cast<uint64_t>(d["block_size"]);
 
-def process_alignment(raw_message, wanted_nodes, chrom_filter):
-    """Return dict[nid] -> list[fast_writer.Segment]."""
-    segment_dict = {}
-    aln = vg_pb2.Alignment()
-    aln.ParseFromString(raw_message)
-
-    if aln.mapping_quality <= 10 or (chrom_filter and not any(pos.name == chrom_filter for pos in aln.refpos)):
-        return segment_dict
-
-    read_sequence, read_quality, mapq, read_offset = aln.sequence, aln.quality, aln.mapping_quality, 0
-
-    for mapping in aln.path.mapping:
-        nid = mapping.position.node_id
-        if nid not in wanted_nodes:
-            for e in mapping.edit: read_offset += e.to_length
-            continue
-
-        node_offset = mapping.position.offset
-        strand_byte = (b"-" if mapping.position.is_reverse else b"+")[0]
-
-        seq_parts, bq_parts, cigar_parts = [], bytearray(), []
-        for e in mapping.edit:
-            fL, tL = e.from_length, e.to_length
-            if fL == tL:
-                cigar_parts.append(f"{fL}M" if not e.sequence else f"{fL}X")
-            elif fL > 0 and tL == 0:
-                cigar_parts.append(f"{fL}D")
-            elif fL == 0 and tL > 0:
-                cigar_parts.append(f"{tL}I")
-            if tL > 0:
-                seq_parts.append(read_sequence[read_offset: read_offset + tL].upper())
-                bq_parts.extend(read_quality[read_offset: read_offset + tL])
-                read_offset += tL
-
-        seg = fast_writer.Segment(
-            offset=int(node_offset),
-            seq="".join(seq_parts).encode(),        # bytes → std::string (no Unicode overhead)
-            bq=bytes(bq_parts),
-            cigar="".join(cigar_parts).encode(),
-            rq=int(mapq),
-            strand=int(strand_byte),                # one byte
-        )
-        segment_dict.setdefault(nid, []).append(seg)
-
-    return segment_dict
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Output init
-def initialize_output_files(stats_path, output_prefix):
-    with open(stats_path, "rb") as fh:
-        stats_data = pickle.load(fh)
-
-    wanted_nodes, node_counts, maxima = set(), {}, {}
-    for node_id_key, stat in stats_data.items():
-        nid = int(node_id_key)
-        perfect = int(stat.get("perfect", 0))
-        not_perfect = int(stat.get("not_perfect", 0))
-        if (perfect + not_perfect) > 0 and not_perfect > 1 and not_perfect / (perfect + not_perfect) > 0.05:
-            wanted_nodes.add(nid)
-            node_counts[nid] = perfect + not_perfect
-            R = int(stat.get("max_read_length", 1) or 1)
-            C = int(stat.get("max_cigar_length", 1) or 1)
-            maxima[nid] = (max(1, R), max(1, C))
-
-    print(f"Filtered {len(wanted_nodes)} nodes from {len(stats_data)} total.")
-    del stats_data
-    gc.collect()
-
-    block_infos = {}
-    current_offset = GLOBAL_HEADER_SIZE
-    for nid in sorted(list(wanted_nodes)):  # deterministic layout
-        nrec = node_counts[nid]
-        R, C = maxima[nid]
-        rec_sz = record_size(R, C)
-        blk_sz = BLOCK_HDR_SIZE + nrec * rec_sz
-        block_infos[nid] = {
-            "offset": current_offset,
-            "n_records": nrec,
-            "current_pos": 0,
-            "max_read_len": R,
-            "max_cigar_len": C,
-            "record_size": rec_sz,
-            "block_size": blk_sz,
+            m.emplace(nid, bi);
         }
-        current_offset += blk_sz
+    }
 
-    dat_path = output_prefix + ".dat"
-    with open(dat_path, "wb") as f:
-        f.write(GLOBAL_MAGIC)
-        f.write(GLOBAL_VER_PACK.pack(GLOBAL_MAJOR, GLOBAL_MINOR, len(block_infos), b'\x00' * 16))
-        for nid, info in block_infos.items():
-            f.write(BLOCK_HDR_PACK.pack(nid, info["n_records"], 0, info["max_read_len"], info["max_cigar_len"]))
-        if current_offset > GLOBAL_HEADER_SIZE:  # pre-allocate
-            f.seek(current_offset - 1)
-            f.write(b'\x00')
+    py::dict to_py_dict() const {
+        py::dict out;
+        for (const auto& kv : m) {
+            const auto& bi = kv.second;
+            py::dict d;
+            d["offset"]        = py::int_(static_cast<uint64_t>(bi.offset));
+            d["n_records"]     = py::int_(static_cast<uint32_t>(bi.n_records));
+            d["current_pos"]   = py::int_(static_cast<uint32_t>(bi.current_pos));
+            d["max_read_len"]  = py::int_(static_cast<uint32_t>(bi.max_read_len));
+            d["max_cigar_len"] = py::int_(static_cast<uint32_t>(bi.max_cigar_len));
+            d["record_size"]   = py::int_(static_cast<uint32_t>(bi.record_size));
+            d["block_size"]    = py::int_(static_cast<uint64_t>(bi.block_size));
+            out[py::int_(kv.first)] = std::move(d);
+        }
+        return out;
+    }
+};
 
-    idx_path = output_prefix + ".idx"
-    with open(idx_path, "wb") as idx:
-        idx.write(struct.pack("<I", len(block_infos)))
-        for nid, info in block_infos.items():
-            idx.write(struct.pack(
-                "<I Q I I H I I",
-                nid,
-                info["offset"],
-                info["block_size"],
-                info["n_records"],
-                0,
-                info["max_read_len"],
-                info["max_cigar_len"],
-            ))
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
 
-    return block_infos, dat_path, wanted_nodes
+static inline void cp_field(char*& p, const std::string& s, int L) {
+    size_t n = s.size();
+    if (n > static_cast<size_t>(L)) n = static_cast<size_t>(L);
+    std::memcpy(p, s.data(), n);
+    if (n < static_cast<size_t>(L)) std::memset(p + n, 0, L - n);
+    p += L;
+}
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Pipeline
-def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filter, use_existing, num_threads):
-    if use_existing:
-        raise NotImplementedError("--use-existing is not implemented yet.")
-    block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
+// <h R s R s C s h c>  => 2 + R + R + C + 2 + 1
+static inline size_t record_size_for(int R, int C) {
+    return 2u + static_cast<size_t>(R) + static_cast<size_t>(R) + static_cast<size_t>(C) + 2u + 1u;
+}
 
-    # Persistent C++ state (tracks current_pos)
-    state = fast_writer.BlockTable(block_infos)
+// ─────────────────────────────────────────────────────────────────────────────
+// Job struct for parallel pack+write
 
-    # Tune this for your memory; fewer flushes = better throughput
-    BUFFER_SEGMENTS = 1_000_000
+struct Job {
+    uint32_t nid;
+    long long write_pos;
+    int R, C;
+    std::vector<const Segment*> seg_ptrs;  // raw pointers to C++ Segment objects
+    std::vector<py::object> keep_alive;    // keep Python wrappers alive
+};
 
-    next_milestone, total_reads, total_segments = milestone_step, 0, 0
-    start_time = time.perf_counter()
+// Worker: pack + pwrite (no Python API; GIL is released during whole parallel section)
+static void do_job(int fd, const Job& j) {
+    const size_t rec_sz = record_size_for(j.R, j.C);
+    const size_t total  = j.seg_ptrs.size() * rec_sz;
 
-    dat_fh = open(dat_path, "r+b", buffering=0)
-    dat_fd = dat_fh.fileno()
+    std::string buf;
+    buf.resize(total);
 
-    segment_buffer = defaultdict(list)
+    char* p = buf.data();
+    for (const Segment* s : j.seg_ptrs) {
+        std::memcpy(p, &s->offset, sizeof(int16_t)); p += sizeof(int16_t);
+        cp_field(p, s->seq,   j.R);
+        cp_field(p, s->bq,    j.R);
+        cp_field(p, s->cigar, j.C);
+        std::memcpy(p, &s->rq, sizeof(int16_t)); p += sizeof(int16_t);
+        *p++ = s->strand;
+    }
 
-    for raw_msg in gam_record_iter(gam_path):
-        segs_by_node = process_alignment(raw_msg, wanted_nodes, chrom_filter)
-        total_reads += 1
+    ssize_t wrote = pwrite(fd, buf.data(), buf.size(), j.write_pos);
+    if (wrote < 0 || static_cast<size_t>(wrote) != buf.size()) {
+        throw std::runtime_error("pwrite failed for nid " + std::to_string(j.nid));
+    }
+}
 
-        for nid, segs in segs_by_node.items():
-            segment_buffer[nid].extend(segs)
-            total_segments += len(segs)
+// Main entry: build jobs (with GIL), then release GIL and run parallel pack+writes
+void flush_entire_buffer_parallel_dict(
+    int fd,
+    py::dict segment_buffer,        // dict[int -> list[Segment]]
+    BlockTable& state,
+    uint32_t block_header_size,
+    int num_threads = 4,
+    bool sort_by_offset = true
+) {
+    // 1) Build job list & reserve file space (with GIL)
+    std::vector<Job> jobs;
+    jobs.reserve(py::len(segment_buffer));
 
-        if total_segments >= BUFFER_SEGMENTS:
-            print(f"Buffer full. Flushing {len(segment_buffer)} node blocks via C++ threads ({num_threads})...")
-            t0 = time.perf_counter()
-            fast_writer.flush_entire_buffer_parallel_dict(
-                dat_fd,
-                segment_buffer,   # dict[int -> list[Segment]]
-                state,            # BlockTable
-                BLOCK_HDR_SIZE,
-                num_threads=num_threads,
-                sort_by_offset=True,
-            )
-            segment_buffer.clear()
-            total_segments = 0
-            print(f"C++ flush complete in {time.perf_counter() - t0:.2f} s.")
+    for (auto kv : segment_buffer) {
+        uint32_t nid = py::cast<uint32_t>(kv.first);
+        auto it = state.m.find(nid);
+        if (it == state.m.end()) continue;  // skip unknown nid
 
-        if total_reads >= next_milestone:
-            elapsed = time.perf_counter() - start_time
-            print(f"{total_reads:,} reads processed | {elapsed:.1f} s")
-            next_milestone += milestone_step
+        BlockInfo& info = it->second;
+        py::list lst = py::cast<py::list>(kv.second);
+        size_t n = py::len(lst);
+        if (n == 0) continue;
 
-    if segment_buffer:
-        print(f"Final flush of {len(segment_buffer)} node blocks via C++ threads ({num_threads})...")
-        t0 = time.perf_counter()
-        fast_writer.flush_entire_buffer_parallel_dict(
-            dat_fd,
-            segment_buffer,
-            state,
-            BLOCK_HDR_SIZE,
-            num_threads=num_threads,
-            sort_by_offset=True,
-        )
-        segment_buffer.clear()
-        print(f"Final flush done in {time.perf_counter() - t0:.2f} s.")
+        if (info.current_pos + n > info.n_records) {
+            throw std::runtime_error("Too many records for nid " + std::to_string(nid));
+        }
 
-    dat_fh.close()
+        long long base = static_cast<long long>(info.offset) + block_header_size;
+        long long write_pos = base + static_cast<long long>(info.current_pos) * info.record_size;
 
-    elapsed = time.perf_counter() - start_time
-    print("\nFinal Summary:")
-    print(f"  Total reads processed: {total_reads:,}")
-    print(f"  Nodes included: {len(block_infos)}")
-    print(f"  Elapsed time: {elapsed:.2f} s")
+        Job j;
+        j.nid = nid;
+        j.write_pos = write_pos;
+        j.R = static_cast<int>(info.max_read_len);
+        j.C = static_cast<int>(info.max_cigar_len);
+        j.seg_ptrs.reserve(n);
+        j.keep_alive.reserve(n);
 
-# ─────────────────────────────────────────────────────────────────────────────
-def main():
-    parser = argparse.ArgumentParser(
-        description="GAM segment extractor with C++ pack+write (parallel pwrite).",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-    parser.add_argument("gam_path")
-    parser.add_argument("stats_pickle")
-    parser.add_argument("output_prefix")
-    parser.add_argument("--milestone", type=int, default=1_000_000)
-    parser.add_argument("--chr", default="")
-    parser.add_argument("--use-existing", action="store_true")
-    parser.add_argument("--threads", type=int, default=4, help="C++ writer threads")
-    args = parser.parse_args()
+        for (auto obj : lst) {
+            py::object o = py::reinterpret_borrow<py::object>(obj);
+            const Segment& s = o.cast<const Segment&>();  // C++ ref to bound object
+            j.keep_alive.emplace_back(std::move(o));      // keep Python alive until after threads join
+            j.seg_ptrs.push_back(&s);
+        }
 
-    run_pipeline(
-        gam_path=args.gam_path,
-        stats_path=args.stats_pickle,
-        output_prefix=args.output_prefix,
-        milestone_step=args.milestone,
-        chrom_filter=args.chr,
-        use_existing=args.use_existing,
-        num_threads=args.threads,
-    )
+        info.current_pos += static_cast<uint32_t>(n);  // reserve space for next flush
+        jobs.emplace_back(std::move(j));
+    }
 
-if __name__ == "__main__":
-    main()
+    if (jobs.empty()) return;
+
+    if (sort_by_offset) {
+        std::sort(jobs.begin(), jobs.end(),
+                  [](const Job& a, const Job& b){ return a.write_pos < b.write_pos; });
+    }
+
+    if (num_threads < 1) num_threads = 1;
+    if (num_threads > (int)jobs.size()) num_threads = (int)jobs.size();
+
+    // 2) Parallel pack + write with GIL released
+    {
+        py::gil_scoped_release nogil;
+
+        std::vector<std::thread> workers;
+        workers.reserve(num_threads);
+
+        // simple static partition
+        auto worker_fn = [&](int tid) {
+            size_t start = (jobs.size() * tid) / num_threads;
+            size_t end   = (jobs.size() * (tid + 1)) / num_threads;
+            for (size_t i = start; i < end; ++i) {
+                do_job(fd, jobs[i]);
+            }
+        };
+
+        for (int t = 0; t < num_threads; ++t) {
+            workers.emplace_back(worker_fn, t);
+        }
+        for (auto& th : workers) th.join();
+    }
+    // GIL auto-reacquired here; jobs & keep_alive will be destroyed safely.
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Module
+
+PYBIND11_MODULE(fast_writer, m) {
+    m.doc() = "C++ pack+write for GAM-derived segments with parallel pwrite.";
+
+    // Segment: support both str and bytes inputs
+    py::class_<Segment>(m, "Segment")
+        // str-based ctor
+        .def(py::init<int16_t, std::string, std::string, std::string, int16_t, char>(),
+             py::arg("offset"), py::arg("seq"), py::arg("bq"),
+             py::arg("cigar"), py::arg("rq"), py::arg("strand"))
+        // bytes + int strand overload (named args so kwargs work)
+        .def(py::init([](int16_t offset,
+                         py::bytes seq,
+                         py::bytes bq,
+                         py::bytes cigar,
+                         int16_t rq,
+                         int strand) {
+                Segment s{};
+                s.offset = offset;
+                s.seq    = std::string(seq);
+                s.bq     = std::string(bq);
+                s.cigar  = std::string(cigar);
+                s.rq     = rq;
+                s.strand = static_cast<char>(strand);
+                return s;
+            }),
+            py::arg("offset"), py::arg("seq"), py::arg("bq"),
+            py::arg("cigar"), py::arg("rq"), py::arg("strand"));
+
+    py::class_<BlockInfo>(m, "BlockInfo")
+        .def(py::init<>())
+        .def_readwrite("offset",        &BlockInfo::offset)
+        .def_readwrite("n_records",     &BlockInfo::n_records)
+        .def_readwrite("current_pos",   &BlockInfo::current_pos)
+        .def_readwrite("max_read_len",  &BlockInfo::max_read_len)
+        .def_readwrite("max_cigar_len", &BlockInfo::max_cigar_len)
+        .def_readwrite("record_size",   &BlockInfo::record_size)
+        .def_readwrite("block_size",    &BlockInfo::block_size);
+
+    py::class_<BlockTable>(m, "BlockTable")
+        .def(py::init<py::dict>())
+        .def("to_py_dict", &BlockTable::to_py_dict);
+
+    m.def("flush_entire_buffer_parallel_dict", &flush_entire_buffer_parallel_dict,
+          py::arg("fd"),
+          py::arg("segment_buffer"),
+          py::arg("state"),
+          py::arg("block_header_size"),
+          py::arg("num_threads") = (int)std::thread::hardware_concurrency(),
+          py::arg("sort_by_offset") = true,
+          R"doc(
+              Pack and write all segments in 'segment_buffer' using C++ threads.
+              'segment_buffer' is { nid:int -> list[Segment] }.
+              'state' is a BlockTable created from your Python block_infos (updates current_pos).
+          )doc");
+}
