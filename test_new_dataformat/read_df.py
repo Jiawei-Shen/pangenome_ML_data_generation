@@ -199,7 +199,7 @@ def read_segments(dat_path, node_index, node_id):
         # Jump to records start
         block_content_start = block_start + hdr_size
         f.seek(block_content_start, os.SEEK_SET)
-
+        print(rec_size)
         for _ in range(n_records):
             raw = f.read(rec_size)
             if len(raw) < rec_size:
