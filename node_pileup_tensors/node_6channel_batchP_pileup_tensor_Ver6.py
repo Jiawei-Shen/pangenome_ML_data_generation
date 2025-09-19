@@ -29,15 +29,15 @@ IDX_ENTRY_SIZE = 30
 IDX_ENTRY_PACK = struct.Struct("<I Q I I H I I")  # nid, offset, block_size, n_records, flags, R, C
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Encoding tables & tensor constants (unchanged)
-
-BASE_TO_INDEX = {'A': 20, 'C': 30, 'G': 50, 'T': 70, 'N': 10, '*': 90, '_PADDING_': 0}
+# Encoding tables & tensor constants (with requested codes)
+# NOTE: '*' → 1, 'I' → 90, 'N' → 5
+BASE_TO_INDEX = {'A': 20, 'C': 30, 'G': 50, 'T': 70, 'N': 5, '*': 1, 'I': 90, '_PADDING_': 0}
 PADDING_BASE_INDEX = 0
 
 CIGAR_OP_TO_INDEX = {'M': 10, 'N': 20, 'S': 30, 'I': 40, 'D': 50, 'H': 60, 'P': 70, '=': 80, 'X': 90, '_PADDING_': 0}
 CIGAR_PADDING_INDEX = 0
 
-INDEX_TO_BASE_FOR_VIEW = {20: 'A', 30: 'C', 50: 'G', 70: 'T', 10: 'N', 90: '*', 0: ' '}
+INDEX_TO_BASE_FOR_VIEW = {20: 'A', 30: 'C', 50: 'G', 70: 'T', 5: 'N', 1: '*', 90: 'I', 0: ' '}
 
 TENSOR_WINDOW_SIZE = 100
 TENSOR_MAX_READ_ROWS = 200
@@ -302,6 +302,10 @@ def init_worker(dat_file_path_for_worker, base_output_dir_for_worker, need_view_
     worker_base_output_dir = base_output_dir_for_worker
     worker_need_view = bool(need_view_flag)
 
+def _non_M_length(cops):
+    # Sum of lengths for CIGAR ops that are NOT 'M'
+    return sum(L for L, op in cops or [] if op != 'M')
+
 def process_single_node_for_pileup(task_args):
     (node_id, dat_file_offset, n_records,
      min_af_threshold, min_variants_threshold, min_allele_bq_threshold,
@@ -387,10 +391,16 @@ def process_single_node_for_pileup(task_args):
         sys.stderr.write(f"Error [Node {node_id}]: {e}\n")
         return node_id, None, tensor_files_generated_for_node
 
+    # ▼ NEW: downselect to top 200 by "non-M base length" instead of returning early
+    if len(aligned_read_segments) > TENSOR_MAX_READ_ROWS:
+        aligned_read_segments.sort(
+            key=lambda s: _non_M_length(s["cigar_ops"]),
+            reverse=True
+        )
+        aligned_read_segments = aligned_read_segments[:(TENSOR_MAX_READ_ROWS * 2)]
+
     if not aligned_read_segments:
         return node_id, {}, tensor_files_generated_for_node
-    if len(aligned_read_segments) > 100000:
-        return node_id, None, tensor_files_generated_for_node
 
     # Variant discovery
     candidate_variants = defaultdict(int)
@@ -507,6 +517,23 @@ def process_single_node_for_pileup(task_args):
             b_row, q_row, mq_row, cig_row = get_read_tensor_rows_in_window(
                 seg["cigar_ops"], seg["offset_on_node"], seg["read_sequence"], seg["processed_quality_values"],
                 mapq, win_start, TENSOR_WINDOW_SIZE, node_len)
+
+            # ── Encode insertion ALT as 'I' at the anchor with mean BQ of inserted bases
+            if v_type == 'I' and 0 <= variant_win_idx < TENSOR_WINDOW_SIZE:
+                allele_ins, mean_bq_ins = get_allele_from_read_at_node_pos(
+                    seg["offset_on_node"],
+                    seg["read_sequence"],
+                    seg["processed_quality_values"],
+                    seg["cigar_ops"],
+                    v_pos,
+                    node_sequence,
+                    expected_var_type='I',
+                    expected_ref_allele_for_indel=(node_sequence[v_pos] if 0 <= v_pos < node_len else "*"),
+                )
+                if isinstance(allele_ins, str) and allele_ins == v_alt_from_cigar:
+                    b_row[variant_win_idx] = BASE_TO_INDEX['I']
+                    if mean_bq_ins is not None:
+                        q_row[variant_win_idx] = int(max(0, min(127, round(mean_bq_ins))))
 
             if any(b != PADDING_BASE_INDEX for b in b_row):
                 r = 1 + reads_added

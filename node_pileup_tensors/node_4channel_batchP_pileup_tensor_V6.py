@@ -29,8 +29,9 @@ RECORD_SIZE = RECORD_STRUCT.size
 
 BASE_TO_INDEX = {
     'A': 20, 'C': 30, 'G': 50, 'T': 70,
-    'N': 10,
-    '*': 90,
+    'N': 5,      # CHANGED
+    '*': 1,      # CHANGED
+    'I': 90,     # ADDED: insertion placeholder token
     '_PADDING_': 0
 }
 PADDING_BASE_INDEX = 0
@@ -43,8 +44,8 @@ CIGAR_PADDING_INDEX = 0
 
 INDEX_TO_BASE_FOR_VIEW = {
     20: 'A', 30: 'C', 50: 'G', 70: 'T',
-    10: 'N',
-    90: '*',
+    5: 'N',   # CHANGED to reflect 'N' -> 5
+    1: '*',   # CHANGED to reflect '*' -> 1
     0: ' '
 }
 
@@ -376,7 +377,26 @@ def get_read_tensor_rows_in_window(segment_cigar_ops, segment_offset_on_node,
                     bases[win_idx] = BASE_TO_INDEX['*']
                     quals[win_idx] = DEFAULT_QUALITY_PADDING
             node_pos += L
-        elif op in ('I', 'S'):
+        elif op == 'I':
+            # Represent insertion at its left anchor (node_pos - 1)
+            anchor_node_pos = node_pos - 1
+            anchor_idx = anchor_node_pos - window_start_node
+            if 0 <= anchor_idx < tensor_win_size:
+                cigar_ops_indices[anchor_idx] = op_idx          # mark CIGAR 'I' at anchor
+                mapqs[anchor_idx] = mapping_quality             # place MAPQ at anchor
+                bases[anchor_idx] = BASE_TO_INDEX['I']          # use 'I' token (90)
+
+                # average BQ across the inserted run
+                if L > 0 and read_pos + L <= qual_len:
+                    ins_quals = segment_quality_values[read_pos: read_pos + L]
+                    avg_bq = int(round(sum(ins_quals) / L)) if ins_quals else DEFAULT_QUALITY_PADDING
+                else:
+                    avg_bq = DEFAULT_QUALITY_PADDING
+                quals[anchor_idx] = avg_bq
+
+            # Insertions consume read only (no node columns)
+            read_pos += L
+        elif op == 'S':
             read_pos += L
 
         if read_pos >= read_seq_len:
@@ -502,8 +522,14 @@ def process_single_node_for_pileup(task_args):
 
     if not aligned_read_segments:
         return node_id, {}, tensor_files_generated_for_node
-    if len(aligned_read_segments) > 100000:
-        return node_id, None, tensor_files_generated_for_node
+
+    # NEW: if too many reads, keep only top 400 by "non-M length" (prioritize mismatches/indels)
+    if len(aligned_read_segments) > TENSOR_MAX_READ_ROWS:
+        def non_m_length(seg):
+            # Sum lengths for CIGAR ops that are not 'M'
+            return sum(L for L, op in seg["cigar_ops"] if op != 'M')
+        aligned_read_segments.sort(key=non_m_length, reverse=True)
+        aligned_read_segments = aligned_read_segments[: (TENSOR_MAX_READ_ROWS * 2)]  # 200 * 2 = 400
 
     candidate_variants = defaultdict(int)
     for seg in aligned_read_segments:
