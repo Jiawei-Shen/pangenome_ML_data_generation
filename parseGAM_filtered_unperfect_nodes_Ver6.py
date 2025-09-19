@@ -304,7 +304,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     total_segments = 0
     start_time = time.perf_counter()
 
-    # dat_fh = open(dat_path, "r+b")
+    dat_fh = open(dat_path, "r+b")
     fd = os.open(dat_path, os.O_RDWR)
     segment_buffer = defaultdict(list)
 
