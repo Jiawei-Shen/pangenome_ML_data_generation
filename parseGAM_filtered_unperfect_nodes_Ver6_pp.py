@@ -201,17 +201,25 @@ def initialize_output_files(stats_path, output_prefix):
     # Create and preallocate .dat
     dat_path = output_prefix + ".dat"
     with open(dat_path, "wb") as f:
+        # 1) write global header
         f.write(GLOBAL_MAGIC)
-        f.write(GLOBAL_VER_PACK.pack(GLOBAL_MAJOR, GLOBAL_MINOR, len(block_infos), b"\x00" * 16))
-        for nid, info in block_infos.items():
-            f.write(BLOCK_HDR_PACK.pack(nid, info["n_records"], 0, info["max_read_len"], info["max_cigar_len"]))
-        # Pre-allocate the payload region
+        f.write(GLOBAL_VER_PACK.pack(GLOBAL_MAJOR, GLOBAL_MINOR, len(block_infos), b'\x00' * 16))
+
+        # 2) pre-allocate whole file
         if current_offset > GLOBAL_HEADER_SIZE:
-            try:
-                os.posix_fallocate(f.fileno(), 0, current_offset)
-            except Exception:
-                f.seek(current_offset - 1)
-                f.write(b"\x00")
+            f.seek(current_offset - 1)
+            f.write(b'\x00')
+
+        # 3) write each block header at its declared offset
+        for nid, info in block_infos.items():
+            f.seek(info["offset"], os.SEEK_SET)
+            f.write(BLOCK_HDR_PACK.pack(
+                nid,
+                info["n_records"],
+                0,  # flags
+                info["max_read_len"],
+                info["max_cigar_len"],
+            ))
 
     # Write .idx
     idx_path = output_prefix + ".idx"
