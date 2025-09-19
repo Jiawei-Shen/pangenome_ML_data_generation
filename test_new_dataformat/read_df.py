@@ -217,7 +217,7 @@ def read_segments(dat_path, node_index, node_id):
                            if isinstance(strand, (bytes, bytearray)) else chr(strand)),
             }
             record["cigar"] = 0
-            print(record)
+            print(record[:10])
             records.append(record)
 
     return records

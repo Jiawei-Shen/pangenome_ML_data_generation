@@ -169,7 +169,7 @@ def initialize_output_files(stats_path, output_prefix):
         perfect = int(stat.get("perfect", 0))
         not_perfect = int(stat.get("not_perfect", 0))
         total = perfect + not_perfect
-        if total > 0 and not_perfect > 1 and not_perfect / total > 0.05:
+        if total > 0 and not_perfect > 1 and not_perfect / total > 0.5:
             wanted_nodes.add(nid)
             node_counts[nid] = total
             R = int(stat.get("max_read_length", 1) or 1)
@@ -276,7 +276,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     else:
         block_infos, dat_path, wanted_nodes, total_size = initialize_output_files(stats_path, output_prefix)
 
-    BUFFER_SEGMENTS = 10_000_000  # total segments batched before a flush
+    BUFFER_SEGMENTS = 100_000  # total segments batched before a flush
     next_milestone = milestone_step
     total_reads = 0
     total_segments = 0
