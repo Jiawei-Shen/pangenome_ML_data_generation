@@ -564,6 +564,7 @@ def process_single_node_for_pileup(task_args):
 
     # NEW: if too many reads, keep only top 400 by "non-M length" (prioritize mismatches/indels)
     if len(aligned_read_segments) > TENSOR_MAX_READ_ROWS:
+        print(node_id, len(aligned_read_segments), node_len)
         def non_m_length(seg):
             # Sum lengths for CIGAR ops that are not 'M'
             return sum(L for L, op in seg["cigar_ops"] if op != 'M')
