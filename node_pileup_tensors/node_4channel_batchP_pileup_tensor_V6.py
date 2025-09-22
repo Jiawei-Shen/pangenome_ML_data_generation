@@ -784,8 +784,9 @@ def process_single_node_for_pileup(task_args):
         except Exception as e:
             sys.stderr.write(f"Error saving tensor for {variant_key_string}: {e}\n")
 
-    if len(tensor_files_generated_for_node) >  20:
-        print(node_id, node_len, len(tensor_files_generated_for_node))
+    if tensor_files_generated_for_node >  20:
+        print(node_id, node_len, tensor_files_generated_for_node)
+
     if variant_headers_for_summary:
         summary_path = os.path.join(worker_base_output_dir, str(node_id), "variant_summary.json")
         with open(summary_path, 'w') as f:
