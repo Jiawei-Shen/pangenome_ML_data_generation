@@ -56,6 +56,9 @@ DEFAULT_MAPPING_QUALITY_PADDING = -1
 MISMATCH_CHANNEL_REF_ROW_VALUE = 0
 MISMATCH_COMPARISON_PADDING_VALUE = -1
 
+# NEW: drop INDELs longer than this (bp)
+MAX_INDEL_LEN = 100
+
 # Worker globals
 worker_dat_file = None
 worker_base_output_dir = None
@@ -290,6 +293,10 @@ def detect_variants_from_cigar(offset_on_node, cigar_ops_decoded, read_sequence,
             read_pos += length
 
         elif op == 'I':
+            # NEW: drop long insertions
+            if length > MAX_INDEL_LEN:
+                read_pos += length
+                continue
             inserted_sequence = read_sequence[read_pos: read_pos + length].upper()
             # NEW: ignore insertions containing N
             if inserted_sequence and 'N' not in inserted_sequence:
@@ -301,6 +308,10 @@ def detect_variants_from_cigar(offset_on_node, cigar_ops_decoded, read_sequence,
             read_pos += length
 
         elif op == 'D':
+            # NEW: drop long deletions
+            if length > MAX_INDEL_LEN:
+                node_pos += length
+                continue
             if node_pos + length <= node_seq_len:
                 deleted_sequence_from_ref = node_sequence[node_pos: node_pos + length].upper()
                 # NEW: ignore deletions containing N
