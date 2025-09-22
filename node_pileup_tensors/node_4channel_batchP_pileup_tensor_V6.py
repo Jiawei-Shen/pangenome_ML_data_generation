@@ -234,14 +234,18 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_qu
             current_node_pos += length
             current_read_pos += length
 
+
         elif op == 'I':
-            if expected_var_type == 'I' and (current_node_pos - 1) == target_node_pos:
+            # Use the same anchor definition as detection (clamp to 0)
+            anchor_node_pos = current_node_pos - 1 if current_node_pos > 0 else 0
+            if expected_var_type == 'I' and anchor_node_pos == target_node_pos:
                 if current_read_pos + length <= len(read_sequence):
                     qualities = read_quality_values[current_read_pos: current_read_pos + length]
                     mean_quality = sum(qualities) / len(qualities) if qualities else 0.0
                     return read_sequence[current_read_pos: current_read_pos + length].upper(), mean_quality
                 return None, None
             current_read_pos += length
+
 
         elif op == 'D':
             if current_node_pos <= target_node_pos < current_node_pos + length:
@@ -293,6 +297,10 @@ def detect_variants_from_cigar(offset_on_node, cigar_ops_decoded, read_sequence,
             read_pos += length
 
         elif op == 'I':
+            # NEW: drop long insertions
+            if length > MAX_INDEL_LEN:
+                read_pos += length
+                continue
             inserted_sequence = read_sequence[read_pos: read_pos + length].upper()
             # NEW: ignore insertions containing N
             if inserted_sequence and 'N' not in inserted_sequence:
@@ -304,6 +312,10 @@ def detect_variants_from_cigar(offset_on_node, cigar_ops_decoded, read_sequence,
             read_pos += length
 
         elif op == 'D':
+            # NEW: drop long deletions
+            if length > MAX_INDEL_LEN:
+                node_pos += length
+                continue
             if node_pos + length <= node_seq_len:
                 deleted_sequence_from_ref = node_sequence[node_pos: node_pos + length].upper()
                 # NEW: ignore deletions containing N
@@ -646,8 +658,6 @@ def process_single_node_for_pileup(task_args):
         mean_alt_bq = sum(alt_allele_base_qualities) / len(alt_allele_base_qualities) if alt_allele_base_qualities else 0.0
 
         variant_key_string = canonical_variant_key(v_pos, vt, v_ref_from_cigar, v_alt_from_cigar, node_sequence)
-        if len(v_alt_from_cigar) > MAX_INDEL_LEN or len(v_ref_from_cigar) > MAX_INDEL_LEN:
-            continue
 
         window_center_pos = v_pos + 1 if vt == 'I' else v_pos
         window_start_pos = calculate_window_start(window_center_pos, TENSOR_WINDOW_SIZE)
