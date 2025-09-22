@@ -564,7 +564,6 @@ def process_single_node_for_pileup(task_args):
 
     # NEW: if too many reads, keep only top 400 by "non-M length" (prioritize mismatches/indels)
     if len(aligned_read_segments) > TENSOR_MAX_READ_ROWS:
-        print(node_id, len(aligned_read_segments), node_len)
         def non_m_length(seg):
             # Sum lengths for CIGAR ops that are not 'M'
             return sum(L for L, op in seg["cigar_ops"] if op != 'M')
@@ -762,6 +761,9 @@ def process_single_node_for_pileup(task_args):
             tensor_files_generated_for_node += 1
         except Exception as e:
             sys.stderr.write(f"Error saving tensor for {variant_key_string}: {e}\n")
+
+    if tensor_files_generated_for_node > 10:
+        print(node_id, node_len, tensor_files_generated_for_node)
 
     if variant_headers_for_summary:
         summary_path = os.path.join(worker_base_output_dir, str(node_id), "variant_summary.json")
