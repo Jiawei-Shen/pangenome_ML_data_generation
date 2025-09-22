@@ -420,6 +420,45 @@ def init_worker(dat_file_path_for_worker, base_output_dir_for_worker, need_view_
         sys.stderr.write(f"Error [Worker {os.getpid()}] opening DAT file: {e}\n")
         sys.exit(1)
 
+# ───── NEW: helper for row ordering ALT → OTHER → REF → UNINFORMATIVE ─────
+def _row_group_key_for_variant(vt, expected_alt, expected_ref, allele_observed):
+    """
+    Return a sort key so similar alleles cluster together in tensor rows.
+    Ordering: ALT first, then OTHER alleles, then REF, then uninformative.
+    """
+    if allele_observed is None:
+        return (9,)   # uninformative goes last
+
+    if vt == 'X':  # SNV
+        if allele_observed == expected_alt:
+            return (0,)  # ALT first
+        if allele_observed == expected_ref:
+            return (2,)  # REF after OTHER
+        base_rank = {'A':0, 'C':1, 'G':2, 'T':3, 'N':4}.get(allele_observed, 5)
+        return (1, base_rank, allele_observed)  # OTHER second
+
+    if vt == 'I':  # Insertion
+        if allele_observed == expected_alt:
+            return (0, -len(allele_observed), allele_observed)
+        if allele_observed == "REF_STATE_FOR_INDEL":
+            return (2,)
+        if allele_observed == "OTHER_FOR_INDEL":
+            return (1,)
+        if isinstance(allele_observed, str):
+            return (1, -len(allele_observed), allele_observed)
+        return (8,)
+
+    if vt == 'D':  # Deletion
+        if allele_observed == "*":
+            return (0,)
+        if allele_observed == "OTHER_FOR_INDEL":
+            return (1,)
+        if allele_observed == "REF_STATE_FOR_INDEL":
+            return (2,)
+        return (8,)
+
+    return (9,)
+
 def process_single_node_for_pileup(task_args):
     (node_id, dat_file_offset, n_records,
      min_af_threshold, min_variants_threshold, min_allele_bq_threshold,
@@ -661,9 +700,22 @@ def process_single_node_for_pileup(task_args):
         ch5[0, :] = CIGAR_PADDING_INDEX
         ch6[0, :] = np.asarray(genomead_af_row, dtype=np.int8)
 
+        # ───── NEW: group reads by allele → ALT, OTHER, REF, UNINFORMATIVE ─────
+        grouped_reads = []
+        for seg_data in aligned_read_segments:
+            allele_observed, _bq_tmp = get_allele_from_read_at_node_pos(
+                seg_data["offset_on_node"], seg_data["read_sequence"],
+                seg_data["processed_quality_values"], seg_data["cigar_ops"],
+                v_pos, node_sequence, vt,
+                (expected_ref_for_af if vt in ('I','D') else None)
+            )
+            sort_key = _row_group_key_for_variant(vt, expected_alt_for_af, expected_ref_for_af, allele_observed)
+            grouped_reads.append((sort_key, seg_data))
+        grouped_reads.sort(key=lambda x: x[0])
+
         reads_added = 0
         variant_window_index = v_pos - window_start_pos
-        for seg_data in aligned_read_segments:
+        for _key, seg_data in grouped_reads:
             if reads_added >= TENSOR_MAX_READ_ROWS:
                 break
             mapq = max(0, min(int(seg_data["mapping_quality"]), 127))
