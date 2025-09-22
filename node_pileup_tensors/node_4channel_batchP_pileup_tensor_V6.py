@@ -869,6 +869,7 @@ def main():
     parser.add_argument("--min_allele_bq", type=float, default=10.0, help="Minimum mean BQ for ALT")
     parser.add_argument("--variant_type", type=str, default='all', choices=['snp', 'indel', 'all'],
                         help="Which variants to output tensors for")
+    parser.add_argument("--milestone", type=int, default=100000, help="The milestone to print logs")
     args = parser.parse_args()
 
     if not all([os.path.isfile(args.dat), os.path.isfile(args.idx), os.path.isfile(args.candidate_variants_json)]):
@@ -961,7 +962,7 @@ def main():
                                     args.max_view_reads,
                                     args.view if args.view != -1 else float('inf'))
 
-            if nodes_since_last_report >= 100000 or processed == total_tasks:
+            if nodes_since_last_report >= args.milestone or processed == total_tasks:
                 elapsed_time = time.time() - batch_start_time
                 rate = nodes_since_last_report / elapsed_time if elapsed_time > 0 else 0.0
                 print(
