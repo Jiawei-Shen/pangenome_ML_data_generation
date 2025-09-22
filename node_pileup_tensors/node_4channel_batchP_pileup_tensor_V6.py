@@ -57,7 +57,7 @@ MISMATCH_CHANNEL_REF_ROW_VALUE = 0
 MISMATCH_COMPARISON_PADDING_VALUE = -1
 
 # NEW: drop INDELs longer than this (bp)
-MAX_INDEL_LEN = 300
+MAX_INDEL_LEN = 250
 
 # Worker globals
 worker_dat_file = None
@@ -642,13 +642,13 @@ def process_single_node_for_pileup(task_args):
 
         if alt_allele_count < min_variants_threshold:
             continue
-        # if vt == 'X':
         tmp_af = alt_allele_count / locus_coverage if locus_coverage > 0 else 0.0
         if tmp_af < min_af_threshold:
             continue
-        tmp_bq = sum(alt_allele_base_qualities) / len(alt_allele_base_qualities) if alt_allele_base_qualities else 0.0
-        if tmp_bq < min_allele_bq_threshold:
-            continue
+        if vt == 'X':
+            tmp_bq = sum(alt_allele_base_qualities) / len(alt_allele_base_qualities) if alt_allele_base_qualities else 0.0
+            if tmp_bq < min_allele_bq_threshold:
+                continue
 
         current_alt_freq = alt_allele_count / locus_coverage if locus_coverage > 0 else 0.0
         mean_alt_bq = sum(alt_allele_base_qualities) / len(alt_allele_base_qualities) if alt_allele_base_qualities else 0.0
