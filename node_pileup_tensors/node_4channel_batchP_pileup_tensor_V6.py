@@ -860,7 +860,7 @@ def main():
     parser.add_argument("candidate_variants_json",
                         help="JSON with nodes and sequences to process.")
     parser.add_argument("--num_workers", type=int, default=os.cpu_count(), help="Number of worker processes")
-    parser.add_argument("--chunksize", type=int, default=256, help="Task chunksize for executor.map()")
+    parser.add_argument("--chunksize", type=int, default=128, help="Task chunksize for executor.map()")
     parser.add_argument("--view", nargs='?', const=-1, default=None, type=int, metavar='N',
                         help="Print pileups for top N variants per node (-1 for all)")
     parser.add_argument("--max_view_reads", type=int, default=20, help="Max reads to show per pileup in view mode")
