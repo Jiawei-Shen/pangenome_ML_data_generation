@@ -234,18 +234,14 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_qu
             current_node_pos += length
             current_read_pos += length
 
-
         elif op == 'I':
-            # Use the same anchor definition as detection (clamp to 0)
-            anchor_node_pos = current_node_pos - 1 if current_node_pos > 0 else 0
-            if expected_var_type == 'I' and anchor_node_pos == target_node_pos:
+            if expected_var_type == 'I' and (current_node_pos - 1) == target_node_pos:
                 if current_read_pos + length <= len(read_sequence):
                     qualities = read_quality_values[current_read_pos: current_read_pos + length]
                     mean_quality = sum(qualities) / len(qualities) if qualities else 0.0
                     return read_sequence[current_read_pos: current_read_pos + length].upper(), mean_quality
                 return None, None
             current_read_pos += length
-
 
         elif op == 'D':
             if current_node_pos <= target_node_pos < current_node_pos + length:
@@ -646,13 +642,13 @@ def process_single_node_for_pileup(task_args):
 
         if alt_allele_count < min_variants_threshold:
             continue
-        if vt == 'X':
-            tmp_af = alt_allele_count / locus_coverage if locus_coverage > 0 else 0.0
-            if tmp_af < min_af_threshold:
-                continue
-            tmp_bq = sum(alt_allele_base_qualities) / len(alt_allele_base_qualities) if alt_allele_base_qualities else 0.0
-            if tmp_bq < min_allele_bq_threshold:
-                continue
+        # if vt == 'X':
+        tmp_af = alt_allele_count / locus_coverage if locus_coverage > 0 else 0.0
+        if tmp_af < min_af_threshold:
+            continue
+        tmp_bq = sum(alt_allele_base_qualities) / len(alt_allele_base_qualities) if alt_allele_base_qualities else 0.0
+        if tmp_bq < min_allele_bq_threshold:
+            continue
 
         current_alt_freq = alt_allele_count / locus_coverage if locus_coverage > 0 else 0.0
         mean_alt_bq = sum(alt_allele_base_qualities) / len(alt_allele_base_qualities) if alt_allele_base_qualities else 0.0
