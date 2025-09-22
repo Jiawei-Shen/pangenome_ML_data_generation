@@ -281,27 +281,38 @@ def detect_variants_from_cigar(offset_on_node, cigar_ops_decoded, read_sequence,
                 if cur_node_p < node_seq_len and cur_read_p < read_seq_len:
                     node_base = node_sequence[cur_node_p].upper()
                     read_base = read_sequence[cur_read_p].upper()
-                    if node_base != read_base and op != '=':
+                    # NEW: ignore positions where either side is N
+                    if node_base != read_base and node_base != 'N' and read_base != 'N' and op != '=':
                         variants.append((cur_node_p, 'X', read_base, node_base))
                 else:
                     break
             node_pos += length
             read_pos += length
+
         elif op == 'I':
             inserted_sequence = read_sequence[read_pos: read_pos + length].upper()
-            ref_anchor_pos = node_pos - 1 if node_pos > 0 else 0
-            ref_base_at_anchor = node_sequence[ref_anchor_pos].upper() if 0 <= ref_anchor_pos < node_seq_len else "*"
-            variants.append((ref_anchor_pos, 'I', inserted_sequence, ref_base_at_anchor))
+            # NEW: ignore insertions containing N
+            if inserted_sequence and 'N' not in inserted_sequence:
+                ref_anchor_pos = node_pos - 1 if node_pos > 0 else 0
+                ref_base_at_anchor = node_sequence[ref_anchor_pos].upper() if 0 <= ref_anchor_pos < node_seq_len else "*"
+                # Also ignore if anchor base is N
+                if ref_base_at_anchor != 'N':
+                    variants.append((ref_anchor_pos, 'I', inserted_sequence, ref_base_at_anchor))
             read_pos += length
+
         elif op == 'D':
-            deleted_sequence_from_ref = node_sequence[node_pos: node_pos + length].upper() if node_pos + length <= node_seq_len else ""
-            if deleted_sequence_from_ref:
-                variants.append((node_pos, 'D', "*", deleted_sequence_from_ref))
+            if node_pos + length <= node_seq_len:
+                deleted_sequence_from_ref = node_sequence[node_pos: node_pos + length].upper()
+                # NEW: ignore deletions containing N
+                if deleted_sequence_from_ref and 'N' not in deleted_sequence_from_ref:
+                    variants.append((node_pos, 'D', "*", deleted_sequence_from_ref))
             node_pos += length
+
         elif op == 'S':
             read_pos += length
         elif op == 'N':
             node_pos += length
+
     return variants
 
 def get_read_representation_in_window_for_view(segment_cigar_ops, segment_offset_on_node, segment_read_sequence,
@@ -579,8 +590,6 @@ def process_single_node_for_pileup(task_args):
     view_oriented_variant_data = {} if worker_need_view else None
     variant_headers_for_summary = []
 
-    raw_canidate_num = len(candidate_variants)
-
     for (v_pos, v_type, v_ref_from_cigar, v_alt_from_cigar), _ in candidate_variants.items():
         vt = v_type
         if (variant_type_to_process == 'snp' and vt != 'X') or \
@@ -763,9 +772,6 @@ def process_single_node_for_pileup(task_args):
             tensor_files_generated_for_node += 1
         except Exception as e:
             sys.stderr.write(f"Error saving tensor for {variant_key_string}: {e}\n")
-
-    if tensor_files_generated_for_node > node_len and tensor_files_generated_for_node > 100:
-        print(node_id, node_len, raw_canidate_num, tensor_files_generated_for_node)
 
     if variant_headers_for_summary:
         summary_path = os.path.join(worker_base_output_dir, str(node_id), "variant_summary.json")
