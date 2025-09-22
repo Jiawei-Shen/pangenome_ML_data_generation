@@ -579,6 +579,8 @@ def process_single_node_for_pileup(task_args):
     view_oriented_variant_data = {} if worker_need_view else None
     variant_headers_for_summary = []
 
+    print(f"Node {node_id}: raw candidate_variants={len(candidate_variants)}")
+
     for (v_pos, v_type, v_ref_from_cigar, v_alt_from_cigar), _ in candidate_variants.items():
         vt = v_type
         if (variant_type_to_process == 'snp' and vt != 'X') or \
