@@ -57,7 +57,7 @@ MISMATCH_CHANNEL_REF_ROW_VALUE = 0
 MISMATCH_COMPARISON_PADDING_VALUE = -1
 
 # NEW: drop INDELs longer than this (bp)
-MAX_INDEL_LEN = 100
+MAX_INDEL_LEN = 300
 
 # Worker globals
 worker_dat_file = None
