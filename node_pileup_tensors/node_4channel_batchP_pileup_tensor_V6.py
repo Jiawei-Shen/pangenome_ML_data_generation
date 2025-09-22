@@ -579,7 +579,7 @@ def process_single_node_for_pileup(task_args):
     view_oriented_variant_data = {} if worker_need_view else None
     variant_headers_for_summary = []
 
-    print(f"Node {node_id}: raw candidate_variants={len(candidate_variants)}")
+    raw_canidate_num = len(candidate_variants)
 
     for (v_pos, v_type, v_ref_from_cigar, v_alt_from_cigar), _ in candidate_variants.items():
         vt = v_type
@@ -764,8 +764,8 @@ def process_single_node_for_pileup(task_args):
         except Exception as e:
             sys.stderr.write(f"Error saving tensor for {variant_key_string}: {e}\n")
 
-    if tensor_files_generated_for_node > node_len:
-        print(node_id, node_len, tensor_files_generated_for_node)
+    if tensor_files_generated_for_node > node_len and tensor_files_generated_for_node > 100:
+        print(node_id, node_len, raw_canidate_num, tensor_files_generated_for_node)
 
     if variant_headers_for_summary:
         summary_path = os.path.join(worker_base_output_dir, str(node_id), "variant_summary.json")
