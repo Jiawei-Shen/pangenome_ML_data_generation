@@ -129,7 +129,6 @@ def canonical_variant_key(v_pos, v_type, v_ref, v_alt, node_seq):
 
     return f"{v_pos}_{v_type}_{v_ref}_{v_alt}"
 
-
 def calculate_window_start(variant_pos, window_size):
     return variant_pos - (window_size // 2)
 
@@ -484,7 +483,7 @@ def _row_group_key_for_variant(vt, expected_alt, expected_ref, allele_observed):
 def process_single_node_for_pileup(task_args):
     (node_id, dat_file_offset, n_records,
      min_af_threshold, min_variants_threshold, min_allele_bq_threshold,
-     variant_type_to_process) = task_args
+     variant_type_to_process, min_depth_threshold) = task_args
 
     global worker_dat_file, worker_base_output_dir, worker_need_view, worker_is_new_format
     global GLOBAL_NODE_SEQS, GLOBAL_NODE_AF
@@ -616,13 +615,14 @@ def process_single_node_for_pileup(task_args):
 
         if vt == 'D':
             expected_alt_for_af = "*"
-            if 0 <= v_pos < node_len:
+            if 0 <= v_pos < len(node_sequence):
                 expected_ref_for_af = node_sequence[v_pos]
             ref_allele_for_indel_context = v_ref_from_cigar
         elif vt == 'I':
-            expected_ref_for_af = node_sequence[v_pos] if 0 <= v_pos < node_len else "*"
+            expected_ref_for_af = node_sequence[v_pos] if 0 <= v_pos < len(node_sequence) else "*"
             ref_allele_for_indel_context = expected_ref_for_af
 
+        # Collect allele observations and coverage
         for seg in aligned_read_segments:
             allele_observed, bq = get_allele_from_read_at_node_pos(
                 seg["offset_on_node"], seg["read_sequence"], seg["processed_quality_values"], seg["cigar_ops"],
@@ -639,6 +639,10 @@ def process_single_node_for_pileup(task_args):
                     ref_allele_count += 1
                 else:
                     other_allele_count += 1
+
+        # NEW: depth gate — skip variants below min_depth
+        if locus_coverage < min_depth_threshold:
+            continue
 
         if alt_allele_count < min_variants_threshold:
             continue
@@ -663,7 +667,7 @@ def process_single_node_for_pileup(task_args):
             for read_segment_idx, seg_data in enumerate(aligned_read_segments[: TENSOR_MAX_READ_ROWS + 50]):
                 row_chars_for_view = get_read_representation_in_window_for_view(
                     seg_data["cigar_ops"], seg_data["offset_on_node"], seg_data["read_sequence"],
-                    window_start_pos, TENSOR_WINDOW_SIZE, node_len)
+                    window_start_pos, TENSOR_WINDOW_SIZE, len(node_sequence))
                 if any(char != ' ' for char in row_chars_for_view):
                     bases_for_view = [
                         (PADDING_BASE_INDEX if char == ' ' else BASE_TO_INDEX.get(char.upper(), BASE_TO_INDEX['N']))
@@ -686,13 +690,13 @@ def process_single_node_for_pileup(task_args):
         # Build channels
         ref_base_indices_row = [PADDING_BASE_INDEX] * TENSOR_WINDOW_SIZE
         for i, node_pos_in_window in enumerate(range(window_start_pos, window_start_pos + TENSOR_WINDOW_SIZE)):
-            if 0 <= node_pos_in_window < node_len:
+            if 0 <= node_pos_in_window < len(node_sequence):
                 ref_base_indices_row[i] = BASE_TO_INDEX.get(node_sequence[node_pos_in_window].upper(), BASE_TO_INDEX['N'])
 
         genomead_af_row = [0] * TENSOR_WINDOW_SIZE
         if genomead_af_list:
             for i, node_pos_in_window in enumerate(range(window_start_pos, window_start_pos + TENSOR_WINDOW_SIZE)):
-                if 0 <= node_pos_in_window < node_len:
+                if 0 <= node_pos_in_window < len(node_sequence):
                     v = genomead_af_list[node_pos_in_window]
                     if isinstance(v, str):
                         if len(v) == 1 and '0' <= v <= '7':
@@ -717,7 +721,7 @@ def process_single_node_for_pileup(task_args):
 
         ch1[0, :] = np.asarray(ref_base_indices_row, dtype=np.int8)
         ch2[0, :] = DEFAULT_QUALITY_PADDING
-        ch3[0, :] = MISMATCH_CHANNEL_REF_ROW_VALUE
+        ch3[0, :] = MISMATCH_COMPARISON_PADDING_VALUE
         ch4[0, :] = DEFAULT_MAPPING_QUALITY_PADDING
         ch5[0, :] = CIGAR_PADDING_INDEX
         ch6[0, :] = np.asarray(genomead_af_row, dtype=np.int8)
@@ -745,7 +749,7 @@ def process_single_node_for_pileup(task_args):
                 seg_data["cigar_ops"], seg_data["offset_on_node"],
                 seg_data["read_sequence"], seg_data["processed_quality_values"],
                 mapq,
-                window_start_pos, TENSOR_WINDOW_SIZE, node_len)
+                window_start_pos, TENSOR_WINDOW_SIZE, len(node_sequence))
 
             if any(b != PADDING_BASE_INDEX for b in base_idx_row):
                 r = 1 + reads_added
@@ -787,7 +791,7 @@ def process_single_node_for_pileup(task_args):
     if variant_headers_for_summary:
         summary_path = os.path.join(worker_base_output_dir, str(node_id), "variant_summary.json")
         with open(summary_path, 'w') as f:
-            json.dump({"node_id": node_id, "node_length": node_len,
+            json.dump({"node_id": node_id, "node_length": len(node_sequence),
                        "variants_passing_af_filter": variant_headers_for_summary}, f, indent=2)
 
     return node_id, (view_oriented_variant_data or {}), tensor_files_generated_for_node
@@ -870,6 +874,8 @@ def main():
     parser.add_argument("--variant_type", type=str, default='all', choices=['snp', 'indel', 'all'],
                         help="Which variants to output tensors for")
     parser.add_argument("--milestone", type=int, default=100000, help="The milestone to print logs")
+    parser.add_argument("--min_depth", type=int, default=30,
+                        help="Minimum locus coverage required to emit a tensor")
     args = parser.parse_args()
 
     if not all([os.path.isfile(args.dat), os.path.isfile(args.idx), os.path.isfile(args.candidate_variants_json)]):
@@ -923,7 +929,7 @@ def main():
         if node_id in full_idx_data:
             offset, n_records = full_idx_data[node_id]
             tasks.append((node_id, offset, n_records, args.min_af, args.min_variants,
-                          args.min_allele_bq, args.variant_type))
+                          args.min_allele_bq, args.variant_type, args.min_depth))
         else:
             missing += 1
     if missing:
