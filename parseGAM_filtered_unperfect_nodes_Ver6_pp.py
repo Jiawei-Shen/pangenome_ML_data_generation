@@ -215,7 +215,7 @@ def flush_worker(job):
             int(s.rq), s.strand if s.strand in (b'+', b'-') else b'+'
         )
         off += rec_sz
-
+    print()
     # 2. I/O-Bound Work: Write the buffer to the file at the pre-calculated position.
     os.pwrite(g_fd, buf, write_pos)
 
