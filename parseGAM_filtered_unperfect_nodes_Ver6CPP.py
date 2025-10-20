@@ -121,7 +121,7 @@ def initialize_output_files(stats_path, output_prefix, alt_threshold):
         nid = int(node_id_key)
         perfect = int(stat.get("perfect", 0))
         not_perfect = int(stat.get("not_perfect", 0))
-        if (perfect + not_perfect) > 0 and not_perfect > 1 and not_perfect / (perfect + not_perfect) > alt_threshold:
+        if (perfect + not_perfect) > 0 and not_perfect >= 1 and not_perfect / (perfect + not_perfect) > alt_threshold:
             wanted_nodes.add(nid)
             node_counts[nid] = perfect + not_perfect
             R = int(stat.get("max_read_length", 1) or 1)
