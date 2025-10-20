@@ -7,10 +7,9 @@ import time
 import gc
 import os
 from collections import defaultdict
-import multiprocessing as mp
 
-import vg_pb2          # compiled protobuf Python file
-import fast_writer     # our C++ extension (Segment, BlockTable, prepare_write_jobs)
+import vg_pb2
+import fast_writer  # Segment, BlockTable, flush_entire_buffer_parallel_dict
 
 # ─────────────────────────────────────────────────────────────────────────────
 # File layout
@@ -28,7 +27,7 @@ def record_size(max_read_len: int, max_cigar_len: int) -> int:
     return make_record_struct(max_read_len, max_cigar_len).size
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers for GAM parsing
+# GAM parsing helpers
 def read_varint(stream):
     value, shift_amount = 0, 0
     while True:
@@ -66,7 +65,7 @@ def gam_record_iter(path, tag="GAM"):
                     break
 
 def process_alignment(raw_message, wanted_nodes, chrom_filter):
-    """Return dict[nid] -> list[fast_writer.Segment] for segments overlapping wanted_nodes."""
+    """Return dict[nid] -> list[fast_writer.Segment]."""
     segment_dict = {}
     aln = vg_pb2.Alignment()
     aln.ParseFromString(raw_message)
@@ -86,7 +85,6 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
         strand_byte = (b"-" if mapping.position.is_reverse else b"+")[0]
 
         seq_parts, bq_parts, cigar_parts = [], bytearray(), []
-
         for e in mapping.edit:
             fL, tL = e.from_length, e.to_length
             if fL == tL:
@@ -95,7 +93,6 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
                 cigar_parts.append(f"{fL}D")
             elif fL == 0 and tL > 0:
                 cigar_parts.append(f"{tL}I")
-
             if tL > 0:
                 seq_parts.append(read_sequence[read_offset: read_offset + tL].upper())
                 bq_parts.extend(read_quality[read_offset: read_offset + tL])
@@ -103,19 +100,19 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
 
         seg = fast_writer.Segment(
             offset=int(node_offset),
-            seq="".join(seq_parts).encode(),            # bytes → std::string (no Unicode overhead)
-            bq=bytes(bq_parts),                          # bytes
-            cigar="".join(cigar_parts).encode(),         # bytes
+            seq="".join(seq_parts).encode(),        # bytes → std::string (no Unicode overhead)
+            bq=bytes(bq_parts),
+            cigar="".join(cigar_parts).encode(),
             rq=int(mapq),
-            strand=int(strand_byte),                     # one byte
+            strand=int(strand_byte),                # one byte
         )
         segment_dict.setdefault(nid, []).append(seg)
 
     return segment_dict
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Output file init
-def initialize_output_files(stats_path, output_prefix):
+# Output init
+def initialize_output_files(stats_path, output_prefix, alt_threshold):
     with open(stats_path, "rb") as fh:
         stats_data = pickle.load(fh)
 
@@ -124,7 +121,7 @@ def initialize_output_files(stats_path, output_prefix):
         nid = int(node_id_key)
         perfect = int(stat.get("perfect", 0))
         not_perfect = int(stat.get("not_perfect", 0))
-        if (perfect + not_perfect) > 0 and not_perfect > 1 and not_perfect / (perfect + not_perfect) > 0.05:
+        if (perfect + not_perfect) > 0 and not_perfect > 1 and not_perfect / (perfect + not_perfect) > alt_threshold:
             wanted_nodes.add(nid)
             node_counts[nid] = perfect + not_perfect
             R = int(stat.get("max_read_length", 1) or 1)
@@ -155,13 +152,25 @@ def initialize_output_files(stats_path, output_prefix):
 
     dat_path = output_prefix + ".dat"
     with open(dat_path, "wb") as f:
+        # 1) write global header
         f.write(GLOBAL_MAGIC)
         f.write(GLOBAL_VER_PACK.pack(GLOBAL_MAJOR, GLOBAL_MINOR, len(block_infos), b'\x00' * 16))
-        for nid, info in block_infos.items():
-            f.write(BLOCK_HDR_PACK.pack(nid, info["n_records"], 0, info["max_read_len"], info["max_cigar_len"]))
-        if current_offset > GLOBAL_HEADER_SIZE:  # pre-allocate file
+
+        # 2) pre-allocate whole file
+        if current_offset > GLOBAL_HEADER_SIZE:
             f.seek(current_offset - 1)
             f.write(b'\x00')
+
+        # 3) write each block header at its declared offset
+        for nid, info in block_infos.items():
+            f.seek(info["offset"], os.SEEK_SET)
+            f.write(BLOCK_HDR_PACK.pack(
+                nid,
+                info["n_records"],
+                0,  # flags
+                info["max_read_len"],
+                info["max_cigar_len"],
+            ))
 
     idx_path = output_prefix + ".idx"
     with open(idx_path, "wb") as idx:
@@ -181,33 +190,18 @@ def initialize_output_files(stats_path, output_prefix):
     return block_infos, dat_path, wanted_nodes
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Multiprocess write-only worker
-def _pwrite_job(fd, pos, buf):
-    os.pwrite(fd, buf, pos)
-
-def flush_with_multiprocess_writers(dat_fd, segment_buffer, state, block_hdr_size, num_procs):
-    if not segment_buffer:
-        return
-    # Prepare write jobs in C++ (packs data; advances current_pos)
-    jobs = fast_writer.prepare_write_jobs(segment_buffer, state, block_hdr_size)
-    # Fan-out the writes across processes
-    # NOTE: On Linux, default start method is 'fork' → fd is inherited.
-    ctx = mp.get_context("fork")
-    with ctx.Pool(processes=num_procs) as pool:
-        pool.starmap(_pwrite_job, ((dat_fd, pos, buf) for (pos, buf) in jobs))
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Pipeline
-def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filter, use_existing, num_procs):
+def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filter, use_existing, num_threads, buffer_segments, alt_threshold):
     if use_existing:
         raise NotImplementedError("--use-existing is not implemented yet.")
-    else:
-        block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
+    block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix, alt_threshold)
 
-    # Persistent C++ state (tracks current_pos internally)
+    # Persistent C++ state (tracks current_pos)
     state = fast_writer.BlockTable(block_infos)
 
-    BUFFER_SEGMENTS = 1_000_000  # tune for your RAM & job size
+    # Tune this for your memory; fewer flushes = better throughput
+    BUFFER_SEGMENTS = buffer_segments
+
     next_milestone, total_reads, total_segments = milestone_step, 0, 0
     start_time = time.perf_counter()
 
@@ -225,12 +219,19 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
             total_segments += len(segs)
 
         if total_segments >= BUFFER_SEGMENTS:
-            print(f"Buffer full. Flushing {len(segment_buffer)} node blocks with {num_procs} writer processes...")
+            print(f"Buffer full. Flushing {len(segment_buffer)} node blocks via C++ threads ({num_threads})...")
             t0 = time.perf_counter()
-            flush_with_multiprocess_writers(dat_fd, segment_buffer, state, BLOCK_HDR_SIZE, num_procs)
+            fast_writer.flush_entire_buffer_parallel_dict(
+                dat_fd,
+                segment_buffer,   # dict[int -> list[Segment]]
+                state,            # BlockTable
+                BLOCK_HDR_SIZE,
+                num_threads=num_threads,
+                sort_by_offset=True,
+            )
             segment_buffer.clear()
             total_segments = 0
-            print(f"Flush done in {time.perf_counter() - t0:.2f} s.")
+            print(f"C++ flush complete in {time.perf_counter() - t0:.2f} s.")
 
         if total_reads >= next_milestone:
             elapsed = time.perf_counter() - start_time
@@ -238,9 +239,16 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
             next_milestone += milestone_step
 
     if segment_buffer:
-        print(f"Final flush of {len(segment_buffer)} node blocks with {num_procs} writer processes...")
+        print(f"Final flush of {len(segment_buffer)} node blocks via C++ threads ({num_threads})...")
         t0 = time.perf_counter()
-        flush_with_multiprocess_writers(dat_fd, segment_buffer, state, BLOCK_HDR_SIZE, num_procs)
+        fast_writer.flush_entire_buffer_parallel_dict(
+            dat_fd,
+            segment_buffer,
+            state,
+            BLOCK_HDR_SIZE,
+            num_threads=num_threads,
+            sort_by_offset=True,
+        )
         segment_buffer.clear()
         print(f"Final flush done in {time.perf_counter() - t0:.2f} s.")
 
@@ -255,16 +263,18 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="GAM segment extractor with C++ packing and multi-process pwrite.",
+        description="GAM segment extractor with C++ pack+write (parallel pwrite).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument("gam_path", help="Path to the GAM file")
-    parser.add_argument("stats_pickle", help="Path to the stats pickle with node maxima")
-    parser.add_argument("output_prefix", help="Prefix for output files (.dat, .idx)")
-    parser.add_argument("--milestone", type=int, default=1_000_000, help="Progress report interval")
-    parser.add_argument("--chr", default="", help="Optional chromosome name to filter on")
-    parser.add_argument("--use-existing", action="store_true", help="Reuse existing initialized output files")
-    parser.add_argument("--writers", type=int, default=4, help="Number of parallel writer processes")
+    parser.add_argument("gam_path")
+    parser.add_argument("stats_pickle")
+    parser.add_argument("output_prefix")
+    parser.add_argument("--buffer", type=int, default=50_000_000)
+    parser.add_argument("--alt", type=float, default=0.05, help="ALT fraction threshold (0–1) replacing 0.05")
+    parser.add_argument("--milestone", type=int, default=1_000_000)
+    parser.add_argument("--chr", default="")
+    parser.add_argument("--use-existing", action="store_true")
+    parser.add_argument("--threads", type=int, default=4, help="C++ writer threads")
     args = parser.parse_args()
 
     run_pipeline(
@@ -274,7 +284,9 @@ def main():
         milestone_step=args.milestone,
         chrom_filter=args.chr,
         use_existing=args.use_existing,
-        num_procs=args.writers,
+        num_threads=args.threads,
+        buffer_segments=args.buffer,
+        alt_threshold=args.alt,
     )
 
 if __name__ == "__main__":

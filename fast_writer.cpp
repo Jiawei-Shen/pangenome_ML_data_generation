@@ -1,7 +1,8 @@
-// fast_writer.cpp
+// fast_writer.cpp (mmap version)
 #include <pybind11/pybind11.h>
-#include <pybind11/stl.h>       // for BlockInfo dict build only
+#include <pybind11/stl.h>
 #include <pybind11/pytypes.h>
+
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -9,15 +10,17 @@
 #include <unordered_map>
 #include <stdexcept>
 #include <algorithm>
-#include <unistd.h>             // pwrite
-#include <mutex>
 #include <thread>
+
+#include <unistd.h>      // close, pread/pwrite (not used now), ftruncate
+#include <sys/mman.h>    // mmap, munmap, msync
+#include <sys/stat.h>    // fstat
+#include <errno.h>
 
 namespace py = pybind11;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Data types
-
 struct Segment {
     int16_t offset;
     std::string seq;    // raw bytes
@@ -37,7 +40,6 @@ struct BlockInfo {
     uint64_t block_size;
 };
 
-// Holds block_infos persistently in C++
 struct BlockTable {
     std::unordered_map<uint32_t, BlockInfo> m;
 
@@ -65,13 +67,13 @@ struct BlockTable {
         for (const auto& kv : m) {
             const auto& bi = kv.second;
             py::dict d;
-            d["offset"]        = py::int_(bi.offset);
-            d["n_records"]     = py::int_(bi.n_records);
-            d["current_pos"]   = py::int_(bi.current_pos);
-            d["max_read_len"]  = py::int_(bi.max_read_len);
-            d["max_cigar_len"] = py::int_(bi.max_cigar_len);
-            d["record_size"]   = py::int_(bi.record_size);
-            d["block_size"]    = py::int_(bi.block_size);
+            d["offset"]        = py::int_(static_cast<uint64_t>(bi.offset));
+            d["n_records"]     = py::int_(static_cast<uint32_t>(bi.n_records));
+            d["current_pos"]   = py::int_(static_cast<uint32_t>(bi.current_pos));
+            d["max_read_len"]  = py::int_(static_cast<uint32_t>(bi.max_read_len));
+            d["max_cigar_len"] = py::int_(static_cast<uint32_t>(bi.max_cigar_len));
+            d["record_size"]   = py::int_(static_cast<uint32_t>(bi.record_size));
+            d["block_size"]    = py::int_(static_cast<uint64_t>(bi.block_size));
             out[py::int_(kv.first)] = std::move(d);
         }
         return out;
@@ -95,27 +97,59 @@ static inline size_t record_size_for(int R, int C) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Prepare write jobs (pack in C++; write will be done by Python processes)
+// Job struct for parallel pack+MMAP write
 
-struct PrepJob {
+struct Job {
+    uint32_t nid;
     long long write_pos;
     int R, C;
-    std::vector<const Segment*> seg_ptrs;  // no copies
-    std::vector<py::object> keep_alive;    // keep Segment Python wrappers alive
+    std::vector<const Segment*> seg_ptrs;  // raw pointers to C++ Segment objects
+    std::vector<py::object> keep_alive;    // keep Python wrappers alive
 };
 
-// Returns list[(write_pos:int, buf:bytes)]
-py::list prepare_write_jobs(py::dict segment_buffer, BlockTable& state, uint32_t block_header_size) {
-    // Phase 1 (with GIL): collect jobs, compute write_pos, bump current_pos
-    std::vector<PrepJob> jobs;
+// Worker: pack directly into mapped memory (no Python API; GIL released outside)
+static void do_job_mmap(char* map_base, size_t map_len, const Job& j) {
+    const size_t rec_sz = record_size_for(j.R, j.C);
+    const size_t total  = j.seg_ptrs.size() * rec_sz;
+
+    // Bounds check
+    if (j.write_pos < 0) {
+        throw std::runtime_error("write_pos < 0 for nid " + std::to_string(j.nid));
+    }
+    if (static_cast<size_t>(j.write_pos) + total > map_len) {
+        throw std::runtime_error("mmap bounds exceeded for nid " + std::to_string(j.nid));
+    }
+
+    char* p = map_base + j.write_pos;
+    for (const Segment* s : j.seg_ptrs) {
+        std::memcpy(p, &s->offset, sizeof(int16_t)); p += sizeof(int16_t);
+        cp_field(p, s->seq,   j.R);
+        cp_field(p, s->bq,    j.R);
+        cp_field(p, s->cigar, j.C);
+        std::memcpy(p, &s->rq, sizeof(int16_t)); p += sizeof(int16_t);
+        *p++ = s->strand;
+    }
+}
+
+// Main entry: build jobs, mmap file, run parallel pack+writes into map, msync at end
+void flush_entire_buffer_parallel_dict(
+    int fd,
+    py::dict segment_buffer,        // dict[int -> list[Segment]]
+    BlockTable& state,
+    uint32_t block_header_size,
+    int num_threads = 4,
+    bool sort_by_offset = true
+) {
+    // 1) Build job list & reserve positions (with GIL)
+    std::vector<Job> jobs;
     jobs.reserve(py::len(segment_buffer));
 
     for (auto kv : segment_buffer) {
         uint32_t nid = py::cast<uint32_t>(kv.first);
         auto it = state.m.find(nid);
-        if (it == state.m.end()) continue;
-        BlockInfo& info = it->second;
+        if (it == state.m.end()) continue;  // skip unknown nid
 
+        BlockInfo& info = it->second;
         py::list lst = py::cast<py::list>(kv.second);
         size_t n = py::len(lst);
         if (n == 0) continue;
@@ -127,7 +161,8 @@ py::list prepare_write_jobs(py::dict segment_buffer, BlockTable& state, uint32_t
         long long base = static_cast<long long>(info.offset) + block_header_size;
         long long write_pos = base + static_cast<long long>(info.current_pos) * info.record_size;
 
-        PrepJob j;
+        Job j;
+        j.nid = nid;
         j.write_pos = write_pos;
         j.R = static_cast<int>(info.max_read_len);
         j.C = static_cast<int>(info.max_cigar_len);
@@ -141,53 +176,81 @@ py::list prepare_write_jobs(py::dict segment_buffer, BlockTable& state, uint32_t
             j.seg_ptrs.push_back(&s);
         }
 
-        info.current_pos += static_cast<uint32_t>(n);  // reserve file space for next flush
+        info.current_pos += static_cast<uint32_t>(n);  // reserve for next flush
         jobs.emplace_back(std::move(j));
     }
 
-    // Phase 2 (no GIL): pack each job into a Python bytes object
-    py::gil_scoped_release nogil;
+    if (jobs.empty()) return;
 
-    py::list out;  // list of (write_pos, bytes)
-    for (auto& j : jobs) {
-        const size_t rec_sz = record_size_for(j.R, j.C);
-        const size_t total  = j.seg_ptrs.size() * rec_sz;
-
-        std::string buf;
-        buf.resize(total);
-        char* p = buf.data();
-
-        for (const Segment* s : j.seg_ptrs) {
-            std::memcpy(p, &s->offset, sizeof(int16_t)); p += sizeof(int16_t);
-            cp_field(p, s->seq,   j.R);
-            cp_field(p, s->bq,    j.R);
-            cp_field(p, s->cigar, j.C);
-            std::memcpy(p, &s->rq, sizeof(int16_t)); p += sizeof(int16_t);
-            *p++ = s->strand;
-        }
-
-        // back under GIL to create Python objects
-        py::gil_scoped_acquire with_gil;
-        out.append(py::make_tuple(py::int_(j.write_pos), py::bytes(buf)));
-        // 'buf' freed after py::bytes owns a copy
+    if (sort_by_offset) {
+        std::sort(jobs.begin(), jobs.end(),
+                  [](const Job& a, const Job& b){ return a.write_pos < b.write_pos; });
     }
 
-    return out;
+    if (num_threads < 1) num_threads = 1;
+    if (num_threads > (int)jobs.size()) num_threads = (int)jobs.size();
+
+    // 2) mmap the whole file so we can address any block
+    struct stat st{};
+    if (fstat(fd, &st) != 0) {
+        throw std::runtime_error("fstat failed: errno=" + std::to_string(errno));
+    }
+    if (st.st_size <= 0) {
+        throw std::runtime_error("File size is zero or negative; pre-allocation required for mmap.");
+    }
+
+    size_t map_len = static_cast<size_t>(st.st_size);
+    void* map_ptr = mmap(nullptr, map_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map_ptr == MAP_FAILED) {
+        throw std::runtime_error("mmap failed: errno=" + std::to_string(errno));
+    }
+    char* map_base = static_cast<char*>(map_ptr);
+
+    // 3) Parallel in-place packing into the mapped region (GIL released)
+    {
+        py::gil_scoped_release nogil;
+
+        std::vector<std::thread> workers;
+        workers.reserve(num_threads);
+
+        auto worker_fn = [&](int tid) {
+            size_t start = (jobs.size() * tid) / num_threads;
+            size_t end   = (jobs.size() * (tid + 1)) / num_threads;
+            for (size_t i = start; i < end; ++i) {
+                do_job_mmap(map_base, map_len, jobs[i]);
+            }
+        };
+
+        for (int t = 0; t < num_threads; ++t) {
+            workers.emplace_back(worker_fn, t);
+        }
+        for (auto& th : workers) th.join();
+
+        // Ensure pages are flushed to disk; MS_ASYNC is usually sufficient.
+        // If you require durability before returning, use MS_SYNC (slower).
+        if (msync(map_base, map_len, MS_ASYNC) != 0) {
+            // not fatal in many cases, but surface it
+            // You could downgrade this to a warning if preferred.
+            // throw std::runtime_error("msync failed: errno=" + std::to_string(errno));
+        }
+    }
+
+    // 4) Cleanup map; GIL re-acquired automatically on scope exit
+    if (munmap(map_base, map_len) != 0) {
+        throw std::runtime_error("munmap failed: errno=" + std::to_string(errno));
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Module
 
 PYBIND11_MODULE(fast_writer, m) {
-    m.doc() = "C++ packer for GAM-derived segments producing write jobs for multiprocessing pwrite.";
+    m.doc() = "C++ pack+write for GAM-derived segments with parallel mmap writes.";
 
-    // Accept both str and bytes from Python for the string-like fields.
     py::class_<Segment>(m, "Segment")
-    // existing str-based ctor
         .def(py::init<int16_t, std::string, std::string, std::string, int16_t, char>(),
              py::arg("offset"), py::arg("seq"), py::arg("bq"),
              py::arg("cigar"), py::arg("rq"), py::arg("strand"))
-        // bytes + int strand overload **with named args**
         .def(py::init([](int16_t offset,
                          py::bytes seq,
                          py::bytes bq,
@@ -202,10 +265,9 @@ PYBIND11_MODULE(fast_writer, m) {
                 s.rq     = rq;
                 s.strand = static_cast<char>(strand);
                 return s;
-        }),
-        py::arg("offset"), py::arg("seq"), py::arg("bq"),
-        py::arg("cigar"), py::arg("rq"), py::arg("strand"));
-
+            }),
+            py::arg("offset"), py::arg("seq"), py::arg("bq"),
+            py::arg("cigar"), py::arg("rq"), py::arg("strand"));
 
     py::class_<BlockInfo>(m, "BlockInfo")
         .def(py::init<>())
@@ -221,12 +283,16 @@ PYBIND11_MODULE(fast_writer, m) {
         .def(py::init<py::dict>())
         .def("to_py_dict", &BlockTable::to_py_dict);
 
-    m.def("prepare_write_jobs", &prepare_write_jobs,
+    m.def("flush_entire_buffer_parallel_dict", &flush_entire_buffer_parallel_dict,
+          py::arg("fd"),
           py::arg("segment_buffer"),
           py::arg("state"),
           py::arg("block_header_size"),
+          py::arg("num_threads") = (int)std::thread::hardware_concurrency(),
+          py::arg("sort_by_offset") = true,
           R"doc(
-              Serialize per-node segments into bytes and return a list of (write_pos:int, buf:bytes).
-              Also advances state.current_pos accordingly.
+              Pack and write all segments in 'segment_buffer' using C++ threads and mmap.
+              'segment_buffer' is { nid:int -> list[Segment] }.
+              'state' is a BlockTable created from your Python block_infos (updates current_pos).
           )doc");
 }

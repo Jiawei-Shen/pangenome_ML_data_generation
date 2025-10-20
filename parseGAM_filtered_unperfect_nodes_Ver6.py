@@ -190,7 +190,7 @@ def initialize_output_files(stats_path, output_prefix):
         nid = int(node_id_key)
         perfect = int(stat.get("perfect", 0))
         not_perfect = int(stat.get("not_perfect", 0))
-        if (perfect + not_perfect) > 0 and not_perfect > 1 and not_perfect / (perfect + not_perfect) > 0.05:
+        if (perfect + not_perfect) > 0 and not_perfect > 1 and not_perfect / (perfect + not_perfect) > 0.5:
             wanted_nodes.add(nid)
             node_counts[nid] = perfect + not_perfect
             R = int(stat.get("max_read_length", 1) or 1)
@@ -214,14 +214,25 @@ def initialize_output_files(stats_path, output_prefix):
 
     dat_path = output_prefix + ".dat"
     with open(dat_path, "wb") as f:
+        # 1) write global header
         f.write(GLOBAL_MAGIC)
         f.write(GLOBAL_VER_PACK.pack(GLOBAL_MAJOR, GLOBAL_MINOR, len(block_infos), b'\x00' * 16))
-        for nid, info in block_infos.items():
-            f.write(BLOCK_HDR_PACK.pack(nid, info["n_records"], 0, info["max_read_len"], info["max_cigar_len"]))
-        # Pre-allocate the file by seeking to the end and writing a null byte
+
+        # 2) pre-allocate whole file
         if current_offset > GLOBAL_HEADER_SIZE:
             f.seek(current_offset - 1)
             f.write(b'\x00')
+
+        # 3) write each block header at its declared offset
+        for nid, info in block_infos.items():
+            f.seek(info["offset"], os.SEEK_SET)
+            f.write(BLOCK_HDR_PACK.pack(
+                nid,
+                info["n_records"],
+                0,  # flags
+                info["max_read_len"],
+                info["max_cigar_len"],
+            ))
 
     idx_path = output_prefix + ".idx"
     with open(idx_path, "wb") as idx:
@@ -297,14 +308,14 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
         block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix)
         print(f"Output file created: {dat_path}")
 
-    BUFFER_SEGMENTS = 500_000_000
+    BUFFER_SEGMENTS = 100_000
 
     next_milestone = milestone_step
     total_reads = 0
     total_segments = 0
     start_time = time.perf_counter()
 
-    # dat_fh = open(dat_path, "r+b")
+    dat_fh = open(dat_path, "r+b")
     fd = os.open(dat_path, os.O_RDWR)
     segment_buffer = defaultdict(list)
 

@@ -199,9 +199,9 @@ def read_segments(dat_path, node_index, node_id):
         # Jump to records start
         block_content_start = block_start + hdr_size
         f.seek(block_content_start, os.SEEK_SET)
-
         for _ in range(n_records):
             raw = f.read(rec_size)
+            # print(raw)
             if len(raw) < rec_size:
                 break
             offset, seq, bq, cigar_bytes, rq, strand = rec_struct.unpack(raw)
@@ -215,6 +215,7 @@ def read_segments(dat_path, node_index, node_id):
                 "strand": (strand.decode('ascii', errors='ignore')
                            if isinstance(strand, (bytes, bytearray)) else chr(strand)),
             }
+            # print(record)
             records.append(record)
 
     return records
