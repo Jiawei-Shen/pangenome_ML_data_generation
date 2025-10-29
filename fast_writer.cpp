@@ -12,9 +12,10 @@
 #include <algorithm>
 #include <thread>
 
-#include <unistd.h>      // close, pread/pwrite (not used now), ftruncate
+#include <unistd.h>      // close, pread/pwrite (not used now), ftruncate, sysconf
 #include <sys/mman.h>    // mmap, munmap, msync
 #include <sys/stat.h>    // fstat
+#include <fcntl.h>       // posix_fadvise
 #include <errno.h>
 
 namespace py = pybind11;
@@ -207,6 +208,7 @@ void flush_entire_buffer_parallel_dict(
     char* map_base = static_cast<char*>(map_ptr);
 
     // 3) Parallel in-place packing into the mapped region (GIL released)
+    size_t touched_min = SIZE_MAX, touched_max = 0;
     {
         py::gil_scoped_release nogil;
 
@@ -221,17 +223,32 @@ void flush_entire_buffer_parallel_dict(
             }
         };
 
-        for (int t = 0; t < num_threads; ++t) {
-            workers.emplace_back(worker_fn, t);
-        }
+        for (int t = 0; t < num_threads; ++t) workers.emplace_back(worker_fn, t);
         for (auto& th : workers) th.join();
 
-        // Ensure pages are flushed to disk; MS_ASYNC is usually sufficient.
-        // If you require durability before returning, use MS_SYNC (slower).
-        if (msync(map_base, map_len, MS_ASYNC) != 0) {
-            // not fatal in many cases, but surface it
-            // You could downgrade this to a warning if preferred.
-            // throw std::runtime_error("msync failed: errno=" + std::to_string(errno));
+        // Compute exact byte range touched this flush
+        for (const auto& j : jobs) {
+            size_t s = static_cast<size_t>(j.write_pos);
+            size_t e = s + j.seg_ptrs.size() * record_size_for(j.R, j.C);
+            if (s < touched_min) touched_min = s;
+            if (e > touched_max) touched_max = e;
+        }
+
+        // Page-align the range
+        long page = sysconf(_SC_PAGESIZE);
+        size_t aoff = (touched_min == SIZE_MAX) ? 0 : (touched_min / page) * page;
+        size_t alen = 0;
+        if (touched_max > touched_min) {
+            size_t span = touched_max - touched_min;
+            size_t pad  = touched_min - aoff;
+            alen = ((span + pad + page - 1) / page) * page;
+        }
+
+        if (alen > 0) {
+            // Flush only what changed; MS_ASYNC is fine unless you require per-flush durability.
+            (void) msync(map_base + aoff, alen, MS_ASYNC);
+            // Drop clean pages from cache to prevent cache bloat across batches.
+            (void) posix_fadvise(fd, aoff, alen, POSIX_FADV_DONTNEED);
         }
     }
 
@@ -292,7 +309,6 @@ PYBIND11_MODULE(fast_writer, m) {
           py::arg("sort_by_offset") = true,
           R"doc(
               Pack and write all segments in 'segment_buffer' using C++ threads and mmap.
-              'segment_buffer' is { nid:int -> list[Segment] }.
-              'state' is a BlockTable created from your Python block_infos (updates current_pos).
+              Syncs only the bytes touched in this flush and evicts them from page cache.
           )doc");
 }

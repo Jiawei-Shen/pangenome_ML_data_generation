@@ -55,7 +55,7 @@ def gam_record_iter(path, tag="GAM"):
                 group_tag = f.read(tag_len).decode()
             except (EOFError, UnicodeDecodeError):
                 break
-            if group_tag != tag:
+            if (group_tag != tag):
                 for _ in range(group_count - 1): f.seek(read_varint(f), 1)
                 continue
             for _ in range(group_count - 1):
@@ -100,7 +100,7 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
 
         seg = fast_writer.Segment(
             offset=int(node_offset),
-            seq="".join(seq_parts).encode(),        # bytes → std::string (no Unicode overhead)
+            seq="".join(seq_parts).encode(),        # bytes → std::string
             bq=bytes(bq_parts),
             cigar="".join(cigar_parts).encode(),
             rq=int(mapq),
@@ -156,10 +156,14 @@ def initialize_output_files(stats_path, output_prefix, alt_threshold):
         f.write(GLOBAL_MAGIC)
         f.write(GLOBAL_VER_PACK.pack(GLOBAL_MAJOR, GLOBAL_MINOR, len(block_infos), b'\x00' * 16))
 
-        # 2) pre-allocate whole file
-        if current_offset > GLOBAL_HEADER_SIZE:
-            f.seek(current_offset - 1)
-            f.write(b'\x00')
+        # 2) true pre-allocation of the entire file (avoid sparse, avoid delayed extent alloc)
+        final_size = current_offset
+        try:
+            os.posix_fallocate(f.fileno(), 0, final_size)
+        except AttributeError:
+            os.ftruncate(f.fileno(), final_size)           # Python lacks posix_fallocate
+        except OSError:
+            os.ftruncate(f.fileno(), final_size)           # FS doesn't support fallocate
 
         # 3) write each block header at its declared offset
         for nid, info in block_infos.items():
@@ -199,7 +203,6 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     # Persistent C++ state (tracks current_pos)
     state = fast_writer.BlockTable(block_infos)
 
-    # Tune this for your memory; fewer flushes = better throughput
     BUFFER_SEGMENTS = buffer_segments
 
     next_milestone, total_reads, total_segments = milestone_step, 0, 0
@@ -263,7 +266,7 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="GAM segment extractor with C++ pack+write (parallel pwrite).",
+        description="GAM segment extractor with C++ pack+write (parallel mmap writer, range-msync).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("gam_path")
