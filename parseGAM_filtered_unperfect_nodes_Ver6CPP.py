@@ -100,11 +100,11 @@ def process_alignment(raw_message, wanted_nodes, chrom_filter):
 
         seg = fast_writer.Segment(
             offset=int(node_offset),
-            seq="".join(seq_parts).encode(),        # bytes → std::string (no Unicode overhead)
+            seq="".join(seq_parts).encode(),
             bq=bytes(bq_parts),
             cigar="".join(cigar_parts).encode(),
             rq=int(mapq),
-            strand=int(strand_byte),                # one byte
+            strand=int(strand_byte),
         )
         segment_dict.setdefault(nid, []).append(seg)
 
@@ -156,10 +156,14 @@ def initialize_output_files(stats_path, output_prefix, alt_threshold):
         f.write(GLOBAL_MAGIC)
         f.write(GLOBAL_VER_PACK.pack(GLOBAL_MAJOR, GLOBAL_MINOR, len(block_infos), b'\x00' * 16))
 
-        # 2) pre-allocate whole file
-        if current_offset > GLOBAL_HEADER_SIZE:
-            f.seek(current_offset - 1)
-            f.write(b'\x00')
+        # 2) true pre-allocation of the entire file
+        final_size = current_offset
+        try:
+            os.posix_fallocate(f.fileno(), 0, final_size)  # best: real allocation, not sparse
+        except AttributeError:
+            os.ftruncate(f.fileno(), final_size)           # fallback if posix_fallocate missing
+        except OSError:
+            os.ftruncate(f.fileno(), final_size)           # fallback if FS doesn't support fallocate
 
         # 3) write each block header at its declared offset
         for nid, info in block_infos.items():
@@ -190,8 +194,70 @@ def initialize_output_files(stats_path, output_prefix, alt_threshold):
     return block_infos, dat_path, wanted_nodes
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Windowed flush helper: bound each C++ call to a max address span
+def _flush_in_windows(dat_fd, segbuf, state, max_span_bytes, num_threads):
+    """
+    segbuf: dict[nid] -> list[Segment]
+    state:  fast_writer.BlockTable (current_pos updated by C++ after each flush)
+    """
+    if not segbuf:
+        return
+
+    # pull current block infos (includes current_pos)
+    infos = state.to_py_dict()
+
+    # Build (nid, start, end, segs) for this batch
+    entries = []
+    for nid, segs in segbuf.items():
+        if not segs:
+            continue
+        bi = infos.get(nid)
+        if bi is None:
+            continue
+        start = bi["offset"] + BLOCK_HDR_SIZE + bi["current_pos"] * bi["record_size"]
+        end   = start + len(segs) * bi["record_size"]
+        entries.append((nid, start, end, segs))
+
+    if not entries:
+        return
+
+    entries.sort(key=lambda x: x[1])
+
+    def _flush_window(win_entries):
+        if not win_entries:
+            return
+        chunk = {nid: segs for (nid, _s, _e, segs) in win_entries}
+        fast_writer.flush_entire_buffer_parallel_dict(
+            dat_fd,
+            chunk,
+            state,
+            BLOCK_HDR_SIZE,
+            num_threads=num_threads,
+            sort_by_offset=True,
+        )
+
+    # Greedy pack into windows by contiguous address span
+    window = []
+    win_start = entries[0][1]
+    win_end   = entries[0][2]
+    for item in entries:
+        nid, start, end, segs = item
+        # If adding this entry would exceed the span budget, flush current window
+        if end - win_start > max_span_bytes and window:
+            _flush_window(window)
+            window.clear()
+            win_start = start
+            win_end   = end
+        else:
+            win_end = max(win_end, end)
+        window.append(item)
+
+    if window:
+        _flush_window(window)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Pipeline
-def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filter, use_existing, num_threads, buffer_segments, alt_threshold):
+def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filter, use_existing, num_threads, buffer_segments, alt_threshold, max_span_bytes):
     if use_existing:
         raise NotImplementedError("--use-existing is not implemented yet.")
     block_infos, dat_path, wanted_nodes = initialize_output_files(stats_path, output_prefix, alt_threshold)
@@ -199,7 +265,6 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
     # Persistent C++ state (tracks current_pos)
     state = fast_writer.BlockTable(block_infos)
 
-    # Tune this for your memory; fewer flushes = better throughput
     BUFFER_SEGMENTS = buffer_segments
 
     next_milestone, total_reads, total_segments = milestone_step, 0, 0
@@ -219,19 +284,12 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
             total_segments += len(segs)
 
         if total_segments >= BUFFER_SEGMENTS:
-            print(f"Buffer full. Flushing {len(segment_buffer)} node blocks via C++ threads ({num_threads})...")
+            print(f"Buffer full. Flushing {len(segment_buffer)} node blocks in windows (threads={num_threads})...")
             t0 = time.perf_counter()
-            fast_writer.flush_entire_buffer_parallel_dict(
-                dat_fd,
-                segment_buffer,   # dict[int -> list[Segment]]
-                state,            # BlockTable
-                BLOCK_HDR_SIZE,
-                num_threads=num_threads,
-                sort_by_offset=True,
-            )
+            _flush_in_windows(dat_fd, segment_buffer, state, max_span_bytes, num_threads)
             segment_buffer.clear()
             total_segments = 0
-            print(f"C++ flush complete in {time.perf_counter() - t0:.2f} s.")
+            print(f"Flush complete in {time.perf_counter() - t0:.2f} s.")
 
         if total_reads >= next_milestone:
             elapsed = time.perf_counter() - start_time
@@ -239,16 +297,9 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
             next_milestone += milestone_step
 
     if segment_buffer:
-        print(f"Final flush of {len(segment_buffer)} node blocks via C++ threads ({num_threads})...")
+        print(f"Final flush of {len(segment_buffer)} node blocks in windows (threads={num_threads})...")
         t0 = time.perf_counter()
-        fast_writer.flush_entire_buffer_parallel_dict(
-            dat_fd,
-            segment_buffer,
-            state,
-            BLOCK_HDR_SIZE,
-            num_threads=num_threads,
-            sort_by_offset=True,
-        )
+        _flush_in_windows(dat_fd, segment_buffer, state, max_span_bytes, num_threads)
         segment_buffer.clear()
         print(f"Final flush done in {time.perf_counter() - t0:.2f} s.")
 
@@ -263,19 +314,28 @@ def run_pipeline(gam_path, stats_path, output_prefix, milestone_step, chrom_filt
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="GAM segment extractor with C++ pack+write (parallel pwrite).",
+        description="GAM segment extractor with C++ pack+write (parallel mmap with range-msync).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("gam_path")
     parser.add_argument("stats_pickle")
     parser.add_argument("output_prefix")
-    parser.add_argument("--buffer", type=int, default=50_000_000)
-    parser.add_argument("--alt", type=float, default=0.05, help="ALT fraction threshold (0–1) replacing 0.05")
+    parser.add_argument("--buffer", type=int, default=50_000_000,
+                        help="Flush when accumulated segments reach this count.")
+    parser.add_argument("--alt", type=float, default=0.05, help="ALT fraction threshold (0–1)")
     parser.add_argument("--milestone", type=int, default=1_000_000)
     parser.add_argument("--chr", default="")
     parser.add_argument("--use-existing", action="store_true")
     parser.add_argument("--threads", type=int, default=4, help="C++ writer threads")
+    parser.add_argument("--max-span", type=str, default="2G",
+                        help="Max file-offset span per flush window, e.g., 1G, 2G, 512M.")
     args = parser.parse_args()
+
+    # parse --max-span like "2G" / "512M"
+    unit = args.max_span[-1].upper() if args.max_span[-1].isalpha() else ""
+    val = int(args.max_span[:-1]) if unit else int(args.max_span)
+    mult = {"K": 1024, "M": 1024**2, "G": 1024**3}.get(unit, 1)
+    max_span_bytes = val * mult
 
     run_pipeline(
         gam_path=args.gam_path,
@@ -287,6 +347,7 @@ def main():
         num_threads=args.threads,
         buffer_segments=args.buffer,
         alt_threshold=args.alt,
+        max_span_bytes=max_span_bytes,
     )
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-// fast_writer.cpp (mmap version)
+// fast_writer.cpp (mmap version, revised)
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/pytypes.h>
@@ -12,9 +12,10 @@
 #include <algorithm>
 #include <thread>
 
-#include <unistd.h>      // close, pread/pwrite (not used now), ftruncate
+#include <unistd.h>      // close, ftruncate, sysconf
 #include <sys/mman.h>    // mmap, munmap, msync
 #include <sys/stat.h>    // fstat
+#include <fcntl.h>       // posix_fadvise
 #include <errno.h>
 
 namespace py = pybind11;
@@ -96,9 +97,6 @@ static inline size_t record_size_for(int R, int C) {
     return 2u + static_cast<size_t>(R) + static_cast<size_t>(R) + static_cast<size_t>(C) + 2u + 1u;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Job struct for parallel pack+MMAP write
-
 struct Job {
     uint32_t nid;
     long long write_pos;
@@ -107,7 +105,13 @@ struct Job {
     std::vector<py::object> keep_alive;    // keep Python wrappers alive
 };
 
-// Worker: pack directly into mapped memory (no Python API; GIL released outside)
+// end offset for a single job
+static inline size_t job_end_pos(const Job& j) {
+    const size_t rec_sz = record_size_for(j.R, j.C);
+    return static_cast<size_t>(j.write_pos) + j.seg_ptrs.size() * rec_sz;
+}
+
+// Worker: pack directly into mapped memory
 static void do_job_mmap(char* map_base, size_t map_len, const Job& j) {
     const size_t rec_sz = record_size_for(j.R, j.C);
     const size_t total  = j.seg_ptrs.size() * rec_sz;
@@ -131,7 +135,7 @@ static void do_job_mmap(char* map_base, size_t map_len, const Job& j) {
     }
 }
 
-// Main entry: build jobs, mmap file, run parallel pack+writes into map, msync at end
+// Main entry: build jobs, mmap file, run parallel pack+writes into map, range-msync at end
 void flush_entire_buffer_parallel_dict(
     int fd,
     py::dict segment_buffer,        // dict[int -> list[Segment]]
@@ -207,6 +211,7 @@ void flush_entire_buffer_parallel_dict(
     char* map_base = static_cast<char*>(map_ptr);
 
     // 3) Parallel in-place packing into the mapped region (GIL released)
+    size_t touched_min = SIZE_MAX, touched_max = 0;
     {
         py::gil_scoped_release nogil;
 
@@ -226,16 +231,33 @@ void flush_entire_buffer_parallel_dict(
         }
         for (auto& th : workers) th.join();
 
-        // Ensure pages are flushed to disk; MS_ASYNC is usually sufficient.
-        // If you require durability before returning, use MS_SYNC (slower).
-        if (msync(map_base, map_len, MS_ASYNC) != 0) {
-            // not fatal in many cases, but surface it
-            // You could downgrade this to a warning if preferred.
-            // throw std::runtime_error("msync failed: errno=" + std::to_string(errno));
+        // compute touched span
+        for (const auto& j : jobs) {
+            size_t s = static_cast<size_t>(j.write_pos);
+            size_t e = job_end_pos(j);
+            if (s < touched_min) touched_min = s;
+            if (e > touched_max) touched_max = e;
+        }
+
+        // Align to page boundaries
+        long page = sysconf(_SC_PAGESIZE);
+        size_t aoff = (touched_min / page) * page;
+        size_t alen = 0;
+        if (touched_max > touched_min) {
+            size_t span = touched_max - touched_min;
+            size_t pad  = (touched_min - aoff);
+            alen = ((span + pad + page - 1) / page) * page;
+        }
+
+        if (alen > 0) {
+            // Range-limited async flush
+            (void) msync(map_base + aoff, alen, MS_ASYNC);
+            // Immediately tell kernel we won't need those clean pages
+            (void) posix_fadvise(fd, aoff, alen, POSIX_FADV_DONTNEED);
         }
     }
 
-    // 4) Cleanup map; GIL re-acquired automatically on scope exit
+    // 4) Cleanup map
     if (munmap(map_base, map_len) != 0) {
         throw std::runtime_error("munmap failed: errno=" + std::to_string(errno));
     }
@@ -245,7 +267,7 @@ void flush_entire_buffer_parallel_dict(
 // Module
 
 PYBIND11_MODULE(fast_writer, m) {
-    m.doc() = "C++ pack+write for GAM-derived segments with parallel mmap writes.";
+    m.doc() = "C++ pack+write for GAM-derived segments with parallel mmap writes (range-msync).";
 
     py::class_<Segment>(m, "Segment")
         .def(py::init<int16_t, std::string, std::string, std::string, int16_t, char>(),
@@ -292,7 +314,6 @@ PYBIND11_MODULE(fast_writer, m) {
           py::arg("sort_by_offset") = true,
           R"doc(
               Pack and write all segments in 'segment_buffer' using C++ threads and mmap.
-              'segment_buffer' is { nid:int -> list[Segment] }.
-              'state' is a BlockTable created from your Python block_infos (updates current_pos).
+              Uses range-limited msync + posix_fadvise(DONTNEED) on only the bytes touched in this flush.
           )doc");
 }
