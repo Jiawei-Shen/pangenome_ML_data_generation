@@ -625,11 +625,11 @@ def main():
     parser.add_argument("output", help="Base output directory")
     parser.add_argument("candidate_variants_json", help="JSON with nodes and sequences to process.")
     parser.add_argument("--num_workers", type=int, default=os.cpu_count(), help="Worker processes")
-    parser.add_argument("--chunksize", type=int, default=256, help="Task chunksize")
+    parser.add_argument("--chunksize", type=int, default=64, help="Task chunksize")
     parser.add_argument("--view", nargs='?', const=-1, default=None, type=int, metavar='N',
                         help="Print pileups for top N variants per node (-1 for all)")
     parser.add_argument("--max_view_reads", type=int, default=20, help="Max reads per pileup in view mode")
-    parser.add_argument("--min_af", type=float, default=0.1, help="Minimum allele frequency")
+    parser.add_argument("--min_af", type=float, default=0.05, help="Minimum allele frequency")
     parser.add_argument("--min_variants", type=int, default=3, help="Minimum ALT-supporting reads")
     parser.add_argument("--min_allele_bq", type=float, default=10.0, help="Minimum mean BQ for ALT")
     parser.add_argument("--variant_type", choices=['snp', 'indel', 'all'], default='all',
