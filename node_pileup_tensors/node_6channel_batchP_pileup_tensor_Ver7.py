@@ -11,12 +11,6 @@ import re
 from concurrent.futures import ProcessPoolExecutor
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Simple logger
-
-def log(msg: str) -> None:
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Latest format constants
 
 DAT_GLOBAL_MAGIC = b"MYFMT\x01"
@@ -35,15 +29,17 @@ IDX_ENTRY_SIZE = 30
 IDX_ENTRY_PACK = struct.Struct("<I Q I I H I I")  # nid, offset, block_size, n_records, flags, R, C
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Encoding tables & tensor constants (with requested codes)
-# NOTE: '*' → 1, 'I' → 90, 'N' → 5
-BASE_TO_INDEX = {'A': 20, 'C': 30, 'G': 50, 'T': 70, 'N': 5, '*': 1, 'I': 90, '_PADDING_': 0}
+# Encoding tables & tensor constants
+BASE_TO_INDEX = {'A': 20, 'C': 30, 'G': 50, 'T': 70,
+                 'N': 5, '*': 1, 'I': 90, '_PADDING_': 0}
 PADDING_BASE_INDEX = 0
 
-CIGAR_OP_TO_INDEX = {'M': 10, 'N': 20, 'S': 30, 'I': 40, 'D': 50, 'H': 60, 'P': 70, '=': 80, 'X': 90, '_PADDING_': 0}
+CIGAR_OP_TO_INDEX = {'M': 10, 'N': 20, 'S': 30, 'I': 40, 'D': 50, 'H': 60,
+                     'P': 70, '=': 80, 'X': 90, '_PADDING_': 0}
 CIGAR_PADDING_INDEX = 0
 
-INDEX_TO_BASE_FOR_VIEW = {20: 'A', 30: 'C', 50: 'G', 70: 'T', 5: 'N', 1: '*', 90: 'I', 0: ' '}
+INDEX_TO_BASE_FOR_VIEW = {20: 'A', 30: 'C', 50: 'G', 70: 'T',
+                          5: 'N', 1: '*', 90: 'I', 0: ' '}
 
 TENSOR_WINDOW_SIZE = 100
 TENSOR_MAX_READ_ROWS = 200
@@ -54,17 +50,19 @@ MISMATCH_COMPARISON_PADDING_VALUE = -1
 
 # Worker globals
 worker_dat_file = None
+worker_base_output_dir = None
 worker_need_view = False
 
-# NEW: classification globals (per worker)
-worker_do_classification = False
-worker_vcf = None          # pysam.VariantFile
-worker_chr = None          # chromosome string, e.g. 'chr1'
-worker_node_pos = {}       # dict[int, int] node_id -> grch38_start
-
-# Read-only globals (broadcast to workers)
+# Read-only globals (broadcast to workers; set in parent)
 GLOBAL_NODE_SEQS = {}
 GLOBAL_NODE_AF = {}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging helper
+
+def log(msg: str) -> None:
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -186,7 +184,8 @@ def detect_variants_from_cigar(offset_on_node, cigar_ops_decoded, read_sequence,
             node_pos += L
     return variants
 
-def get_read_representation_in_window_for_view(cops, offset_on_node, read_seq, win_start, win_size, node_len):
+def get_read_representation_in_window_for_view(cops, offset_on_node, read_seq,
+                                               win_start, win_size, node_len):
     out = [' '] * win_size
     npos, rpos = offset_on_node, 0
     rlen = len(read_seq)
@@ -197,8 +196,7 @@ def get_read_representation_in_window_for_view(cops, offset_on_node, read_seq, w
                 idx = n_aln - win_start
                 if 0 <= idx < win_size and r_aln < rlen:
                     out[idx] = read_seq[r_aln].upper()
-            npos += L
-            rpos += L
+            npos += L; rpos += L
         elif op in ('D', 'N'):
             for i in range(L):
                 idx = (npos + i) - win_start
@@ -213,7 +211,8 @@ def get_read_representation_in_window_for_view(cops, offset_on_node, read_seq, w
             break
     return out
 
-def get_read_tensor_rows_in_window(cops, offset_on_node, read_seq, qual_vals, mapq, win_start, win_size, node_len):
+def get_read_tensor_rows_in_window(cops, offset_on_node, read_seq, qual_vals,
+                                   mapq, win_start, win_size, node_len):
     bases = [PADDING_BASE_INDEX] * win_size
     quals = [DEFAULT_QUALITY_PADDING] * win_size
     mapqs = [DEFAULT_MAPPING_QUALITY_PADDING] * win_size
@@ -238,8 +237,7 @@ def get_read_tensor_rows_in_window(cops, offset_on_node, read_seq, qual_vals, ma
                         bases[idx] = BASE_TO_INDEX.get(b, BASE_TO_INDEX['N'])
                         if r_aln < qlen:
                             quals[idx] = qual_vals[r_aln]
-            npos += L
-            rpos += L
+            npos += L; rpos += L
         elif op in ('D', 'N'):
             for i in range(L):
                 idx = (npos + i) - win_start
@@ -255,9 +253,11 @@ def get_read_tensor_rows_in_window(cops, offset_on_node, read_seq, qual_vals, ma
             break
     return bases, quals, mapqs, cig
 
-def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_quality_values, read_cigar_ops_decoded,
+def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence,
+                                     read_quality_values, read_cigar_ops_decoded,
                                      target_node_pos, node_sequence,
-                                     expected_var_type=None, expected_ref_allele_for_indel=None):
+                                     expected_var_type=None,
+                                     expected_ref_allele_for_indel=None):
     npos = read_offset_on_node
     rpos = 0
     saw_ins_anchor = False
@@ -283,8 +283,7 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_qu
                         bq_anchor = None
                     else:
                         return None, None
-            npos += L
-            rpos += L
+            npos += L; rpos += L
         elif op == 'I':
             if expected_var_type == 'I' and (npos - 1) == target_node_pos:
                 if rpos + L <= len(read_sequence):
@@ -315,76 +314,13 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_qu
     return None, None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Classification helpers
-
-def _parse_key(variant_key: str):
-    parts = variant_key.split("_")
-    if len(parts) < 4:
-        raise ValueError(f"Unexpected variant_key: {variant_key}")
-    offset = int(parts[0])
-    vtype = parts[1]
-    ref = parts[2].upper()
-    alt = parts[3].upper()
-    return offset, vtype, ref, alt
-
-def _vcf_has_partial_match(pos: int, v_ref: str, v_alt: str, v_type: str) -> bool:
-    """
-    Fetch records at POS and test:
-      - Deletion (D):     VCF.REF contains v_ref  AND  any VCF.ALT contains v_alt
-      - Insertion (I):    any VCF.ALT contains v_alt  AND  VCF.REF contains v_ref
-      - Other (e.g. X):   exact REF==v_ref and ALT==v_alt
-    """
-    if not worker_do_classification or worker_vcf is None or worker_chr is None:
-        return False
-
-    for rec in worker_vcf.fetch(worker_chr, max(0, pos - 1), pos + 1):
-        ref_truth = (rec.ref or "").upper()
-        alts_truth = [(a or "").upper() for a in (rec.alts or [])]
-        if v_type == "D":
-            if ref_truth and (v_ref[len(v_alt):] in ref_truth):
-                return True
-        elif v_type == "I":
-            if ref_truth and (v_ref in ref_truth):
-                for a in alts_truth:
-                    if v_alt in a:
-                        return True
-        else:
-            for a in alts_truth:
-                if ref_truth == v_ref and a == v_alt:
-                    return True
-    return False
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Worker init & core
 
-def init_worker(dat_file_path_for_worker,
-                need_view_flag,
-                vcf_path,
-                chrom,
-                node_pos_dict):
-    """
-    Initializer for each worker process.
-    """
-    global worker_dat_file, worker_need_view
-    global worker_do_classification, worker_vcf, worker_chr, worker_node_pos
-
+def init_worker(dat_file_path_for_worker, base_output_dir_for_worker, need_view_flag):
+    global worker_dat_file, worker_base_output_dir, worker_need_view
     worker_dat_file = open(dat_file_path_for_worker, 'rb')
+    worker_base_output_dir = base_output_dir_for_worker
     worker_need_view = bool(need_view_flag)
-
-    worker_chr = chrom
-    worker_node_pos = node_pos_dict or {}
-
-    worker_do_classification = bool(vcf_path and chrom and node_pos_dict)
-    if worker_do_classification:
-        try:
-            import pysam
-        except ImportError as e:
-            raise RuntimeError(
-                "pysam is required when --vcf/--ref-json/--chr are provided."
-            ) from e
-        worker_vcf = pysam.VariantFile(vcf_path)
-    else:
-        worker_vcf = None
 
 def _non_M_length(cops):
     return sum(L for L, op in (cops or []) if op != 'M')
@@ -395,23 +331,17 @@ def process_single_node_for_pileup(task_args):
      variant_type_to_process) = task_args
 
     global worker_dat_file, worker_need_view
-    global GLOBAL_NODE_SEQS, GLOBAL_NODE_AF, worker_node_pos
+    global GLOBAL_NODE_SEQS, GLOBAL_NODE_AF
 
     node_sequence = GLOBAL_NODE_SEQS.get(node_id, "")
     if not node_sequence:
-        return node_id, {}, [], [], []
+        return node_id, {}, [], []  # no tensors, no meta
 
     genomead_af_list = GLOBAL_NODE_AF.get(node_id, [])
     node_len = len(node_sequence)
     aligned_read_segments = []
 
-    node_tensors = []  # list of np.ndarray, each (6, 201, 100)
-    node_labels = []   # list[int]
-    node_meta = []     # list[dict]
-    view_oriented_variant_data = {} if worker_need_view else None
-
     try:
-        # Read block header
         worker_dat_file.seek(dat_file_offset, os.SEEK_SET)
         hdr = worker_dat_file.read(BLOCK_HDR_SIZE)
         if len(hdr) != BLOCK_HDR_SIZE:
@@ -424,7 +354,6 @@ def process_single_node_for_pileup(task_args):
         rec_struct = make_record_struct(R, C)
         rec_size = rec_struct.size
 
-        # Read records
         records_start = dat_file_offset + BLOCK_HDR_SIZE
         worker_dat_file.seek(records_start, os.SEEK_SET)
         bulk = worker_dat_file.read(n_records * rec_size)
@@ -478,7 +407,7 @@ def process_single_node_for_pileup(task_args):
             })
     except Exception as e:
         sys.stderr.write(f"Error [Node {node_id}]: {e}\n")
-        return node_id, None, [], [], []
+        return node_id, None, [], []
 
     if len(aligned_read_segments) > TENSOR_MAX_READ_ROWS:
         aligned_read_segments.sort(
@@ -488,16 +417,18 @@ def process_single_node_for_pileup(task_args):
         aligned_read_segments = aligned_read_segments[: (TENSOR_MAX_READ_ROWS * 2)]
 
     if not aligned_read_segments:
-        return node_id, {}, [], [], []
+        return node_id, {}, [], []
 
-    # Candidate variants
+    # Variant discovery
     candidate_variants = defaultdict(int)
     for seg in aligned_read_segments:
-        for v_pos, v_type, v_ref_alt, v_ref in detect_variants_from_cigar(
+        for v_pos, v_type, v_alt, v_ref in detect_variants_from_cigar(
                 seg["offset_on_node"], seg["cigar_ops"], seg["read_sequence"], node_sequence):
-            # NOTE: original order was (v_pos, v_type, v_alt, v_ref)
-            v_alt = v_ref_alt
             candidate_variants[(v_pos, v_type, v_ref, v_alt)] += 1
+
+    view_oriented_variant_data = {} if worker_need_view else None
+    tensors_for_node = []
+    meta_for_node = []
 
     for (v_pos, v_type, v_ref_from_cigar, v_alt_from_cigar), _ in candidate_variants.items():
         if (variant_type_to_process == 'snp' and v_type != 'X') or \
@@ -520,8 +451,8 @@ def process_single_node_for_pileup(task_args):
 
         for seg in aligned_read_segments:
             allele, bq = get_allele_from_read_at_node_pos(
-                seg["offset_on_node"], seg["read_sequence"], seg["processed_quality_values"], seg["cigar_ops"],
-                v_pos, node_sequence, v_type, ref_for_indel_ctx)
+                seg["offset_on_node"], seg["read_sequence"], seg["processed_quality_values"],
+                seg["cigar_ops"], v_pos, node_sequence, v_type, ref_for_indel_ctx)
             if allele is None:
                 continue
             cov += 1
@@ -546,12 +477,13 @@ def process_single_node_for_pileup(task_args):
 
         af = alt / cov if cov > 0 else 0.0
         mean_bq = sum(alt_bqs) / len(alt_bqs) if alt_bqs else 0.0
+
         key = canonical_variant_key(v_pos, v_type, v_ref_from_cigar, v_alt_from_cigar, node_sequence)
 
         center = v_pos + 1 if v_type == 'I' else v_pos
         win_start = calculate_window_start(center, TENSOR_WINDOW_SIZE)
 
-        # Optional view
+        # Optional view data (debug)
         if worker_need_view:
             pile = []
             for seg in aligned_read_segments[: TENSOR_MAX_READ_ROWS + 50]:
@@ -570,7 +502,7 @@ def process_single_node_for_pileup(task_args):
                         "cigar": seg["original_cigar_str"]
                     })
             view_oriented_variant_data[key] = {
-                "pileup_reads_data": pile[: TENSOR_MAX_READ_ROWS],
+                "pileup_reads_data": pile[:TENSOR_MAX_READ_ROWS],
                 "alt_allele_count": alt,
                 "ref_allele_count_at_locus": ref,
                 "other_allele_count_at_locus": other,
@@ -579,17 +511,18 @@ def process_single_node_for_pileup(task_args):
                 "mean_alt_allele_base_quality": round(mean_bq, 2)
             }
 
-        # Build tensor
+        # Build tensors
         ref_row = [PADDING_BASE_INDEX] * TENSOR_WINDOW_SIZE
         for i, p in enumerate(range(win_start, win_start + TENSOR_WINDOW_SIZE)):
             if 0 <= p < node_len:
                 ref_row[i] = BASE_TO_INDEX.get(node_sequence[p].upper(), BASE_TO_INDEX['N'])
 
         af_row = [0] * TENSOR_WINDOW_SIZE
-        if genomead_af_list:
+        g_list = GLOBAL_NODE_AF.get(node_id, [])
+        if g_list:
             for i, p in enumerate(range(win_start, win_start + TENSOR_WINDOW_SIZE)):
                 if 0 <= p < node_len:
-                    v = genomead_af_list[p]
+                    v = g_list[p]
                     if isinstance(v, str):
                         if len(v) == 1 and '0' <= v <= '7':
                             b = ord(v) - 48
@@ -615,15 +548,18 @@ def process_single_node_for_pileup(task_args):
 
         reads_added = 0
         variant_win_idx = v_pos - win_start
+
         for seg in aligned_read_segments:
             if reads_added >= TENSOR_MAX_READ_ROWS:
                 break
             mapq = max(0, min(int(seg["mapping_quality"]), 127))
             b_row, q_row, mq_row, cig_row = get_read_tensor_rows_in_window(
                 seg["cigar_ops"], seg["offset_on_node"], seg["read_sequence"],
-                seg["processed_quality_values"], mapq, win_start, TENSOR_WINDOW_SIZE, node_len)
+                seg["processed_quality_values"], mapq, win_start,
+                TENSOR_WINDOW_SIZE, node_len
+            )
 
-            # insertion encoding
+            # Encode insertion ALT as 'I' at the anchor with mean BQ
             if v_type == 'I' and 0 <= variant_win_idx < TENSOR_WINDOW_SIZE:
                 allele_ins, mean_bq_ins = get_allele_from_read_at_node_pos(
                     seg["offset_on_node"],
@@ -633,9 +569,7 @@ def process_single_node_for_pileup(task_args):
                     v_pos,
                     node_sequence,
                     expected_var_type='I',
-                    expected_ref_allele_for_indel=(
-                        node_sequence[v_pos] if 0 <= v_pos < node_len else "*"
-                    ),
+                    expected_ref_allele_for_indel=(node_sequence[v_pos] if 0 <= v_pos < node_len else "*"),
                 )
                 if isinstance(allele_ins, str) and allele_ins == v_alt_from_cigar:
                     b_row[variant_win_idx] = BASE_TO_INDEX['I']
@@ -646,6 +580,7 @@ def process_single_node_for_pileup(task_args):
                 r = 1 + reads_added
                 ch1[r, :] = np.asarray(b_row, dtype=np.int8)
                 ch2[r, :] = np.asarray(q_row, dtype=np.int8)
+
                 ref_vec = ch1[0, :].astype(np.int16)
                 read_vec = ch1[r, :].astype(np.int16)
                 flags = np.full(W, MISMATCH_COMPARISON_PADDING_VALUE, dtype=np.int8)
@@ -654,60 +589,47 @@ def process_single_node_for_pileup(task_args):
                 if 0 <= variant_win_idx < W and mask[variant_win_idx] and flags[variant_win_idx] == 1:
                     flags[variant_win_idx] = 5
                 ch3[r, :] = flags
+
                 ch4[r, :] = np.asarray(mq_row, dtype=np.int8)
                 ch5[r, :] = np.asarray(cig_row, dtype=np.int8)
                 ch6[r, :] = ch6[0, :]
+
                 reads_added += 1
 
-        tensor = np.stack([ch1, ch2, ch3, ch4, ch5, ch6], axis=0)  # (6, 201, 100)
+        tensor = np.stack([ch1, ch2, ch3, ch4, ch5, ch6], axis=0)
 
-        # Classification
-        label_int = -1
-        classification_str = "unknown"
-        genomic_position = None
-        try:
-            offset, vtype_for_cls, ref_for_cls, alt_for_cls = _parse_key(key)
-            start_pos = worker_node_pos.get(node_id)
-            if start_pos is not None and worker_do_classification:
-                genomic_position = start_pos + offset
-                is_match = _vcf_has_partial_match(genomic_position, ref_for_cls, alt_for_cls, vtype_for_cls)
-                if is_match:
-                    label_int = 1
-                    classification_str = "true"
-                else:
-                    label_int = 0
-                    classification_str = "false"
-        except Exception:
-            pass
-
-        node_tensors.append(tensor)
-        node_labels.append(label_int)
-        node_meta.append({
+        meta = {
             "node_id": node_id,
             "variant_key": key,
-            "alt_allele_count": alt,
-            "ref_allele_count_at_locus": ref,
-            "other_allele_count_at_locus": other,
-            "coverage_at_locus": cov,
-            "alt_allele_frequency": round(af, 4),
-            "mean_alt_allele_base_quality": round(mean_bq, 2),
-            "classification": classification_str,
-            "label": label_int,
-            "genomic_position": genomic_position,
-        })
+            "v_pos": int(v_pos),
+            "v_type": v_type,
+            "v_ref": v_ref_from_cigar,
+            "v_alt": v_alt_from_cigar,
+            "alt_allele_count": int(alt),
+            "ref_allele_count_at_locus": int(ref),
+            "other_allele_count_at_locus": int(other),
+            "coverage_at_locus": int(cov),
+            "alt_allele_frequency": float(round(af, 4)),
+            "mean_alt_allele_base_quality": float(round(mean_bq, 2)),
+        }
 
-    return node_id, (view_oriented_variant_data or {}), node_tensors, node_labels, node_meta
+        tensors_for_node.append(tensor)
+        meta_for_node.append(meta)
+
+    return node_id, (view_oriented_variant_data or {}), tensors_for_node, meta_for_node
 
 # ─────────────────────────────────────────────────────────────────────────────
-# View (unchanged)
+# View (unchanged, optional)
 
-def display_pileup_data(node_data_for_display_view, node_id_str_for_display, full_node_sequence,
-                        max_reads_to_display_per_variant, max_variants_to_display=float('inf')):
+def display_pileup_data(node_data_for_display_view, node_id_str_for_display,
+                        full_node_sequence, max_reads_to_display_per_variant,
+                        max_variants_to_display=float('inf')):
     if max_variants_to_display == 0 or not node_data_for_display_view:
-        log(f"Info: No pileup data for node {node_id_str_for_display}.")
+        print(f"Info: No pileup data for node {node_id_str_for_display}.")
         return
     print(f"\n=== Displaying Pileups for Node {node_id_str_for_display} (Len: {len(full_node_sequence)}) ===")
-    keys = sorted(node_data_for_display_view.keys(), key=lambda x: (int(x.split('_')[0]), x.split('_')[1]))
+    keys = sorted(node_data_for_display_view.keys(),
+                  key=lambda x: (int(x.split('_')[0]), x.split('_')[1]))
     for i, k in enumerate(keys):
         if i >= max_variants_to_display:
             print(f"\n  ... ({len(keys) - i} more variants not shown due to --view limit)")
@@ -728,42 +650,23 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
             bases_str = ''.join(INDEX_TO_BASE_FOR_VIEW.get(idx, '?') for idx in row["bases"])
             print(f"  Read {j+1:3d}: {bases_str} (CIGAR:{row['cigar']}, STRAND:{row.get('strand', '?')})")
         vd = node_data_for_display_view[k]
-        print(f"  Alt Count: {vd.get('alt_allele_count','N/A')}, Ref Count: {vd.get('ref_allele_count_at_locus','N/A')}, "
+        print(f"  Alt Count: {vd.get('alt_allele_count','N/A')}, "
+              f"Ref Count: {vd.get('ref_allele_count_at_locus','N/A')}, "
               f"Coverage: {vd.get('coverage_at_locus','N/A')}")
         print(f"  Alt Freq: {vd.get('alt_allele_frequency',0.0):.4f}, "
               f"Mean Alt BQ: {vd.get('mean_alt_allele_base_quality',0.0):.2f}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main & helpers
-
-def load_node_positions(ref_json_path, needed_ids):
-    pos = {}
-    with open(ref_json_path, "r") as f:
-        data = json.load(f)
-    for node in data.get("nodes", []):
-        nid_raw = node.get("node_id")
-        if nid_raw is None:
-            continue
-        try:
-            nid = int(nid_raw)
-        except (ValueError, TypeError):
-            continue
-        if nid not in needed_ids:
-            continue
-        p = node.get("grch38_position_start")
-        if isinstance(p, int):
-            pos[nid] = p
-    return pos
+# Main (Stage 1: tensors only)
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate variant-centered tensors from latest .dat/.idx format, "
-                    "sharded into global files with integrated classification.",
+        description="Generate variant-centered tensors from latest .dat/.idx format (R,C per block) into sharded NPYs.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("dat", help=".dat alignment file (latest format)")
     parser.add_argument("idx", help=".idx index file (30B entries)")
-    parser.add_argument("output", help="Base output directory")
+    parser.add_argument("output", help="Base output directory (will contain shard_XXXXX_data.npy and variant_summary.ndjson)")
     parser.add_argument("candidate_variants_json", help="JSON with nodes and sequences to process.")
     parser.add_argument("--num_workers", type=int, default=os.cpu_count(), help="Worker processes")
     parser.add_argument("--chunksize", type=int, default=64, help="Task chunksize")
@@ -776,33 +679,28 @@ def main():
     parser.add_argument("--variant_type", choices=['snp', 'indel', 'all'], default='all',
                         help="Which variants to output tensors for")
     parser.add_argument("--shard_size", type=int, default=4096,
-                        help="Number of variants per output shard.")
-
-    # classification inputs
-    parser.add_argument("--vcf", help="Truth VCF for classification (optional)")
-    parser.add_argument("--ref-json", dest="ref_json",
-                        help="Reference JSON with node -> GRCh38 start positions (optional)")
-    parser.add_argument("--chr", help="Chromosome name for VCF fetch (e.g. chr1)")
-
+                        help="Number of variant tensors per shard")
+    parser.add_argument("--log_every_nodes", type=int, default=100000,
+                        help="Log progress every N nodes")
     args = parser.parse_args()
 
     if not all(os.path.isfile(p) for p in (args.dat, args.idx, args.candidate_variants_json)):
         sys.exit("Error: dat/idx/json not found.")
 
-    log(f"Reading .dat header from {args.dat}")
+    # Validate latest .dat header
     try:
         major, minor, blocks = read_dat_global_header(args.dat)
         log(f".dat header: version {major}.{minor}, blocks={blocks} (expect latest format)")
     except Exception as e:
         sys.exit(f"Error reading .dat header: {e}")
 
-    log(f"Loading .idx from {args.idx}")
+    # Load idx (latest only)
     try:
         idx_map = load_full_idx_data_latest(args.idx)
     except Exception as e:
         sys.exit(f"Error reading .idx (latest): {e}")
 
-    log(f"Loading candidate nodes JSON from {args.candidate_variants_json}")
+    # Input nodes JSON
     node_sequences, node_af_data, node_ids = {}, {}, set()
     try:
         with open(args.candidate_variants_json, 'r') as f:
@@ -820,7 +718,7 @@ def main():
                     except ValueError:
                         pass
     except Exception as e:
-        sys.exit(f"Error parsing candidate_variants_json: {e}")
+        sys.exit(f"Error parsing JSON: {e}")
 
     log(f"Loaded {len(node_sequences)} candidate nodes from JSON.")
 
@@ -829,7 +727,9 @@ def main():
     for nid in node_ids:
         if nid in idx_map:
             off, nrec = idx_map[nid]
-            tasks.append((nid, off, nrec, args.min_af, args.min_variants, args.min_allele_bq, args.variant_type))
+            tasks.append((nid, off, nrec,
+                          args.min_af, args.min_variants,
+                          args.min_allele_bq, args.variant_type))
         else:
             missing += 1
     if missing:
@@ -837,156 +737,101 @@ def main():
     if not tasks:
         sys.exit("No tasks to run after JSON/idx filtering.")
 
-    tasks.sort(key=lambda t: t[1])
+    tasks.sort(key=lambda t: t[1])  # by offset
     os.makedirs(args.output, exist_ok=True)
 
     global GLOBAL_NODE_SEQS, GLOBAL_NODE_AF
     GLOBAL_NODE_SEQS, GLOBAL_NODE_AF = node_sequences, node_af_data
 
-    classification_enabled = bool(args.vcf and args.ref_json and args.chr)
-    if any([args.vcf, args.ref_json, args.chr]) and not classification_enabled:
-        sys.exit("If using classification, you must supply --vcf, --ref-json and --chr together.")
-
-    node_pos_map = {}
-    if classification_enabled:
-        log("Classification mode: ENABLED.")
-        log(f"  VCF     : {args.vcf}")
-        log(f"  ref JSON: {args.ref_json}")
-        log(f"  chr     : {args.chr}")
-        node_pos_map = load_node_positions(args.ref_json, node_ids)
-        log(f"Loaded GRCh38 start positions for {len(node_pos_map)} nodes.")
-        if not node_pos_map:
-            log("Warning: no node positions found in ref_json for candidate nodes; "
-                "classification will effectively be 'unknown'.")
-    else:
-        log("Classification mode: DISABLED (no --vcf/--ref-json/--chr).")
-
     need_view = (args.view is not None and args.view != 0)
-    total = len(tasks)
-    log(f"Submitting {total} nodes to {args.num_workers} workers…")
+    total_nodes = len(tasks)
+    log(f"Submitting {total_nodes} nodes to {args.num_workers} workers...")
 
-    # Global buffering for shards
     shard_size = max(1, int(args.shard_size))
     shard_idx = 0
     buffer_tensors = []
-    buffer_labels = []
     buffer_meta = []
 
     summary_path = os.path.join(args.output, "variant_summary.ndjson")
     summary_f = open(summary_path, "w")
 
+    t0 = time.time()
+    processed_nodes = 0
     total_variants = 0
-    total_true = 0
-    total_false = 0
-    total_unknown = 0
-
-    processed = 0
     batch_nodes = 0
     batch_variants = 0
-    t0 = time.time()
 
     def flush_shard():
-        nonlocal shard_idx, buffer_tensors, buffer_labels, buffer_meta
+        nonlocal shard_idx, buffer_tensors, buffer_meta, total_variants
         if not buffer_tensors:
-            return 0
-        n = len(buffer_tensors)
-        xs = np.stack(buffer_tensors, axis=0)
-        ys = np.asarray(buffer_labels, dtype=np.int8)
-
+            return
+        xs = np.stack(buffer_tensors, axis=0)  # (N, 6, 201, 100)
+        N = xs.shape[0]
         data_path = os.path.join(args.output, f"shard_{shard_idx:05d}_data.npy")
-        labels_path = os.path.join(args.output, f"shard_{shard_idx:05d}_labels.npy")
-
-        log(f"Flushing shard {shard_idx:05d}: {n} variants → {data_path}, {labels_path}")
+        log(f"Saving shard {shard_idx} data: {N} tensors -> {data_path}")
         np.save(data_path, xs)
-        np.save(labels_path, ys)
 
-        # simple per-shard label distribution
-        unique, counts = np.unique(ys, return_counts=True)
-        dist = ", ".join(f"label {int(u)}: {int(c)}" for u, c in zip(unique, counts))
-        log(f"  Shard {shard_idx:05d} label distribution: {dist}")
+        # Write meta lines for this shard, with shard+index info
+        for i, m in enumerate(buffer_meta):
+            m_out = dict(m)
+            m_out["shard_index"] = shard_idx
+            m_out["index_within_shard"] = i
+            summary_f.write(json.dumps(m_out) + "\n")
 
-        for i, meta in enumerate(buffer_meta):
-            rec = dict(meta)
-            rec["shard_index"] = shard_idx
-            rec["index_within_shard"] = i
-            summary_f.write(json.dumps(rec) + "\n")
-
+        total_variants += N
         shard_idx += 1
         buffer_tensors = []
-        buffer_labels = []
         buffer_meta = []
-        return n
 
-    with ProcessPoolExecutor(
-        max_workers=args.num_workers,
-        initializer=init_worker,
-        initargs=(args.dat, need_view, args.vcf, args.chr, node_pos_map)
-    ) as ex:
-        for nid, view_data, node_tensors, node_labels, node_meta in ex.map(
-            process_single_node_for_pileup, tasks, chunksize=max(1, args.chunksize)
-        ):
-            processed += 1
+    with ProcessPoolExecutor(max_workers=args.num_workers,
+                             initializer=init_worker,
+                             initargs=(args.dat, args.output, need_view)) as ex:
+        for nid, view_data, node_tensors, node_meta in ex.map(
+                process_single_node_for_pileup,
+                tasks,
+                chunksize=max(1, args.chunksize)):
+
+            processed_nodes += 1
             batch_nodes += 1
 
+            if node_tensors:
+                buffer_tensors.extend(node_tensors)
+                buffer_meta.extend(node_meta)
+                n_new = len(node_tensors)
+                batch_variants += n_new
+
+            # Optional live view print
             if need_view and view_data:
                 seq_for_view = GLOBAL_NODE_SEQS.get(nid, "")
-                display_pileup_data(
-                    view_data,
-                    str(nid),
-                    seq_for_view,
-                    args.max_view_reads,
-                    args.view if args.view != -1 else float('inf')
-                )
+                display_pileup_data(view_data, str(nid), seq_for_view,
+                                    args.max_view_reads,
+                                    args.view if args.view != -1 else float('inf'))
 
-            # extend global buffers
-            buffer_tensors.extend(node_tensors)
-            buffer_labels.extend(node_labels)
-            buffer_meta.extend(node_meta)
-
-            n_new = len(node_tensors)
-            total_variants += n_new
-            batch_variants += n_new
-
-            # update global label counts
-            for lbl in node_labels:
-                if lbl == 1:
-                    total_true += 1
-                elif lbl == 0:
-                    total_false += 1
-                else:
-                    total_unknown += 1
-
-            # flush shard if needed
+            # Flush shards as buffer grows
             while len(buffer_tensors) >= shard_size:
                 flush_shard()
 
-            # periodic batch progress log
-            if batch_nodes >= 100000 or processed == total:
+            # Progress logging
+            if (processed_nodes % args.log_every_nodes == 0) or (processed_nodes == total_nodes):
                 dt = time.time() - t0
                 rate_nodes = batch_nodes / dt if dt > 0 else 0.0
-                rate_variants = batch_variants / dt if dt > 0 else 0.0
-                log(
-                    f"Batch progress: +{batch_nodes} nodes (+{batch_variants} variants) "
-                    f"in {dt:.2f}s → {rate_nodes:.1f} nodes/s, {rate_variants:.1f} vars/s "
-                    f"[total {processed}/{total} nodes, {total_variants} variants, "
-                    f"{shard_idx} shards written so far]"
-                )
+                rate_vars = batch_variants / dt if dt > 0 else 0.0
+                log(f"Batch: +{batch_nodes} nodes (+{batch_variants} variants) "
+                    f"in {dt:.2f}s → {rate_nodes:.1f} nodes/s, {rate_vars:.1f} vars/s. "
+                    f"[total {processed_nodes}/{total_nodes} nodes, "
+                    f"{total_variants} variants, {shard_idx} shards written so far]")
                 batch_nodes = 0
                 batch_variants = 0
                 t0 = time.time()
 
-    # flush remaining
-    remaining = flush_shard()
-    if remaining:
-        log(f"Final flush: {remaining} variants in last shard.")
-
+    # Final shard flush
+    flush_shard()
     summary_f.close()
 
-    log("All done.")
-    log(f"Total variant tensors generated: {total_variants}")
-    log(f"Total labels: true={total_true}, false={total_false}, unknown={total_unknown}")
-    log(f"Total shards written: {shard_idx}")
-    log(f"Output directory: {args.output}")
+    log("Done.")
+    log(f"Total nodes processed  : {processed_nodes}")
+    log(f"Total variant tensors  : {total_variants}")
+    log(f"Total shards written   : {shard_idx}")
     log(f"Variant summary (NDJSON): {summary_path}")
 
 if __name__ == "__main__":
