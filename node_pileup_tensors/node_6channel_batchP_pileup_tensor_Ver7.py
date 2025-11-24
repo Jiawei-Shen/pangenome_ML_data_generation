@@ -807,6 +807,7 @@ def main():
                                     args.max_view_reads,
                                     args.view if args.view != -1 else float('inf'))
 
+            print(f"length of buffer_tensors: {len(buffer_tensors)}%", end="\r", flush=True)
             # Flush shards as buffer grows
             while len(buffer_tensors) >= shard_size:
                 flush_shard()
