@@ -11,6 +11,12 @@ import re
 from concurrent.futures import ProcessPoolExecutor
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Simple logger
+
+def log(msg: str) -> None:
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Latest format constants
 
 DAT_GLOBAL_MAGIC = b"MYFMT\x01"
@@ -309,7 +315,7 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_qu
     return None, None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Classification helpers (ported from your previous classify script)
+# Classification helpers
 
 def _parse_key(variant_key: str):
     parts = variant_key.split("_")
@@ -487,8 +493,10 @@ def process_single_node_for_pileup(task_args):
     # Candidate variants
     candidate_variants = defaultdict(int)
     for seg in aligned_read_segments:
-        for v_pos, v_type, v_alt, v_ref in detect_variants_from_cigar(
+        for v_pos, v_type, v_ref_alt, v_ref in detect_variants_from_cigar(
                 seg["offset_on_node"], seg["cigar_ops"], seg["read_sequence"], node_sequence):
+            # NOTE: original order was (v_pos, v_type, v_alt, v_ref)
+            v_alt = v_ref_alt
             candidate_variants[(v_pos, v_type, v_ref, v_alt)] += 1
 
     for (v_pos, v_type, v_ref_from_cigar, v_alt_from_cigar), _ in candidate_variants.items():
@@ -696,7 +704,7 @@ def process_single_node_for_pileup(task_args):
 def display_pileup_data(node_data_for_display_view, node_id_str_for_display, full_node_sequence,
                         max_reads_to_display_per_variant, max_variants_to_display=float('inf')):
     if max_variants_to_display == 0 or not node_data_for_display_view:
-        print(f"Info: No pileup data for node {node_id_str_for_display}.")
+        log(f"Info: No pileup data for node {node_id_str_for_display}.")
         return
     print(f"\n=== Displaying Pileups for Node {node_id_str_for_display} (Len: {len(full_node_sequence)}) ===")
     keys = sorted(node_data_for_display_view.keys(), key=lambda x: (int(x.split('_')[0]), x.split('_')[1]))
@@ -781,17 +789,20 @@ def main():
     if not all(os.path.isfile(p) for p in (args.dat, args.idx, args.candidate_variants_json)):
         sys.exit("Error: dat/idx/json not found.")
 
+    log(f"Reading .dat header from {args.dat}")
     try:
         major, minor, blocks = read_dat_global_header(args.dat)
-        print(f".dat header: version {major}.{minor}, blocks={blocks} (expect latest format)")
+        log(f".dat header: version {major}.{minor}, blocks={blocks} (expect latest format)")
     except Exception as e:
         sys.exit(f"Error reading .dat header: {e}")
 
+    log(f"Loading .idx from {args.idx}")
     try:
         idx_map = load_full_idx_data_latest(args.idx)
     except Exception as e:
         sys.exit(f"Error reading .idx (latest): {e}")
 
+    log(f"Loading candidate nodes JSON from {args.candidate_variants_json}")
     node_sequences, node_af_data, node_ids = {}, {}, set()
     try:
         with open(args.candidate_variants_json, 'r') as f:
@@ -811,7 +822,7 @@ def main():
     except Exception as e:
         sys.exit(f"Error parsing candidate_variants_json: {e}")
 
-    print(f"Loaded {len(node_sequences)} candidate nodes from JSON.")
+    log(f"Loaded {len(node_sequences)} candidate nodes from JSON.")
 
     tasks = []
     missing = 0
@@ -822,7 +833,7 @@ def main():
         else:
             missing += 1
     if missing:
-        print(f"Warning: {missing} nodes from JSON not found in idx; skipped.")
+        log(f"Warning: {missing} nodes from JSON not found in idx; skipped.")
     if not tasks:
         sys.exit("No tasks to run after JSON/idx filtering.")
 
@@ -838,21 +849,21 @@ def main():
 
     node_pos_map = {}
     if classification_enabled:
-        print("Classification mode: enabled.")
-        print(f"  VCF     : {args.vcf}")
-        print(f"  ref JSON: {args.ref_json}")
-        print(f"  chr     : {args.chr}")
+        log("Classification mode: ENABLED.")
+        log(f"  VCF     : {args.vcf}")
+        log(f"  ref JSON: {args.ref_json}")
+        log(f"  chr     : {args.chr}")
         node_pos_map = load_node_positions(args.ref_json, node_ids)
-        print(f"Loaded GRCh38 start positions for {len(node_pos_map)} nodes.")
+        log(f"Loaded GRCh38 start positions for {len(node_pos_map)} nodes.")
         if not node_pos_map:
-            print("Warning: no node positions found in ref_json for candidate nodes; "
-                  "classification will effectively be 'unknown'.")
+            log("Warning: no node positions found in ref_json for candidate nodes; "
+                "classification will effectively be 'unknown'.")
     else:
-        print("Classification mode: disabled (no --vcf/--ref-json/--chr).")
+        log("Classification mode: DISABLED (no --vcf/--ref-json/--chr).")
 
     need_view = (args.view is not None and args.view != 0)
     total = len(tasks)
-    print(f"Submitting {total} nodes to {args.num_workers} workers...")
+    log(f"Submitting {total} nodes to {args.num_workers} workers…")
 
     # Global buffering for shards
     shard_size = max(1, int(args.shard_size))
@@ -864,6 +875,16 @@ def main():
     summary_path = os.path.join(args.output, "variant_summary.ndjson")
     summary_f = open(summary_path, "w")
 
+    total_variants = 0
+    total_true = 0
+    total_false = 0
+    total_unknown = 0
+
+    processed = 0
+    batch_nodes = 0
+    batch_variants = 0
+    t0 = time.time()
+
     def flush_shard():
         nonlocal shard_idx, buffer_tensors, buffer_labels, buffer_meta
         if not buffer_tensors:
@@ -874,8 +895,15 @@ def main():
 
         data_path = os.path.join(args.output, f"shard_{shard_idx:05d}_data.npy")
         labels_path = os.path.join(args.output, f"shard_{shard_idx:05d}_labels.npy")
+
+        log(f"Flushing shard {shard_idx:05d}: {n} variants → {data_path}, {labels_path}")
         np.save(data_path, xs)
         np.save(labels_path, ys)
+
+        # simple per-shard label distribution
+        unique, counts = np.unique(ys, return_counts=True)
+        dist = ", ".join(f"label {int(u)}: {int(c)}" for u, c in zip(unique, counts))
+        log(f"  Shard {shard_idx:05d} label distribution: {dist}")
 
         for i, meta in enumerate(buffer_meta):
             rec = dict(meta)
@@ -888,12 +916,6 @@ def main():
         buffer_labels = []
         buffer_meta = []
         return n
-
-    total_variants = 0
-    processed = 0
-    batch_nodes = 0
-    batch_variants = 0
-    t0 = time.time()
 
     with ProcessPoolExecutor(
         max_workers=args.num_workers,
@@ -925,28 +947,47 @@ def main():
             total_variants += n_new
             batch_variants += n_new
 
+            # update global label counts
+            for lbl in node_labels:
+                if lbl == 1:
+                    total_true += 1
+                elif lbl == 0:
+                    total_false += 1
+                else:
+                    total_unknown += 1
+
             # flush shard if needed
             while len(buffer_tensors) >= shard_size:
-                flushed = flush_shard()
-                # flushed == shard_size typically, but don't assume
+                flush_shard()
 
+            # periodic batch progress log
             if batch_nodes >= 100000 or processed == total:
                 dt = time.time() - t0
-                rate = batch_nodes / dt if dt > 0 else 0.0
-                print(f"  Batch {batch_nodes} nodes (total {processed}/{total}) in {dt:.2f}s "
-                      f"→ {rate:.1f} nodes/s. Batch variants: {batch_variants}. "
-                      f"Total variants: {total_variants}.")
+                rate_nodes = batch_nodes / dt if dt > 0 else 0.0
+                rate_variants = batch_variants / dt if dt > 0 else 0.0
+                log(
+                    f"Batch progress: +{batch_nodes} nodes (+{batch_variants} variants) "
+                    f"in {dt:.2f}s → {rate_nodes:.1f} nodes/s, {rate_variants:.1f} vars/s "
+                    f"[total {processed}/{total} nodes, {total_variants} variants, "
+                    f"{shard_idx} shards written so far]"
+                )
                 batch_nodes = 0
                 batch_variants = 0
                 t0 = time.time()
 
     # flush remaining
-    flush_shard()
+    remaining = flush_shard()
+    if remaining:
+        log(f"Final flush: {remaining} variants in last shard.")
+
     summary_f.close()
 
-    print(f"\nDone. Total variant tensors generated: {total_variants}.")
-    print(f"Shards and labels written under: {args.output}")
-    print(f"Variant summary (NDJSON): {summary_path}")
+    log("All done.")
+    log(f"Total variant tensors generated: {total_variants}")
+    log(f"Total labels: true={total_true}, false={total_false}, unknown={total_unknown}")
+    log(f"Total shards written: {shard_idx}")
+    log(f"Output directory: {args.output}")
+    log(f"Variant summary (NDJSON): {summary_path}")
 
 if __name__ == "__main__":
     main()
