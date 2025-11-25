@@ -679,7 +679,7 @@ def main():
     parser.add_argument("--variant_type", choices=['snp', 'indel', 'all'], default='all',
                         help="Which variants to output tensors for")
     parser.add_argument("--shard_size", type=int, default=4096,
-                        help="Number of variant tensors per shard")
+                        help="Number of variant tensors per full shard")
     parser.add_argument("--log_every_nodes", type=int, default=100000,
                         help="Log progress every N nodes")
     args = parser.parse_args()
@@ -751,27 +751,65 @@ def main():
     shard_idx = 0
     buffer_tensors = []
     buffer_meta = []
+    total_variants = 0
 
     summary_path = os.path.join(args.output, "variant_summary.ndjson")
     summary_f = open(summary_path, "w")
 
     t0 = time.time()
     processed_nodes = 0
-    total_variants = 0
     batch_nodes = 0
     batch_variants = 0
 
-    def flush_shard():
+    def flush_full_shard():
+        """
+        Take exactly `shard_size` tensors/meta from the front of the buffers,
+        write them as one shard, and keep any leftovers in the buffers.
+        """
         nonlocal shard_idx, buffer_tensors, buffer_meta, total_variants
-        if not buffer_tensors:
+
+        if len(buffer_tensors) < shard_size:
             return
-        xs = np.stack(buffer_tensors, axis=0)  # (N, 6, 201, 100)
+
+        # take exactly shard_size items
+        chunk_tensors = buffer_tensors[:shard_size]
+        chunk_meta = buffer_meta[:shard_size]
+
+        # keep leftovers in buffer
+        buffer_tensors = buffer_tensors[shard_size:]
+        buffer_meta = buffer_meta[shard_size:]
+
+        xs = np.stack(chunk_tensors, axis=0)  # (shard_size, 6, 201, 100)
         N = xs.shape[0]
         data_path = os.path.join(args.output, f"shard_{shard_idx:05d}_data.npy")
         log(f"Saving shard {shard_idx} data: {N} tensors -> {data_path}")
         np.save(data_path, xs)
 
-        # Write meta lines for this shard, with shard+index info
+        # meta for this shard
+        for i, m in enumerate(chunk_meta):
+            m_out = dict(m)
+            m_out["shard_index"] = shard_idx
+            m_out["index_within_shard"] = i
+            summary_f.write(json.dumps(m_out) + "\n")
+
+        total_variants += N
+        shard_idx += 1
+
+    def flush_remainder():
+        """
+        Write any remaining tensors as a final shard (may be smaller than shard_size).
+        """
+        nonlocal shard_idx, buffer_tensors, buffer_meta, total_variants
+
+        if not buffer_tensors:
+            return
+
+        xs = np.stack(buffer_tensors, axis=0)
+        N = xs.shape[0]
+        data_path = os.path.join(args.output, f"shard_{shard_idx:05d}_data.npy")
+        log(f"Saving FINAL shard {shard_idx} data: {N} tensors -> {data_path}")
+        np.save(data_path, xs)
+
         for i, m in enumerate(buffer_meta):
             m_out = dict(m)
             m_out["shard_index"] = shard_idx
@@ -780,8 +818,9 @@ def main():
 
         total_variants += N
         shard_idx += 1
-        buffer_tensors = []
-        buffer_meta = []
+
+        buffer_tensors.clear()
+        buffer_meta.clear()
 
     with ProcessPoolExecutor(max_workers=args.num_workers,
                              initializer=init_worker,
@@ -807,9 +846,9 @@ def main():
                                     args.max_view_reads,
                                     args.view if args.view != -1 else float('inf'))
 
-            # Flush shards as buffer grows
+            # Flush any full shards from the buffer
             while len(buffer_tensors) >= shard_size:
-                flush_shard()
+                flush_full_shard()
 
             # Progress logging
             if (processed_nodes % args.log_every_nodes == 0) or (processed_nodes == total_nodes):
@@ -824,14 +863,14 @@ def main():
                 batch_variants = 0
                 t0 = time.time()
 
-    # Final shard flush
-    flush_shard()
+    # Final shard flush for leftovers (may be < shard_size)
+    flush_remainder()
     summary_f.close()
 
     log("Done.")
-    log(f"Total nodes processed  : {processed_nodes}")
-    log(f"Total variant tensors  : {total_variants}")
-    log(f"Total shards written   : {shard_idx}")
+    log(f"Total nodes processed   : {processed_nodes}")
+    log(f"Total variant tensors   : {total_variants}")
+    log(f"Total shards written    : {shard_idx}")
     log(f"Variant summary (NDJSON): {summary_path}")
 
 if __name__ == "__main__":
