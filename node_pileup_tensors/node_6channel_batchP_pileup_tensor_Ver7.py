@@ -416,6 +416,8 @@ def process_single_node_for_pileup(task_args):
         )
         aligned_read_segments = aligned_read_segments[: (TENSOR_MAX_READ_ROWS * 2)]
 
+    print(node_id, " Start!")
+
     if not aligned_read_segments:
         return node_id, {}, [], []
 
@@ -429,6 +431,8 @@ def process_single_node_for_pileup(task_args):
     view_oriented_variant_data = {} if worker_need_view else None
     tensors_for_node = []
     meta_for_node = []
+
+    print(node_id, " Ends!")
 
     for (v_pos, v_type, v_ref_from_cigar, v_alt_from_cigar), _ in candidate_variants.items():
         if (variant_type_to_process == 'snp' and v_type != 'X') or \
@@ -616,7 +620,6 @@ def process_single_node_for_pileup(task_args):
         tensors_for_node.append(tensor)
         meta_for_node.append(meta)
 
-    print(node_id, " Done!")
     return node_id, (view_oriented_variant_data or {}), tensors_for_node, meta_for_node
 
 # ─────────────────────────────────────────────────────────────────────────────
