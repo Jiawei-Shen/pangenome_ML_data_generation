@@ -673,7 +673,7 @@ def main():
     parser.add_argument("--view", nargs='?', const=-1, default=None, type=int, metavar='N',
                         help="Print pileups for top N variants per node (-1 for all)")
     parser.add_argument("--max_view_reads", type=int, default=20, help="Max reads per pileup in view mode")
-    parser.add_argument("--min_af", type=float, default=0.03, help="Minimum allele frequency")
+    parser.add_argument("--min_af", type=float, default=0.05, help="Minimum allele frequency")
     parser.add_argument("--min_variants", type=int, default=2, help="Minimum ALT-supporting reads")
     parser.add_argument("--min_allele_bq", type=float, default=10.0, help="Minimum mean BQ for ALT")
     parser.add_argument("--variant_type", choices=['snp', 'indel', 'all'], default='all',
@@ -682,6 +682,14 @@ def main():
                         help="Number of variant tensors per full shard")
     parser.add_argument("--log_every_nodes", type=int, default=100000,
                         help="Log progress every N nodes")
+    # NEW: customizable shard prefix
+    parser.add_argument(
+        "--shard_prefix",
+        type=str,
+        default="shard",
+        help="Prefix for shard filenames (prefix_00000_data.npy)"
+    )
+
     args = parser.parse_args()
 
     if not all(os.path.isfile(p) for p in (args.dat, args.idx, args.candidate_variants_json)):
@@ -781,7 +789,7 @@ def main():
 
         xs = np.stack(chunk_tensors, axis=0)  # (shard_size, 6, 201, 100)
         N = xs.shape[0]
-        data_path = os.path.join(args.output, f"shard_{shard_idx:05d}_data.npy")
+        data_path = os.path.join(args.output, f"{args.shard_prefix}_{shard_idx:05d}_data.npy")
         log(f"Saving shard {shard_idx} data: {N} tensors -> {data_path}")
         np.save(data_path, xs)
 
@@ -806,7 +814,7 @@ def main():
 
         xs = np.stack(buffer_tensors, axis=0)
         N = xs.shape[0]
-        data_path = os.path.join(args.output, f"shard_{shard_idx:05d}_data.npy")
+        data_path = os.path.join(args.output, f"{args.shard_prefix}_{shard_idx:05d}_data.npy")
         log(f"Saving FINAL shard {shard_idx} data: {N} tensors -> {data_path}")
         np.save(data_path, xs)
 
