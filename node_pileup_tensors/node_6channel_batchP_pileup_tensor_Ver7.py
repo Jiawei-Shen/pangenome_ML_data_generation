@@ -322,8 +322,31 @@ def init_worker(dat_file_path_for_worker, base_output_dir_for_worker, need_view_
     worker_base_output_dir = base_output_dir_for_worker
     worker_need_view = bool(need_view_flag)
 
-def _non_M_length(cops):
-    return sum(L for L, op in (cops or []) if op != 'M')
+def _non_M_length(cops, variant_type_to_process=None):
+    """
+    Weighted non-M length used for sorting reads:
+
+    - If variant_type_to_process == 'snp':
+        X (mismatch) ops get weight 2.
+    - If variant_type_to_process == 'indel':
+        I and D ops get weight 2.
+    - Otherwise ('all' or None):
+        all non-M ops weight 1 (original behavior).
+    """
+    total = 0
+    for L, op in (cops or []):
+        if op == 'M':
+            continue
+
+        weight = 1
+        if variant_type_to_process == 'snp' and op == 'X':
+            weight = 2
+        elif variant_type_to_process == 'indel' and op in ('I', 'D'):
+            weight = 2
+
+        total += L * weight
+    return total
+
 
 def process_single_node_for_pileup(task_args):
     (node_id, dat_file_offset, n_records,
@@ -410,7 +433,7 @@ def process_single_node_for_pileup(task_args):
         return node_id, None, [], []
 
     aligned_read_segments.sort(
-        key=lambda s: _non_M_length(s["cigar_ops"]),
+        key=lambda s: _non_M_length(s["cigar_ops"], variant_type_to_process),
         reverse=True
     )
     if len(aligned_read_segments) > TENSOR_MAX_READ_ROWS:
