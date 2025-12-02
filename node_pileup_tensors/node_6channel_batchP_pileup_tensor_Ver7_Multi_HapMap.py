@@ -29,8 +29,8 @@ IDX_ENTRY_SIZE = 30
 IDX_ENTRY_PACK = struct.Struct("<I Q I I H I I")  # nid, offset, block_size, n_records, flags, R, C
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Encoding tables & tensor constants (with requested codes)
-# NOTE: '*' → 1, 'I' → 90, 'N' → 5
+# Encoding tables & tensor constants (latest version)
+
 BASE_TO_INDEX = {'A': 20, 'C': 30, 'G': 50, 'T': 70, 'N': 5, '*': 1, 'I': 90, '_PADDING_': 0}
 PADDING_BASE_INDEX = 0
 
@@ -55,6 +55,13 @@ worker_need_view = False
 # Read-only globals (broadcast to workers)
 GLOBAL_NODE_SEQS = {}
 GLOBAL_NODE_AF = {}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging helper
+
+def log(msg: str) -> None:
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -331,17 +338,25 @@ def _non_M_length(cops):
     return sum(L for L, op in (cops or []) if op != 'M')
 
 def process_single_node_for_pileup(task_args):
+    """
+    Single node task:
+      - Collect aligned read segments from ALL dat files for this node
+      - Discover candidate variants
+      - Filter by AF / alt count / BQ
+      - Build variant-centered 6x500x100 tensors
+      - Return all tensors + meta for this node (no file I/O here)
+    """
     (node_id, dat_entries,
      min_af_threshold, min_variants_threshold, min_allele_bq_threshold,
      variant_type_to_process) = task_args
 
-    global worker_dat_files, worker_base_output_dir, worker_need_view
+    global worker_dat_files, worker_need_view
     global GLOBAL_NODE_SEQS, GLOBAL_NODE_AF
 
-    tensor_files_generated_for_node = 0
     node_sequence = GLOBAL_NODE_SEQS.get(node_id, "")
     if not node_sequence:
-        return node_id, {}, tensor_files_generated_for_node
+        return node_id, {}, [], []  # no sequence, nothing to do
+
     genomead_af_list = GLOBAL_NODE_AF.get(node_id, [])
     node_len = len(node_sequence)
     aligned_read_segments = []
@@ -422,7 +437,7 @@ def process_single_node_for_pileup(task_args):
                 })
     except Exception as e:
         sys.stderr.write(f"Error [Node {node_id}]: {e}\n")
-        return node_id, None, tensor_files_generated_for_node
+        return node_id, None, [], []
 
     # Downselect to top reads by "non-M base length"
     if len(aligned_read_segments) > TENSOR_MAX_READ_ROWS:
@@ -433,7 +448,7 @@ def process_single_node_for_pileup(task_args):
         aligned_read_segments = aligned_read_segments[: (TENSOR_MAX_READ_ROWS * 2)]
 
     if not aligned_read_segments:
-        return node_id, {}, tensor_files_generated_for_node
+        return node_id, {}, [], []
 
     # Variant discovery
     candidate_variants = defaultdict(int)
@@ -443,7 +458,8 @@ def process_single_node_for_pileup(task_args):
             candidate_variants[(v_pos, v_type, v_ref, v_alt)] += 1
 
     view_oriented_variant_data = {} if worker_need_view else None
-    variant_headers_for_summary = []
+    tensors_for_node = []
+    meta_for_node = []
 
     for (v_pos, v_type, v_ref_from_cigar, v_alt_from_cigar), _ in candidate_variants.items():
         if (variant_type_to_process == 'snp' and v_type != 'X') or \
@@ -498,19 +514,25 @@ def process_single_node_for_pileup(task_args):
         center = v_pos + 1 if v_type == 'I' else v_pos
         win_start = calculate_window_start(center, TENSOR_WINDOW_SIZE)
 
+        # Optional view data (debug/inspection)
         if worker_need_view:
             pile = []
             for seg in aligned_read_segments[: TENSOR_MAX_READ_ROWS + 50]:
                 row = get_read_representation_in_window_for_view(
                     seg["cigar_ops"], seg["offset_on_node"], seg["read_sequence"], win_start, TENSOR_WINDOW_SIZE, node_len)
                 if any(ch != ' ' for ch in row):
-                    bases_for_view = [(PADDING_BASE_INDEX if ch == ' ' else BASE_TO_INDEX.get(ch.upper(), BASE_TO_INDEX['N'])) for ch in row]
-                    pile.append({"bases": bases_for_view, "offset": seg["offset_on_node"],
-                                 "strand": seg["strand"], "cigar": seg["original_cigar_str"]})
+                    bases_for_view = [(PADDING_BASE_INDEX if ch == ' ' else BASE_TO_INDEX.get(ch.upper(), BASE_TO_INDEX['N']))
+                                      for ch in row]
+                    pile.append({"bases": bases_for_view,
+                                 "offset": seg["offset_on_node"],
+                                 "strand": seg["strand"],
+                                 "cigar": seg["original_cigar_str"]})
             view_oriented_variant_data[key] = {
                 "pileup_reads_data": pile[: TENSOR_MAX_READ_ROWS],
-                "alt_allele_count": alt, "ref_allele_count_at_locus": ref,
-                "other_allele_count_at_locus": other, "coverage_at_locus": cov,
+                "alt_allele_count": alt,
+                "ref_allele_count_at_locus": ref,
+                "other_allele_count_at_locus": other,
+                "coverage_at_locus": cov,
                 "alt_allele_frequency": round(af, 4),
                 "mean_alt_allele_base_quality": round(mean_bq, 2)
             }
@@ -552,6 +574,7 @@ def process_single_node_for_pileup(task_args):
 
         reads_added = 0
         variant_win_idx = v_pos - win_start
+
         for seg in aligned_read_segments:
             if reads_added >= TENSOR_MAX_READ_ROWS:
                 break
@@ -594,33 +617,28 @@ def process_single_node_for_pileup(task_args):
                 ch6[r, :] = ch6[0, :]
                 reads_added += 1
 
-        tensor = np.stack([ch1, ch2, ch3, ch4, ch5, ch6], axis=0)
+        tensor = np.stack([ch1, ch2, ch3, ch4, ch5, ch6], axis=0)  # (6, 500, 100)
 
-        out_dir = os.path.join(worker_base_output_dir, str(node_id))
-        os.makedirs(out_dir, exist_ok=True)
+        meta = {
+            "node_id": node_id,
+            "node_length": node_len,
+            "variant_key": key,
+            "v_pos": int(v_pos),
+            "v_type": v_type,
+            "v_ref": v_ref_from_cigar,
+            "v_alt": v_alt_from_cigar,
+            "alt_allele_count": int(alt),
+            "ref_allele_count_at_locus": int(ref),
+            "other_allele_count_at_locus": int(other),
+            "coverage_at_locus": int(cov),
+            "alt_allele_frequency": float(round(af, 4)),
+            "mean_alt_allele_base_quality": float(round(mean_bq, 2)),
+        }
 
-        key = canonical_variant_key(v_pos, v_type, v_ref_from_cigar, v_alt_from_cigar, node_sequence)
-        fname = f"{key}.npy"
-        try:
-            np.save(os.path.join(out_dir, fname), tensor)
-            variant_headers_for_summary.append({
-                "variant_key": key, "tensor_file": fname,
-                "alt_allele_count": alt, "ref_allele_count_at_locus": ref,
-                "other_allele_count_at_locus": other, "coverage_at_locus": cov,
-                "alt_allele_frequency": round(af, 4),
-                "mean_alt_allele_base_quality": round(mean_bq, 2)
-            })
-            tensor_files_generated_for_node += 1
-        except Exception as e:
-            sys.stderr.write(f"Error saving tensor for {key}: {e}\n")
+        tensors_for_node.append(tensor)
+        meta_for_node.append(meta)
 
-    if variant_headers_for_summary:
-        summary_path = os.path.join(worker_base_output_dir, str(node_id), "variant_summary.json")
-        with open(summary_path, 'w') as f:
-            json.dump({"node_id": node_id, "node_length": node_len,
-                       "variants_passing_af_filter": variant_headers_for_summary}, f, indent=2)
-
-    return node_id, (view_oriented_variant_data or {}), tensor_files_generated_for_node
+    return node_id, (view_oriented_variant_data or {}), tensors_for_node, meta_for_node
 
 # ─────────────────────────────────────────────────────────────────────────────
 # View (optional, unchanged)
@@ -658,17 +676,17 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
               f"Mean Alt BQ: {vd.get('mean_alt_allele_base_quality',0.0):.2f}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main
+# Main: multi-dat/idx + sharded NPY output
 
 def main():
     parser = argparse.ArgumentParser(
         description="Generate variant-centered tensors from latest .dat/.idx format (R,C per block), "
-                    "optionally merging multiple .dat/.idx pairs.",
+                    "optionally merging multiple .dat/.idx pairs, and write sharded NPY files.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("dat", help="Primary .dat alignment file (latest format)")
     parser.add_argument("idx", help="Primary .idx index file (30B entries)")
-    parser.add_argument("output", help="Base output directory")
+    parser.add_argument("output", help="Base output directory for shards + variant_summary.ndjson")
     parser.add_argument("candidate_variants_json", help="JSON with nodes and sequences to process.")
     parser.add_argument("--extra-dat-idx", metavar=("DAT", "IDX"), nargs=2, action="append", default=[],
                         help="Additional .dat/.idx pairs to merge; can be given multiple times.")
@@ -682,6 +700,13 @@ def main():
     parser.add_argument("--min_allele_bq", type=float, default=10.0, help="Minimum mean BQ for ALT")
     parser.add_argument("--variant_type", choices=['snp', 'indel', 'all'], default='all',
                         help="Which variants to output tensors for")
+    parser.add_argument("--shard_size", type=int, default=4096,
+                        help="Number of variant tensors per shard")
+    parser.add_argument("--shard_prefix", type=str, default="shard",
+                        help="Prefix for shard filenames (prefix_00000_data.npy)")
+    parser.add_argument("--log_every_nodes", type=int, default=100000,
+                        help="Log progress every N nodes")
+
     args = parser.parse_args()
 
     # Build list of all (.dat, .idx) pairs
@@ -700,8 +725,8 @@ def main():
     for pair_idx, (dat_path, idx_path) in enumerate(dat_idx_pairs):
         try:
             major, minor, blocks = read_dat_global_header(dat_path)
-            print(f"[PAIR {pair_idx}] .dat header for {os.path.basename(dat_path)}: "
-                  f"version {major}.{minor}, blocks={blocks} (expect latest format)")
+            log(f"[PAIR {pair_idx}] .dat header for {os.path.basename(dat_path)}: "
+                f"version {major}.{minor}, blocks={blocks} (expect latest format)")
         except Exception as e:
             sys.exit(f"Error reading .dat header {dat_path}: {e}")
 
@@ -709,7 +734,7 @@ def main():
             idx_map = load_full_idx_data_latest(idx_path)
             idx_maps.append(idx_map)
             all_node_ids_from_idx.update(idx_map.keys())
-            print(f"[PAIR {pair_idx}] Loaded {len(idx_map)} index entries from {idx_path}.")
+            log(f"[PAIR {pair_idx}] Loaded {len(idx_map)} index entries from {idx_path}.")
         except Exception as e:
             sys.exit(f"Error reading .idx (latest) {idx_path}: {e}")
 
@@ -735,8 +760,8 @@ def main():
     except Exception as e:
         sys.exit(f"Error parsing JSON: {e}")
 
-    print(f"Loaded {len(node_sequences)} nodes with sequence info from JSON.")
-    print(f"Total distinct node IDs across all idx files: {len(all_node_ids_from_idx)}")
+    log(f"Loaded {len(node_sequences)} nodes with sequence info from JSON.")
+    log(f"Total distinct node IDs across all idx files: {len(all_node_ids_from_idx)}")
 
     # Build combined node list from all idx files, then filter to ones with sequence
     tasks = []
@@ -759,11 +784,11 @@ def main():
         tasks.append((nid, dat_entries, args.min_af, args.min_variants, args.min_allele_bq, args.variant_type))
 
     if missing_seq:
-        print(f"Warning: {missing_seq} node IDs from idx files had no sequence in JSON and were skipped.")
+        log(f"Warning: {missing_seq} node IDs from idx files had no sequence in JSON and were skipped.")
     if not tasks:
         sys.exit("No tasks to run after merging idx files and JSON filtering.")
 
-    print(f"Prepared {len(tasks)} node tasks after merging all idx files.")
+    log(f"Prepared {len(tasks)} node tasks after merging all idx files.")
 
     os.makedirs(args.output, exist_ok=True)
 
@@ -772,42 +797,124 @@ def main():
     GLOBAL_NODE_SEQS, GLOBAL_NODE_AF = node_sequences, node_af_data
 
     need_view = (args.view is not None and args.view != 0)
-    total = len(tasks)
-    print(f"Submitting {total} nodes to {args.num_workers} workers...")
+    total_nodes = len(tasks)
+    log(f"Submitting {total_nodes} nodes to {args.num_workers} workers...")
 
-    total_tensors = 0
-    processed = 0
-    batch_nodes = 0
-    batch_tensors = 0
+    shard_size = max(1, int(args.shard_size))
+    shard_idx = 0
+    buffer_tensors = []
+    buffer_meta = []
+    total_variants = 0
+
+    summary_path = os.path.join(args.output, "variant_summary.ndjson")
+    summary_f = open(summary_path, "w")
+
     t0 = time.time()
+    processed_nodes = 0
+    batch_nodes = 0
+    batch_variants = 0
+
+    def flush_full_shard():
+        nonlocal shard_idx, buffer_tensors, buffer_meta, total_variants
+
+        if len(buffer_tensors) < shard_size:
+            return
+
+        chunk_tensors = buffer_tensors[:shard_size]
+        chunk_meta = buffer_meta[:shard_size]
+
+        buffer_tensors = buffer_tensors[shard_size:]
+        buffer_meta = buffer_meta[shard_size:]
+
+        xs = np.stack(chunk_tensors, axis=0)  # (shard_size, 6, H, W)
+        N = xs.shape[0]
+        data_path = os.path.join(args.output, f"{args.shard_prefix}_{shard_idx:05d}_data.npy")
+        log(f"Saving shard {shard_idx} data: {N} tensors -> {data_path}")
+        np.save(data_path, xs)
+
+        for i, m in enumerate(chunk_meta):
+            m_out = dict(m)
+            m_out["shard_index"] = shard_idx
+            m_out["index_within_shard"] = i
+            summary_f.write(json.dumps(m_out) + "\n")
+
+        total_variants += N
+        shard_idx += 1
+
+    def flush_remainder():
+        nonlocal shard_idx, buffer_tensors, buffer_meta, total_variants
+
+        if not buffer_tensors:
+            return
+
+        xs = np.stack(buffer_tensors, axis=0)
+        N = xs.shape[0]
+        data_path = os.path.join(args.output, f"{args.shard_prefix}_{shard_idx:05d}_data.npy")
+        log(f"Saving FINAL shard {shard_idx} data: {N} tensors -> {data_path}")
+        np.save(data_path, xs)
+
+        for i, m in enumerate(buffer_meta):
+            m_out = dict(m)
+            m_out["shard_index"] = shard_idx
+            m_out["index_within_shard"] = i
+            summary_f.write(json.dumps(m_out) + "\n")
+
+        total_variants += N
+        shard_idx += 1
+        buffer_tensors.clear()
+        buffer_meta.clear()
 
     dat_paths = [d for d, _ in dat_idx_pairs]
     with ProcessPoolExecutor(max_workers=args.num_workers,
                              initializer=init_worker,
                              initargs=(dat_paths, args.output, need_view)) as ex:
-        for nid, view_data, tcount in ex.map(process_single_node_for_pileup, tasks,
-                                             chunksize=max(1, args.chunksize)):
-            processed += 1
-            batch_nodes += 1
-            total_tensors += tcount
-            batch_tensors += tcount
+        for nid, view_data, node_tensors, node_meta in ex.map(
+                process_single_node_for_pileup,
+                tasks,
+                chunksize=max(1, args.chunksize)):
 
+            processed_nodes += 1
+            batch_nodes += 1
+
+            if node_tensors:
+                buffer_tensors.extend(node_tensors)
+                buffer_meta.extend(node_meta)
+                n_new = len(node_tensors)
+                batch_variants += n_new
+
+            # Optional live view print
             if need_view and view_data:
                 seq_for_view = GLOBAL_NODE_SEQS.get(nid, "")
                 display_pileup_data(view_data, str(nid), seq_for_view,
                                     args.max_view_reads,
                                     args.view if args.view != -1 else float('inf'))
 
-            if batch_nodes >= 100000 or processed == total:
+            # Flush any full shards from the buffer
+            while len(buffer_tensors) >= shard_size:
+                flush_full_shard()
+
+            # Progress logging
+            if (processed_nodes % args.log_every_nodes == 0) or (processed_nodes == total_nodes):
                 dt = time.time() - t0
-                rate = batch_nodes / dt if dt > 0 else 0.0
-                print(f"  Batch {batch_nodes} nodes (total {processed}/{total}) in {dt:.2f}s "
-                      f"→ {rate:.1f} nodes/s. Batch tensors: {batch_tensors}. Total tensors: {total_tensors}.")
+                rate_nodes = batch_nodes / dt if dt > 0 else 0.0
+                rate_vars = batch_variants / dt if dt > 0 else 0.0
+                log(f"Batch: +{batch_nodes} nodes (+{batch_variants} variants) "
+                    f"in {dt:.2f}s → {rate_nodes:.1f} nodes/s, {rate_vars:.1f} vars/s. "
+                    f"[total {processed_nodes}/{total_nodes} nodes, "
+                    f"{total_variants} variants, {shard_idx} shards written so far]")
                 batch_nodes = 0
-                batch_tensors = 0
+                batch_variants = 0
                 t0 = time.time()
 
-    print(f"\nDone. Total tensors generated: {total_tensors}.")
+    # Final shard flush for leftovers (may be < shard_size)
+    flush_remainder()
+    summary_f.close()
+
+    log("Done.")
+    log(f"Total nodes processed   : {processed_nodes}")
+    log(f"Total variant tensors   : {total_variants}")
+    log(f"Total shards written    : {shard_idx}")
+    log(f"Variant summary (NDJSON): {summary_path}")
 
 if __name__ == "__main__":
     main()
