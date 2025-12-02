@@ -8,7 +8,7 @@ import time
 import numpy as np
 from collections import defaultdict
 import re
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed  # ← added as_completed
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Latest format constants
@@ -830,46 +830,77 @@ def main():
         buffer_tensors.clear()
         buffer_meta.clear()
 
+    # ───── revised ex.map(...) → bounded submit + as_completed ────
+    max_tasks_in_flight = max(1, args.num_workers * 4)
+    task_iter = iter(tasks)
+
     with ProcessPoolExecutor(max_workers=args.num_workers,
                              initializer=init_worker,
                              initargs=(args.dat, args.output, need_view)) as ex:
-        for nid, view_data, node_tensors, node_meta in ex.map(
-                process_single_node_for_pileup,
-                tasks,
-                chunksize=max(1, args.chunksize)):
+        futures = {}
 
-            processed_nodes += 1
-            batch_nodes += 1
+        # Seed initial tasks
+        try:
+            for _ in range(max_tasks_in_flight):
+                t = next(task_iter)
+                f = ex.submit(process_single_node_for_pileup, t)
+                futures[f] = True
+        except StopIteration:
+            pass
 
-            if node_tensors:
-                buffer_tensors.extend(node_tensors)
-                buffer_meta.extend(node_meta)
-                n_new = len(node_tensors)
-                batch_variants += n_new
+        try:
+            while futures:
+                for f in as_completed(list(futures.keys())):
+                    del futures[f]
+                    nid, view_data, node_tensors, node_meta = f.result()
 
-            # Optional live view print
-            if need_view and view_data:
-                seq_for_view = GLOBAL_NODE_SEQS.get(nid, "")
-                display_pileup_data(view_data, str(nid), seq_for_view,
-                                    args.max_view_reads,
-                                    args.view if args.view != -1 else float('inf'))
+                    processed_nodes += 1
+                    batch_nodes += 1
 
-            # Flush any full shards from the buffer
-            while len(buffer_tensors) >= shard_size:
-                flush_full_shard()
+                    if node_tensors:
+                        buffer_tensors.extend(node_tensors)
+                        buffer_meta.extend(node_meta)
+                        n_new = len(node_tensors)
+                        batch_variants += n_new
 
-            # Progress logging
-            if (processed_nodes % args.log_every_nodes == 0) or (processed_nodes == total_nodes):
-                dt = time.time() - t0
-                rate_nodes = batch_nodes / dt if dt > 0 else 0.0
-                rate_vars = batch_variants / dt if dt > 0 else 0.0
-                log(f"Batch: +{batch_nodes} nodes (+{batch_variants} variants) "
-                    f"in {dt:.2f}s → {rate_nodes:.1f} nodes/s, {rate_vars:.1f} vars/s. "
-                    f"[total {processed_nodes}/{total_nodes} nodes, "
-                    f"{total_variants} variants, {shard_idx} shards written so far]")
-                batch_nodes = 0
-                batch_variants = 0
-                t0 = time.time()
+                    # Optional live view print
+                    if need_view and view_data:
+                        seq_for_view = GLOBAL_NODE_SEQS.get(nid, "")
+                        display_pileup_data(view_data, str(nid), seq_for_view,
+                                            args.max_view_reads,
+                                            args.view if args.view != -1 else float('inf'))
+
+                    # Flush any full shards from the buffer
+                    while len(buffer_tensors) >= shard_size:
+                        flush_full_shard()
+
+                    # Progress logging (unchanged logic)
+                    if (processed_nodes % args.log_every_nodes == 0) or (processed_nodes == total_nodes):
+                        dt = time.time() - t0
+                        rate_nodes = batch_nodes / dt if dt > 0 else 0.0
+                        rate_vars = batch_variants / dt if dt > 0 else 0.0
+                        log(f"Batch: +{batch_nodes} nodes (+{batch_variants} variants) "
+                            f"in {dt:.2f}s → {rate_nodes:.1f} nodes/s, {rate_vars:.1f} vars/s. "
+                            f"[total {processed_nodes}/{total_nodes} nodes, "
+                            f"{total_variants} variants, {shard_idx} shards written so far]")
+                        batch_nodes = 0
+                        batch_variants = 0
+                        t0 = time.time()
+
+                    # Refill the queue up to max_tasks_in_flight
+                    try:
+                        while len(futures) < max_tasks_in_flight:
+                            t = next(task_iter)
+                            nf = ex.submit(process_single_node_for_pileup, t)
+                            futures[nf] = True
+                    except StopIteration:
+                        pass
+
+                    if not futures:
+                        break
+        except KeyboardInterrupt:
+            log("KeyboardInterrupt detected, shutting down executor...")
+            raise
 
     # Final shard flush for leftovers (may be < shard_size)
     flush_remainder()
