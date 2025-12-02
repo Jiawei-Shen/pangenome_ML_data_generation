@@ -40,7 +40,7 @@ CIGAR_PADDING_INDEX = 0
 INDEX_TO_BASE_FOR_VIEW = {20: 'A', 30: 'C', 50: 'G', 70: 'T', 5: 'N', 1: '*', 90: 'I', 0: ' '}
 
 TENSOR_WINDOW_SIZE = 100
-# We want total depth (ref row + read rows) = 500, so allow 499 reads.
+# Total depth (ref row + read rows) = 500 → allow 499 reads.
 TENSOR_MAX_READ_ROWS = 499
 DEFAULT_QUALITY_PADDING = 0
 DEFAULT_MAPPING_QUALITY_PADDING = -1
@@ -74,10 +74,12 @@ def read_dat_global_header(dat_path):
         major, minor, block_count, _ = GLOBAL_VER_PACK.unpack(f.read(GLOBAL_VER_PACK.size))
         return major, minor, block_count
 
-def load_full_idx_data_latest(idx_path):
+def load_full_idx_data_latest_filtered(idx_path, wanted_nodes):
     """
     Strictly parse latest .idx format (30 bytes/entry):
       <I Q I I H I I> → nid, offset, block_size, n_records, flags, R, C
+
+    Only keep entries where nid ∈ wanted_nodes to avoid huge idx maps.
     Returns: dict[nid] = (offset, n_records)
     """
     m = {}
@@ -96,7 +98,8 @@ def load_full_idx_data_latest(idx_path):
             if len(rec) != IDX_ENTRY_SIZE:
                 raise RuntimeError(f"Truncated idx at entry {i+1}")
             nid, offset, _blk_sz, nrec, _flags, _R, _C = IDX_ENTRY_PACK.unpack(rec)
-            m[nid] = (offset, nrec)
+            if nid in wanted_nodes:
+                m[nid] = (offset, nrec)
     return m
 
 def decode_cigar_to_int_ops(cigar_string):
@@ -519,14 +522,19 @@ def process_single_node_for_pileup(task_args):
             pile = []
             for seg in aligned_read_segments[: TENSOR_MAX_READ_ROWS + 50]:
                 row = get_read_representation_in_window_for_view(
-                    seg["cigar_ops"], seg["offset_on_node"], seg["read_sequence"], win_start, TENSOR_WINDOW_SIZE, node_len)
+                    seg["cigar_ops"], seg["offset_on_node"], seg["read_sequence"],
+                    win_start, TENSOR_WINDOW_SIZE, node_len)
                 if any(ch != ' ' for ch in row):
-                    bases_for_view = [(PADDING_BASE_INDEX if ch == ' ' else BASE_TO_INDEX.get(ch.upper(), BASE_TO_INDEX['N']))
-                                      for ch in row]
-                    pile.append({"bases": bases_for_view,
-                                 "offset": seg["offset_on_node"],
-                                 "strand": seg["strand"],
-                                 "cigar": seg["original_cigar_str"]})
+                    bases_for_view = [
+                        (PADDING_BASE_INDEX if ch == ' ' else BASE_TO_INDEX.get(ch.upper(), BASE_TO_INDEX['N']))
+                        for ch in row
+                    ]
+                    pile.append({
+                        "bases": bases_for_view,
+                        "offset": seg["offset_on_node"],
+                        "strand": seg["strand"],
+                        "cigar": seg["original_cigar_str"],
+                    })
             view_oriented_variant_data[key] = {
                 "pileup_reads_data": pile[: TENSOR_MAX_READ_ROWS],
                 "alt_allele_count": alt,
@@ -534,7 +542,7 @@ def process_single_node_for_pileup(task_args):
                 "other_allele_count_at_locus": other,
                 "coverage_at_locus": cov,
                 "alt_allele_frequency": round(af, 4),
-                "mean_alt_allele_base_quality": round(mean_bq, 2)
+                "mean_alt_allele_base_quality": round(mean_bq, 2),
             }
 
         # Build tensors
@@ -580,10 +588,12 @@ def process_single_node_for_pileup(task_args):
                 break
             mapq = max(0, min(int(seg["mapping_quality"]), 127))
             b_row, q_row, mq_row, cig_row = get_read_tensor_rows_in_window(
-                seg["cigar_ops"], seg["offset_on_node"], seg["read_sequence"], seg["processed_quality_values"],
-                mapq, win_start, TENSOR_WINDOW_SIZE, node_len)
+                seg["cigar_ops"], seg["offset_on_node"], seg["read_sequence"],
+                seg["processed_quality_values"],
+                mapq, win_start, TENSOR_WINDOW_SIZE, node_len
+            )
 
-            # ── Encode insertion ALT as 'I' at the anchor with mean BQ of inserted bases
+            # Encode insertion ALT as 'I' at the anchor with mean BQ of inserted bases
             if v_type == 'I' and 0 <= variant_win_idx < TENSOR_WINDOW_SIZE:
                 allele_ins, mean_bq_ins = get_allele_from_read_at_node_pos(
                     seg["offset_on_node"],
@@ -604,6 +614,7 @@ def process_single_node_for_pileup(task_args):
                 r = 1 + reads_added
                 ch1[r, :] = np.asarray(b_row, dtype=np.int8)
                 ch2[r, :] = np.asarray(q_row, dtype=np.int8)
+
                 ref_vec = ch1[0, :].astype(np.int16)
                 read_vec = ch1[r, :].astype(np.int16)
                 flags = np.full(W, MISMATCH_COMPARISON_PADDING_VALUE, dtype=np.int8)
@@ -612,9 +623,11 @@ def process_single_node_for_pileup(task_args):
                 if 0 <= variant_win_idx < W and mask[variant_win_idx] and flags[variant_win_idx] == 1:
                     flags[variant_win_idx] = 5
                 ch3[r, :] = flags
+
                 ch4[r, :] = np.asarray(mq_row, dtype=np.int8)
                 ch5[r, :] = np.asarray(cig_row, dtype=np.int8)
                 ch6[r, :] = ch6[0, :]
+
                 reads_added += 1
 
         tensor = np.stack([ch1, ch2, ch3, ch4, ch5, ch6], axis=0)  # (6, 500, 100)
@@ -670,13 +683,14 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
             bases_str = ''.join(INDEX_TO_BASE_FOR_VIEW.get(idx, '?') for idx in row["bases"])
             print(f"  Read {j+1:3d}: {bases_str} (CIGAR:{row['cigar']}, STRAND:{row.get('strand', '?')})")
         vd = node_data_for_display_view[k]
-        print(f"  Alt Count: {vd.get('alt_allele_count','N/A')}, Ref Count: {vd.get('ref_allele_count_at_locus','N/A')}, "
+        print(f"  Alt Count: {vd.get('alt_allele_count','N/A')}, "
+              f"Ref Count: {vd.get('ref_allele_count_at_locus','N/A')}, "
               f"Coverage: {vd.get('coverage_at_locus','N/A')}")
         print(f"  Alt Freq: {vd.get('alt_allele_frequency',0.0):.4f}, "
               f"Mean Alt BQ: {vd.get('mean_alt_allele_base_quality',0.0):.2f}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main: multi-dat/idx + sharded NPY output
+# Main: multi-dat/idx + sharded NPY output (memory-optimized)
 
 def main():
     parser = argparse.ArgumentParser(
@@ -712,37 +726,17 @@ def main():
     # Build list of all (.dat, .idx) pairs
     dat_idx_pairs = [(args.dat, args.idx)] + (args.extra_dat_idx or [])
 
-    # quick checks
+    # quick existence checks
     files_to_check = [args.candidate_variants_json]
     for d, i in dat_idx_pairs:
         files_to_check.extend([d, i])
     if not all(os.path.isfile(p) for p in files_to_check):
         sys.exit("Error: one or more .dat/.idx/json files not found.")
 
-    # Validate each .dat header and load each .idx
-    idx_maps = []
-    all_node_ids_from_idx = set()
-    for pair_idx, (dat_path, idx_path) in enumerate(dat_idx_pairs):
-        try:
-            major, minor, blocks = read_dat_global_header(dat_path)
-            log(f"[PAIR {pair_idx}] .dat header for {os.path.basename(dat_path)}: "
-                f"version {major}.{minor}, blocks={blocks} (expect latest format)")
-        except Exception as e:
-            sys.exit(f"Error reading .dat header {dat_path}: {e}")
+    # ── 1. Load JSON FIRST, so we know which node_ids we actually care about
+    node_sequences = {}
+    node_af_data = {}
 
-        try:
-            idx_map = load_full_idx_data_latest(idx_path)
-            idx_maps.append(idx_map)
-            all_node_ids_from_idx.update(idx_map.keys())
-            log(f"[PAIR {pair_idx}] Loaded {len(idx_map)} index entries from {idx_path}.")
-        except Exception as e:
-            sys.exit(f"Error reading .idx (latest) {idx_path}: {e}")
-
-    if not idx_maps or not all_node_ids_from_idx:
-        sys.exit("No nodes found in provided .idx files.")
-
-    # Input nodes JSON (sequence / AF info)
-    node_sequences, node_af_data = {}, {}
     try:
         with open(args.candidate_variants_json, 'r') as f:
             data = json.load(f)
@@ -760,45 +754,66 @@ def main():
     except Exception as e:
         sys.exit(f"Error parsing JSON: {e}")
 
+    wanted_nodes = set(node_sequences.keys())
     log(f"Loaded {len(node_sequences)} nodes with sequence info from JSON.")
-    log(f"Total distinct node IDs across all idx files: {len(all_node_ids_from_idx)}")
+    if not wanted_nodes:
+        sys.exit("No nodes loaded from JSON; nothing to do.")
 
-    # Build combined node list from all idx files, then filter to ones with sequence
-    tasks = []
-    missing_seq = 0
-    for nid in sorted(all_node_ids_from_idx):
-        seq = node_sequences.get(nid)
-        if not seq:
-            missing_seq += 1
-            continue
+    # ── 2. Validate each .dat and load FILTERED idx for desired nodes only
+    idx_maps = []
+    total_filtered_idx_entries = 0
 
-        dat_entries = []
-        for file_idx, idx_map in enumerate(idx_maps):
-            if nid in idx_map:
-                off, nrec = idx_map[nid]
-                dat_entries.append((file_idx, off, nrec))
+    for pair_idx, (dat_path, idx_path) in enumerate(dat_idx_pairs):
+        try:
+            major, minor, blocks = read_dat_global_header(dat_path)
+            log(f"[PAIR {pair_idx}] .dat header for {os.path.basename(dat_path)}: "
+                f"version {major}.{minor}, blocks={blocks} (expect latest format)")
+        except Exception as e:
+            sys.exit(f"Error reading .dat header {dat_path}: {e}")
 
-        if not dat_entries:
-            continue
+        try:
+            idx_map = load_full_idx_data_latest_filtered(idx_path, wanted_nodes)
+            idx_maps.append(idx_map)
+            total_filtered_idx_entries += len(idx_map)
+            log(f"[PAIR {pair_idx}] Loaded {len(idx_map)} filtered index entries from {idx_path}.")
+        except Exception as e:
+            sys.exit(f"Error reading .idx (latest) {idx_path}: {e}")
 
-        tasks.append((nid, dat_entries, args.min_af, args.min_variants, args.min_allele_bq, args.variant_type))
+    if not idx_maps:
+        sys.exit("No idx entries loaded after filtering; nothing to do.")
 
-    if missing_seq:
-        log(f"Warning: {missing_seq} node IDs from idx files had no sequence in JSON and were skipped.")
-    if not tasks:
-        sys.exit("No tasks to run after merging idx files and JSON filtering.")
+    log(f"Total filtered idx entries across all files (for JSON nodes): {total_filtered_idx_entries}")
 
-    log(f"Prepared {len(tasks)} node tasks after merging all idx files.")
-
+    # ── 3. Build tasks as a GENERATOR (no giant in-memory task list)
     os.makedirs(args.output, exist_ok=True)
 
-    # share globals
     global GLOBAL_NODE_SEQS, GLOBAL_NODE_AF
     GLOBAL_NODE_SEQS, GLOBAL_NODE_AF = node_sequences, node_af_data
 
     need_view = (args.view is not None and args.view != 0)
-    total_nodes = len(tasks)
-    log(f"Submitting {total_nodes} nodes to {args.num_workers} workers...")
+    total_json_nodes = len(node_sequences)
+
+    # keep a counter for nodes in JSON that have no entries in any idx file
+    missing_in_idx = 0
+
+    def iter_tasks():
+        nonlocal missing_in_idx
+        # iterate over JSON nodes (the ones we actually care about)
+        for nid in sorted(node_sequences.keys()):
+            dat_entries = []
+            for file_idx, idx_map in enumerate(idx_maps):
+                entry = idx_map.get(nid)
+                if entry is not None:
+                    off, nrec = entry
+                    dat_entries.append((file_idx, off, nrec))
+            if not dat_entries:
+                missing_in_idx += 1
+                continue
+            yield (nid, dat_entries,
+                   args.min_af, args.min_variants,
+                   args.min_allele_bq, args.variant_type)
+
+    task_iter = iter_tasks()
 
     shard_size = max(1, int(args.shard_size))
     shard_idx = 0
@@ -865,12 +880,15 @@ def main():
         buffer_meta.clear()
 
     dat_paths = [d for d, _ in dat_idx_pairs]
+    log(f"Submitting JSON nodes (up to {total_json_nodes}) to {args.num_workers} workers "
+        f"via generator tasks...")
+
     with ProcessPoolExecutor(max_workers=args.num_workers,
                              initializer=init_worker,
                              initargs=(dat_paths, args.output, need_view)) as ex:
         for nid, view_data, node_tensors, node_meta in ex.map(
                 process_single_node_for_pileup,
-                tasks,
+                task_iter,
                 chunksize=max(1, args.chunksize)):
 
             processed_nodes += 1
@@ -894,14 +912,14 @@ def main():
                 flush_full_shard()
 
             # Progress logging
-            if (processed_nodes % args.log_every_nodes == 0) or (processed_nodes == total_nodes):
+            if (processed_nodes % args.log_every_nodes == 0):
                 dt = time.time() - t0
                 rate_nodes = batch_nodes / dt if dt > 0 else 0.0
                 rate_vars = batch_variants / dt if dt > 0 else 0.0
                 log(f"Batch: +{batch_nodes} nodes (+{batch_variants} variants) "
                     f"in {dt:.2f}s → {rate_nodes:.1f} nodes/s, {rate_vars:.1f} vars/s. "
-                    f"[total {processed_nodes}/{total_nodes} nodes, "
-                    f"{total_variants} variants, {shard_idx} shards written so far]")
+                    f"[total {processed_nodes} nodes with data processed so far, "
+                    f"{total_variants} variants, {shard_idx} shards written]")
                 batch_nodes = 0
                 batch_variants = 0
                 t0 = time.time()
@@ -911,10 +929,12 @@ def main():
     summary_f.close()
 
     log("Done.")
-    log(f"Total nodes processed   : {processed_nodes}")
-    log(f"Total variant tensors   : {total_variants}")
-    log(f"Total shards written    : {shard_idx}")
-    log(f"Variant summary (NDJSON): {summary_path}")
+    log(f"Total JSON nodes            : {total_json_nodes}")
+    log(f"JSON nodes missing in idx   : {missing_in_idx}")
+    log(f"Total nodes actually processed (with reads) : {processed_nodes}")
+    log(f"Total variant tensors       : {total_variants}")
+    log(f"Total shards written        : {shard_idx}")
+    log(f"Variant summary (NDJSON)    : {summary_path}")
 
 if __name__ == "__main__":
     main()
