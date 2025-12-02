@@ -409,11 +409,11 @@ def process_single_node_for_pileup(task_args):
         sys.stderr.write(f"Error [Node {node_id}]: {e}\n")
         return node_id, None, [], []
 
+    aligned_read_segments.sort(
+        key=lambda s: _non_M_length(s["cigar_ops"]),
+        reverse=True
+    )
     if len(aligned_read_segments) > TENSOR_MAX_READ_ROWS:
-        aligned_read_segments.sort(
-            key=lambda s: _non_M_length(s["cigar_ops"]),
-            reverse=True
-        )
         aligned_read_segments = aligned_read_segments[: (TENSOR_MAX_READ_ROWS * 2)]
 
     if not aligned_read_segments:

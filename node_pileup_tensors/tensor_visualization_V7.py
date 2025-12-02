@@ -1,22 +1,4 @@
 #!/usr/bin/env python3
-"""
-Visualize head N shard_XXXXX_data.npy files produced by the pileup/tensor script.
-
-For each selected .npy shard:
-  - Load the array of shape (num_variants, 6, H, W)
-  - For the first K variants in that shard, save a PNG with 6 heatmaps
-    (one per channel: base, BQ, mismatch flags, MAPQ, CIGAR, AF-bin)
-
-Usage example:
-
-  python visualize_pileup_npy.py \
-      --data-dir /scratch/jshen/data/Pansoma/COLO829T_ONT/6ch_training_data_P100_SNV_flat \
-      --max-files 2 \
-      --samples-per-file 3 \
-      --output-dir ./npy_previews
-
-"""
-
 import argparse
 import os
 import sys
@@ -24,140 +6,121 @@ import sys
 import numpy as np
 
 import matplotlib
-matplotlib.use("Agg")  # so it works on headless servers
+matplotlib.use("Agg")  # safe for cluster / no GUI
 import matplotlib.pyplot as plt
-
-
-# Channel semantics (matching your generator script)
-CHANNEL_NAMES = [
-    "ch1: base encoding",
-    "ch2: base quality",
-    "ch3: mismatch flags",
-    "ch4: mapping quality",
-    "ch5: CIGAR encoding",
-    "ch6: AF bin"
-]
 
 
 def log(msg: str) -> None:
     print(msg, flush=True)
 
 
-def find_npy_files(data_dir):
-    """Return sorted list of *_data.npy files in the directory."""
-    if not os.path.isdir(data_dir):
-        raise SystemExit(f"Error: data_dir {data_dir!r} is not a directory")
-
-    files = [f for f in os.listdir(data_dir) if f.endswith(".npy")]
-    # Optional: prioritize shard_XXXXX_data.npy
-    files.sort()
-    return [os.path.join(data_dir, f) for f in files]
-
-
-def visualize_tensor(sample, out_path_prefix):
+def visualize_sample(sample, out_prefix):
     """
-    Given a single tensor of shape (6, H, W), save a PNG with 6 heatmaps.
+    sample:
+      - (C, H, W)  → multiple channels
+      - (H, W)     → single channel
 
-    out_path_prefix: base path (without extension) to save figure, e.g. ".../shard00000_idx000"
+    out_prefix: path without extension
     """
-    if sample.ndim != 3 or sample.shape[0] != 6:
-        raise ValueError(f"Expected tensor shape (6, H, W), got {sample.shape}")
+    if sample.ndim == 3:
+        # (C, H, W)
+        C, H, W = sample.shape
+        # layout: 1xC or 2x3 etc.
+        # keep it simple: up to 3 columns per row
+        ncols = min(3, C)
+        nrows = (C + ncols - 1) // ncols
 
-    _, H, W = sample.shape
+        fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3 * nrows))
+        if not isinstance(axes, np.ndarray):
+            axes = np.array([[axes]])
+        axes = axes.reshape(nrows, ncols)
 
-    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
-    axes = axes.ravel()
+        for c in range(C):
+            r = c // ncols
+            k = c % ncols
+            ax = axes[r, k]
+            im = ax.imshow(sample[c], aspect="auto", interpolation="nearest")
+            ax.set_title(f"Channel {c}")
+            ax.set_xlabel("W")
+            ax.set_ylabel("H")
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-    for ch in range(6):
-        ax = axes[ch]
-        im = ax.imshow(sample[ch], aspect="auto", interpolation="nearest")
-        ax.set_title(CHANNEL_NAMES[ch])
-        ax.set_xlabel("Window position (W)")
-        ax.set_ylabel("Row (H)")
+        # hide any unused axes
+        for c in range(C, nrows * ncols):
+            r = c // ncols
+            k = c % ncols
+            axes[r, k].axis("off")
+
+        fig.suptitle(f"Sample preview: shape={sample.shape}", fontsize=12)
+        fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+    elif sample.ndim == 2:
+        # (H, W)
+        H, W = sample.shape
+        fig, ax = plt.subplots(figsize=(6, 4))
+        im = ax.imshow(sample, aspect="auto", interpolation="nearest")
+        ax.set_title(f"Sample preview: shape={sample.shape}")
+        ax.set_xlabel("W")
+        ax.set_ylabel("H")
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        fig.tight_layout()
+    else:
+        raise ValueError(f"Expected sample ndim 2 or 3, got {sample.ndim} with shape {sample.shape}")
 
-    fig.suptitle(f"Tensor preview (shape={sample.shape})", fontsize=14)
-    fig.tight_layout(rect=[0, 0.03, 1, 0.95])
-
-    out_png = out_path_prefix + ".png"
+    out_png = out_prefix + ".png"
     fig.savefig(out_png, dpi=150)
     plt.close(fig)
-
-    log(f"  Saved visualization -> {out_png}")
+    log(f"  Saved {out_png}")
 
 
 def main():
-    ap = argparse.ArgumentParser(
-        description="Visualize head N NPY shard files produced by pileup tensor generator."
+    parser = argparse.ArgumentParser(
+        description="Visualize head K tensors from a single .npy file."
     )
-    ap.add_argument(
-        "--data-dir",
-        required=True,
-        help="Directory containing shard_XXXXX_data.npy (or similar) files."
+    parser.add_argument(
+        "npy_path",
+        help="Path to the .npy file (expected shape (N, C, H, W) or (N, H, W)).",
     )
-    ap.add_argument(
+    parser.add_argument(
+        "--head",
+        type=int,
+        default=5,
+        help="Number of first tensors (samples) to visualize.",
+    )
+    parser.add_argument(
         "--output-dir",
-        required=True,
-        help="Directory to write PNG previews."
+        type=str,
+        default="./npy_head_vis",
+        help="Where to save PNGs.",
     )
-    ap.add_argument(
-        "--max-files",
-        type=int,
-        default=3,
-        help="Visualize only the first N .npy files in data-dir."
-    )
-    ap.add_argument(
-        "--samples-per-file",
-        type=int,
-        default=3,
-        help="Number of tensors (variants) to visualize per file."
-    )
-    ap.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Print extra info about shapes."
-    )
+    args = parser.parse_args()
 
-    args = ap.parse_args()
+    if not os.path.isfile(args.npy_path):
+        sys.exit(f"Error: file not found: {args.npy_path}")
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    all_npy = find_npy_files(args.data_dir)
-    if not all_npy:
-        raise SystemExit(f"No .npy files found in {args.data_dir!r}")
+    log(f"Loading {args.npy_path} ...")
+    arr = np.load(args.npy_path)
 
-    selected = all_npy[: max(1, args.max_files)]
+    if arr.ndim not in (3, 4):
+        sys.exit(f"Error: expected array ndim 3 or 4 (N,C,H,W or N,H,W), but got {arr.ndim} with shape {arr.shape}")
 
-    log(f"Found {len(all_npy)} .npy files, visualizing first {len(selected)} of them:")
-    for path in selected:
-        log(f"  {path}")
+    N = arr.shape[0]
+    k = min(args.head, N)
 
-    for file_idx, npy_path in enumerate(selected):
-        log(f"\n=== File {file_idx} / {len(selected)-1}: {npy_path} ===")
+    log(f"Array shape: {arr.shape}")
+    log(f"Total samples (N): {N}")
+    log(f"Visualizing first {k} samples...")
 
-        arr = np.load(npy_path)
-        if arr.ndim != 4 or arr.shape[1] != 6:
-            log(f"Warning: expected array shape (N, 6, H, W), got {arr.shape}; skipping file.")
-            continue
+    base_name = os.path.splitext(os.path.basename(args.npy_path))[0]
 
-        num_variants, channels, H, W = arr.shape
-        if args.verbose:
-            log(f"  Shape: {arr.shape}  (variants={num_variants}, channels={channels}, H={H}, W={W})")
+    for i in range(k):
+        sample = arr[i]  # (C,H,W) or (H,W)
+        out_prefix = os.path.join(args.output_dir, f"{base_name}_head{i:04d}")
+        visualize_sample(sample, out_prefix)
 
-        num_to_show = min(args.samples_per_file, num_variants)
-        log(f"  Visualizing first {num_to_show} variants from this shard...")
-
-        base_name = os.path.splitext(os.path.basename(npy_path))[0]
-
-        for i in range(num_to_show):
-            sample = arr[i]  # (6, H, W)
-            out_prefix = os.path.join(
-                args.output_dir,
-                f"{base_name}_var{i:04d}"
-            )
-            visualize_tensor(sample, out_prefix)
-
-    log("\nDone.")
+    log("Done.")
 
 
 if __name__ == "__main__":
