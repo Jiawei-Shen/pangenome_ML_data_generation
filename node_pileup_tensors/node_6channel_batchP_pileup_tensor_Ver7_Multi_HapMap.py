@@ -8,7 +8,7 @@ import time
 import numpy as np
 from collections import defaultdict
 import re
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Latest format constants
@@ -34,13 +34,19 @@ IDX_ENTRY_PACK = struct.Struct("<I Q I I H I I")  # nid, offset, block_size, n_r
 BASE_TO_INDEX = {'A': 20, 'C': 30, 'G': 50, 'T': 70, 'N': 5, '*': 1, 'I': 90, '_PADDING_': 0}
 PADDING_BASE_INDEX = 0
 
-CIGAR_OP_TO_INDEX = {'M': 10, 'N': 20, 'S': 30, 'I': 40, 'D': 50, 'H': 60, 'P': 70, '=': 80, 'X': 90, '_PADDING_': 0}
+CIGAR_OP_TO_INDEX = {
+    'M': 10, 'N': 20, 'S': 30, 'I': 40, 'D': 50, 'H': 60,
+    'P': 70, '=': 80, 'X': 90, '_PADDING_': 0
+}
 CIGAR_PADDING_INDEX = 0
 
-INDEX_TO_BASE_FOR_VIEW = {20: 'A', 30: 'C', 50: 'G', 70: 'T', 5: 'N', 1: '*', 90: 'I', 0: ' '}
+INDEX_TO_BASE_FOR_VIEW = {
+    20: 'A', 30: 'C', 50: 'G', 70: 'T',
+     5: 'N',  1: '*', 90: 'I',  0: ' '
+}
 
 TENSOR_WINDOW_SIZE = 100
-# Total depth (ref row + read rows) = 500 → allow 499 reads.
+# We want total depth (ref row + read rows) = 500, so allow 499 reads.
 TENSOR_MAX_READ_ROWS = 499
 DEFAULT_QUALITY_PADDING = 0
 DEFAULT_MAPPING_QUALITY_PADDING = -1
@@ -74,15 +80,17 @@ def read_dat_global_header(dat_path):
         major, minor, block_count, _ = GLOBAL_VER_PACK.unpack(f.read(GLOBAL_VER_PACK.size))
         return major, minor, block_count
 
-def load_full_idx_data_latest_filtered(idx_path, wanted_nodes):
+
+def load_full_idx_data_latest(idx_path, allowed_nodes=None):
     """
     Strictly parse latest .idx format (30 bytes/entry):
       <I Q I I H I I> → nid, offset, block_size, n_records, flags, R, C
 
-    Only keep entries where nid ∈ wanted_nodes to avoid huge idx maps.
-    Returns: dict[nid] = (offset, n_records)
+    If allowed_nodes is not None, only keep entries whose nid is in allowed_nodes.
+    Returns: (dict[nid] = (offset, n_records), kept_count)
     """
     m = {}
+    kept = 0
     with open(idx_path, "rb") as f:
         size = os.fstat(f.fileno()).st_size
         if size < 4:
@@ -92,15 +100,20 @@ def load_full_idx_data_latest_filtered(idx_path, wanted_nodes):
         if size != expected:
             # still read linearly, but enforce entry size
             if (size - 4) // IDX_ENTRY_SIZE != count:
-                raise RuntimeError(f"Idx size mismatch: file={size}, count={count}, entry={IDX_ENTRY_SIZE}")
+                raise RuntimeError(
+                    f"Idx size mismatch: file={size}, count={count}, entry={IDX_ENTRY_SIZE}"
+                )
         for i in range(count):
             rec = f.read(IDX_ENTRY_SIZE)
             if len(rec) != IDX_ENTRY_SIZE:
                 raise RuntimeError(f"Truncated idx at entry {i+1}")
             nid, offset, _blk_sz, nrec, _flags, _R, _C = IDX_ENTRY_PACK.unpack(rec)
-            if nid in wanted_nodes:
-                m[nid] = (offset, nrec)
-    return m
+            if allowed_nodes is not None and nid not in allowed_nodes:
+                continue
+            m[nid] = (offset, nrec)
+            kept += 1
+    return m, kept
+
 
 def decode_cigar_to_int_ops(cigar_string):
     if not cigar_string or cigar_string == '*':
@@ -110,8 +123,10 @@ def decode_cigar_to_int_ops(cigar_string):
     except Exception:
         return []
 
+
 def reverse_complement(sequence):
     return sequence.translate(str.maketrans("ACGTacgtNn", "TGCAtgcaNn"))[::-1]
+
 
 def af_float_to_bin(x: float) -> int:
     try:
@@ -136,13 +151,16 @@ def af_float_to_bin(x: float) -> int:
         return 6
     return 7
 
+
 def canonical_variant_key(v_pos, v_type, v_ref, v_alt, node_seq):
     node_len = len(node_seq)
 
     if v_type == 'I':
         anchor_pos = v_pos
-        anchor_base = (v_ref if v_ref and v_ref != "*"
-                       else (node_seq[anchor_pos].upper() if 0 <= anchor_pos < node_len else "N"))
+        anchor_base = (
+            v_ref if v_ref and v_ref != "*"
+            else (node_seq[anchor_pos].upper() if 0 <= anchor_pos < node_len else "N")
+        )
         inserted = v_alt or ""
         return f"{anchor_pos}_I_{anchor_base}_{anchor_base + inserted}"
 
@@ -158,8 +176,10 @@ def canonical_variant_key(v_pos, v_type, v_ref, v_alt, node_seq):
 
     return f"{v_pos}_{v_type}_{v_ref}_{v_alt}"
 
+
 def calculate_window_start(variant_pos, window_size):
     return variant_pos - (window_size // 2)
+
 
 def detect_variants_from_cigar(offset_on_node, cigar_ops_decoded, read_sequence, node_sequence):
     variants = []
@@ -186,7 +206,10 @@ def detect_variants_from_cigar(offset_on_node, cigar_ops_decoded, read_sequence,
             variants.append((ref_anchor, 'I', ins, ref_base))
             read_pos += L
         elif op == 'D':
-            del_seq = node_sequence[node_pos: node_pos + L].upper() if node_pos + L <= node_seq_len else ""
+            del_seq = (
+                node_sequence[node_pos: node_pos + L].upper()
+                if node_pos + L <= node_seq_len else ""
+            )
             if del_seq:
                 variants.append((node_pos, 'D', "*", del_seq))
             node_pos += L
@@ -196,7 +219,10 @@ def detect_variants_from_cigar(offset_on_node, cigar_ops_decoded, read_sequence,
             node_pos += L
     return variants
 
-def get_read_representation_in_window_for_view(cops, offset_on_node, read_seq, win_start, win_size, node_len):
+
+def get_read_representation_in_window_for_view(
+    cops, offset_on_node, read_seq, win_start, win_size, node_len
+):
     out = [' '] * win_size
     npos, rpos = offset_on_node, 0
     rlen = len(read_seq)
@@ -223,7 +249,10 @@ def get_read_representation_in_window_for_view(cops, offset_on_node, read_seq, w
             break
     return out
 
-def get_read_tensor_rows_in_window(cops, offset_on_node, read_seq, qual_vals, mapq, win_start, win_size, node_len):
+
+def get_read_tensor_rows_in_window(
+    cops, offset_on_node, read_seq, qual_vals, mapq, win_start, win_size, node_len
+):
     bases = [PADDING_BASE_INDEX] * win_size
     quals = [DEFAULT_QUALITY_PADDING] * win_size
     mapqs = [DEFAULT_MAPPING_QUALITY_PADDING] * win_size
@@ -265,9 +294,12 @@ def get_read_tensor_rows_in_window(cops, offset_on_node, read_seq, qual_vals, ma
             break
     return bases, quals, mapqs, cig
 
-def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_quality_values, read_cigar_ops_decoded,
-                                     target_node_pos, node_sequence,
-                                     expected_var_type=None, expected_ref_allele_for_indel=None):
+
+def get_allele_from_read_at_node_pos(
+    read_offset_on_node, read_sequence, read_quality_values, read_cigar_ops_decoded,
+    target_node_pos, node_sequence,
+    expected_var_type=None, expected_ref_allele_for_indel=None
+):
     npos = read_offset_on_node
     rpos = 0
     saw_ins_anchor = False
@@ -310,7 +342,11 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_qu
                 if expected_var_type == 'D':
                     if 0 <= npos < len(node_sequence) and npos + L <= len(node_sequence):
                         del_ref = node_sequence[npos: npos + L]
-                        return ("*" if del_ref == expected_ref_allele_for_indel else "OTHER_FOR_INDEL"), None
+                        return (
+                            "*" if del_ref == expected_ref_allele_for_indel
+                            else "OTHER_FOR_INDEL",
+                            None,
+                        )
                     return "OTHER_FOR_INDEL", None
                 return "*", None
             npos += L
@@ -318,7 +354,9 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence, read_qu
             rpos += L
         elif op == 'N':
             npos += L
-        if npos > target_node_pos + 1 and not (expected_var_type == 'I' and (npos - 1) <= target_node_pos):
+        if npos > target_node_pos + 1 and not (
+            expected_var_type == 'I' and (npos - 1) <= target_node_pos
+        ):
             break
     if expected_var_type == 'I' and saw_ins_anchor:
         return "REF_STATE_FOR_INDEL", bq_anchor
@@ -336,9 +374,11 @@ def init_worker(dat_file_paths_for_worker, base_output_dir_for_worker, need_view
     worker_base_output_dir = base_output_dir_for_worker
     worker_need_view = bool(need_view_flag)
 
+
 def _non_M_length(cops):
     # Sum of lengths for CIGAR ops that are NOT 'M'
     return sum(L for L, op in (cops or []) if op != 'M')
+
 
 def process_single_node_for_pileup(task_args):
     """
@@ -375,7 +415,9 @@ def process_single_node_for_pileup(task_args):
             dat_f.seek(dat_file_offset, os.SEEK_SET)
             hdr = dat_f.read(BLOCK_HDR_SIZE)
             if len(hdr) != BLOCK_HDR_SIZE:
-                raise RuntimeError(f"Cannot read block header at {dat_file_offset} for node {node_id} (file #{file_idx})")
+                raise RuntimeError(
+                    f"Cannot read block header at {dat_file_offset} for node {node_id} (file #{file_idx})"
+                )
             nid2, nrec2, _flags, R, C = BLOCK_HDR_PACK.unpack(hdr)
             if nid2 != node_id or nrec2 != n_records:
                 # not fatal – proceed with idx values
@@ -400,7 +442,11 @@ def process_single_node_for_pileup(task_args):
                     seq = raw_seq.rstrip(b'\0').decode('ascii', 'replace')
                     qual_values = list(raw_qual.rstrip(b'\0'))
                     cigar_str = raw_cigar.rstrip(b'\0').decode('ascii', 'replace')
-                    strand_char = strand_byte.decode('ascii') if isinstance(strand_byte, (bytes, bytearray)) else chr(strand_byte)
+                    strand_char = (
+                        strand_byte.decode('ascii')
+                        if isinstance(strand_byte, (bytes, bytearray))
+                        else chr(strand_byte)
+                    )
                 except UnicodeDecodeError:
                     continue
                 if not cigar_str or len(seq) != len(qual_values):
@@ -457,7 +503,8 @@ def process_single_node_for_pileup(task_args):
     candidate_variants = defaultdict(int)
     for seg in aligned_read_segments:
         for v_pos, v_type, v_alt, v_ref in detect_variants_from_cigar(
-                seg["offset_on_node"], seg["cigar_ops"], seg["read_sequence"], node_sequence):
+            seg["offset_on_node"], seg["cigar_ops"], seg["read_sequence"], node_sequence
+        ):
             candidate_variants[(v_pos, v_type, v_ref, v_alt)] += 1
 
     view_oriented_variant_data = {} if worker_need_view else None
@@ -485,8 +532,9 @@ def process_single_node_for_pileup(task_args):
 
         for seg in aligned_read_segments:
             allele, bq = get_allele_from_read_at_node_pos(
-                seg["offset_on_node"], seg["read_sequence"], seg["processed_quality_values"], seg["cigar_ops"],
-                v_pos, node_sequence, v_type, ref_for_indel_ctx)
+                seg["offset_on_node"], seg["read_sequence"], seg["processed_quality_values"],
+                seg["cigar_ops"], v_pos, node_sequence, v_type, ref_for_indel_ctx
+            )
             if allele is None:
                 continue
             cov += 1
@@ -523,7 +571,8 @@ def process_single_node_for_pileup(task_args):
             for seg in aligned_read_segments[: TENSOR_MAX_READ_ROWS + 50]:
                 row = get_read_representation_in_window_for_view(
                     seg["cigar_ops"], seg["offset_on_node"], seg["read_sequence"],
-                    win_start, TENSOR_WINDOW_SIZE, node_len)
+                    win_start, TENSOR_WINDOW_SIZE, node_len
+                )
                 if any(ch != ' ' for ch in row):
                     bases_for_view = [
                         (PADDING_BASE_INDEX if ch == ' ' else BASE_TO_INDEX.get(ch.upper(), BASE_TO_INDEX['N']))
@@ -533,7 +582,7 @@ def process_single_node_for_pileup(task_args):
                         "bases": bases_for_view,
                         "offset": seg["offset_on_node"],
                         "strand": seg["strand"],
-                        "cigar": seg["original_cigar_str"],
+                        "cigar": seg["original_cigar_str"]
                     })
             view_oriented_variant_data[key] = {
                 "pileup_reads_data": pile[: TENSOR_MAX_READ_ROWS],
@@ -542,7 +591,7 @@ def process_single_node_for_pileup(task_args):
                 "other_allele_count_at_locus": other,
                 "coverage_at_locus": cov,
                 "alt_allele_frequency": round(af, 4),
-                "mean_alt_allele_base_quality": round(mean_bq, 2),
+                "mean_alt_allele_base_quality": round(mean_bq, 2)
             }
 
         # Build tensors
@@ -589,8 +638,7 @@ def process_single_node_for_pileup(task_args):
             mapq = max(0, min(int(seg["mapping_quality"]), 127))
             b_row, q_row, mq_row, cig_row = get_read_tensor_rows_in_window(
                 seg["cigar_ops"], seg["offset_on_node"], seg["read_sequence"],
-                seg["processed_quality_values"],
-                mapq, win_start, TENSOR_WINDOW_SIZE, node_len
+                seg["processed_quality_values"], mapq, win_start, TENSOR_WINDOW_SIZE, node_len
             )
 
             # Encode insertion ALT as 'I' at the anchor with mean BQ of inserted bases
@@ -603,12 +651,16 @@ def process_single_node_for_pileup(task_args):
                     v_pos,
                     node_sequence,
                     expected_var_type='I',
-                    expected_ref_allele_for_indel=(node_sequence[v_pos] if 0 <= v_pos < node_len else "*"),
+                    expected_ref_allele_for_indel=(
+                        node_sequence[v_pos] if 0 <= v_pos < node_len else "*"
+                    ),
                 )
                 if isinstance(allele_ins, str) and allele_ins == v_alt_from_cigar:
                     b_row[variant_win_idx] = BASE_TO_INDEX['I']
                     if mean_bq_ins is not None:
-                        q_row[variant_win_idx] = int(max(0, min(127, round(mean_bq_ins))))
+                        q_row[variant_win_idx] = int(
+                            max(0, min(127, round(mean_bq_ins)))
+                        )
 
             if any(b != PADDING_BASE_INDEX for b in b_row):
                 r = 1 + reads_added
@@ -654,24 +706,33 @@ def process_single_node_for_pileup(task_args):
     return node_id, (view_oriented_variant_data or {}), tensors_for_node, meta_for_node
 
 # ─────────────────────────────────────────────────────────────────────────────
-# View (optional, unchanged)
+# View (optional)
 
-def display_pileup_data(node_data_for_display_view, node_id_str_for_display, full_node_sequence,
-                        max_reads_to_display_per_variant, max_variants_to_display=float('inf')):
+def display_pileup_data(
+    node_data_for_display_view, node_id_str_for_display, full_node_sequence,
+    max_reads_to_display_per_variant, max_variants_to_display=float('inf')
+):
     if max_variants_to_display == 0 or not node_data_for_display_view:
         print(f"Info: No pileup data for node {node_id_str_for_display}.")
         return
     print(f"\n=== Displaying Pileups for Node {node_id_str_for_display} (Len: {len(full_node_sequence)}) ===")
-    keys = sorted(node_data_for_display_view.keys(), key=lambda x: (int(x.split('_')[0]), x.split('_')[1]))
+    keys = sorted(
+        node_data_for_display_view.keys(),
+        key=lambda x: (int(x.split('_')[0]), x.split('_')[1])
+    )
     for i, k in enumerate(keys):
         if i >= max_variants_to_display:
             print(f"\n  ... ({len(keys) - i} more variants not shown due to --view limit)")
             break
         v_pos, v_type = int(k.split('_')[0]), k.split('_')[1]
-        win_start = calculate_window_start(v_pos + 1 if v_type == 'I' else v_pos, TENSOR_WINDOW_SIZE)
+        win_start = calculate_window_start(
+            v_pos + 1 if v_type == 'I' else v_pos, TENSOR_WINDOW_SIZE
+        )
         print(f"\n--- Variant: {k} ---")
-        ref = ''.join(full_node_sequence[j] if 0 <= j < len(full_node_sequence) else '0'
-                      for j in range(win_start, win_start + TENSOR_WINDOW_SIZE))
+        ref = ''.join(
+            full_node_sequence[j] if 0 <= j < len(full_node_sequence) else '0'
+            for j in range(win_start, win_start + TENSOR_WINDOW_SIZE)
+        )
         print(f"  Node Ref: {ref}")
         marker_idx = v_pos - win_start
         mark = [' '] * TENSOR_WINDOW_SIZE
@@ -683,60 +744,83 @@ def display_pileup_data(node_data_for_display_view, node_id_str_for_display, ful
             bases_str = ''.join(INDEX_TO_BASE_FOR_VIEW.get(idx, '?') for idx in row["bases"])
             print(f"  Read {j+1:3d}: {bases_str} (CIGAR:{row['cigar']}, STRAND:{row.get('strand', '?')})")
         vd = node_data_for_display_view[k]
-        print(f"  Alt Count: {vd.get('alt_allele_count','N/A')}, "
-              f"Ref Count: {vd.get('ref_allele_count_at_locus','N/A')}, "
-              f"Coverage: {vd.get('coverage_at_locus','N/A')}")
-        print(f"  Alt Freq: {vd.get('alt_allele_frequency',0.0):.4f}, "
-              f"Mean Alt BQ: {vd.get('mean_alt_allele_base_quality',0.0):.2f}")
+        print(
+            f"  Alt Count: {vd.get('alt_allele_count','N/A')}, "
+            f"Ref Count: {vd.get('ref_allele_count_at_locus','N/A')}, "
+            f"Coverage: {vd.get('coverage_at_locus','N/A')}"
+        )
+        print(
+            f"  Alt Freq: {vd.get('alt_allele_frequency',0.0):.4f}, "
+            f"Mean Alt BQ: {vd.get('mean_alt_allele_base_quality',0.0):.2f}"
+        )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main: multi-dat/idx + sharded NPY output (memory-optimized)
+# Main: multi-dat/idx + sharded NPY output with bounded in-flight tasks
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate variant-centered tensors from latest .dat/.idx format (R,C per block), "
-                    "optionally merging multiple .dat/.idx pairs, and write sharded NPY files.",
+        description=(
+            "Generate variant-centered tensors from latest .dat/.idx format (R,C per block), "
+            "optionally merging multiple .dat/.idx pairs, and write sharded NPY files."
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("dat", help="Primary .dat alignment file (latest format)")
     parser.add_argument("idx", help="Primary .idx index file (30B entries)")
     parser.add_argument("output", help="Base output directory for shards + variant_summary.ndjson")
     parser.add_argument("candidate_variants_json", help="JSON with nodes and sequences to process.")
-    parser.add_argument("--extra-dat-idx", metavar=("DAT", "IDX"), nargs=2, action="append", default=[],
-                        help="Additional .dat/.idx pairs to merge; can be given multiple times.")
+    parser.add_argument(
+        "--extra-dat-idx", metavar=("DAT", "IDX"), nargs=2, action="append", default=[],
+        help="Additional .dat/.idx pairs to merge; can be given multiple times."
+    )
     parser.add_argument("--num_workers", type=int, default=os.cpu_count(), help="Worker processes")
-    parser.add_argument("--chunksize", type=int, default=64, help="Task chunksize")
-    parser.add_argument("--view", nargs='?', const=-1, default=None, type=int, metavar='N',
-                        help="Print pileups for top N variants per node (-1 for all)")
+    parser.add_argument(
+        "--chunksize", type=int, default=64,
+        help="[Unused in bounded mode; kept for compatibility]"
+    )
+    parser.add_argument(
+        "--view", nargs='?', const=-1, default=None, type=int, metavar='N',
+        help="Print pileups for top N variants per node (-1 for all)"
+    )
     parser.add_argument("--max_view_reads", type=int, default=20, help="Max reads per pileup in view mode")
     parser.add_argument("--min_af", type=float, default=0.03, help="Minimum allele frequency")
     parser.add_argument("--min_variants", type=int, default=2, help="Minimum ALT-supporting reads")
     parser.add_argument("--min_allele_bq", type=float, default=10.0, help="Minimum mean BQ for ALT")
-    parser.add_argument("--variant_type", choices=['snp', 'indel', 'all'], default='all',
-                        help="Which variants to output tensors for")
-    parser.add_argument("--shard_size", type=int, default=4096,
-                        help="Number of variant tensors per shard")
-    parser.add_argument("--shard_prefix", type=str, default="shard",
-                        help="Prefix for shard filenames (prefix_00000_data.npy)")
-    parser.add_argument("--log_every_nodes", type=int, default=100000,
-                        help="Log progress every N nodes")
+    parser.add_argument(
+        "--variant_type", choices=['snp', 'indel', 'all'], default='all',
+        help="Which variants to output tensors for"
+    )
+    parser.add_argument(
+        "--shard_size", type=int, default=4096,
+        help="Number of variant tensors per shard"
+    )
+    parser.add_argument(
+        "--shard_prefix", type=str, default="shard",
+        help="Prefix for shard filenames (prefix_00000_data.npy)"
+    )
+    parser.add_argument(
+        "--log_every_nodes", type=int, default=100000,
+        help="Log progress every N nodes"
+    )
+    parser.add_argument(
+        "--max_tasks_in_flight", type=int, default=None,
+        help="Max tasks queued in the ProcessPool at once (default: 4 * num_workers)"
+    )
 
     args = parser.parse_args()
 
     # Build list of all (.dat, .idx) pairs
     dat_idx_pairs = [(args.dat, args.idx)] + (args.extra_dat_idx or [])
 
-    # quick existence checks
+    # quick checks
     files_to_check = [args.candidate_variants_json]
     for d, i in dat_idx_pairs:
         files_to_check.extend([d, i])
     if not all(os.path.isfile(p) for p in files_to_check):
         sys.exit("Error: one or more .dat/.idx/json files not found.")
 
-    # ── 1. Load JSON FIRST, so we know which node_ids we actually care about
-    node_sequences = {}
-    node_af_data = {}
-
+    # Input nodes JSON (sequence / AF info) first, so we know allowed node IDs
+    node_sequences, node_af_data = {}, {}
     try:
         with open(args.candidate_variants_json, 'r') as f:
             data = json.load(f)
@@ -754,66 +838,81 @@ def main():
     except Exception as e:
         sys.exit(f"Error parsing JSON: {e}")
 
-    wanted_nodes = set(node_sequences.keys())
+    allowed_nodes = set(node_sequences.keys())
     log(f"Loaded {len(node_sequences)} nodes with sequence info from JSON.")
-    if not wanted_nodes:
-        sys.exit("No nodes loaded from JSON; nothing to do.")
 
-    # ── 2. Validate each .dat and load FILTERED idx for desired nodes only
+    # Validate each .dat header and load each .idx, filtering to JSON nodes
     idx_maps = []
-    total_filtered_idx_entries = 0
-
+    all_node_ids_from_idx = set()
     for pair_idx, (dat_path, idx_path) in enumerate(dat_idx_pairs):
         try:
             major, minor, blocks = read_dat_global_header(dat_path)
-            log(f"[PAIR {pair_idx}] .dat header for {os.path.basename(dat_path)}: "
-                f"version {major}.{minor}, blocks={blocks} (expect latest format)")
+            log(
+                f"[PAIR {pair_idx}] .dat header for {os.path.basename(dat_path)}: "
+                f"version {major}.{minor}, blocks={blocks} (expect latest format)"
+            )
         except Exception as e:
             sys.exit(f"Error reading .dat header {dat_path}: {e}")
 
         try:
-            idx_map = load_full_idx_data_latest_filtered(idx_path, wanted_nodes)
+            idx_map, kept = load_full_idx_data_latest(idx_path, allowed_nodes=allowed_nodes)
             idx_maps.append(idx_map)
-            total_filtered_idx_entries += len(idx_map)
-            log(f"[PAIR {pair_idx}] Loaded {len(idx_map)} filtered index entries from {idx_path}.")
+            all_node_ids_from_idx.update(idx_map.keys())
+            log(
+                f"[PAIR {pair_idx}] Loaded {kept} filtered index entries "
+                f"from {idx_path}."
+            )
         except Exception as e:
             sys.exit(f"Error reading .idx (latest) {idx_path}: {e}")
 
-    if not idx_maps:
-        sys.exit("No idx entries loaded after filtering; nothing to do.")
+    if not idx_maps or not all_node_ids_from_idx:
+        sys.exit("No nodes found in provided .idx files after filtering to JSON nodes.")
 
-    log(f"Total filtered idx entries across all files (for JSON nodes): {total_filtered_idx_entries}")
+    total_filtered_entries = sum(len(m) for m in idx_maps)
+    log(f"Total filtered idx entries across all files (for JSON nodes): {total_filtered_entries}")
+    log(f"Total distinct node IDs across filtered idx files: {len(all_node_ids_from_idx)}")
 
-    # ── 3. Build tasks as a GENERATOR (no giant in-memory task list)
+    # We will not pre-build a huge tasks list. Instead, we define a generator.
+    def task_generator():
+        for nid in sorted(all_node_ids_from_idx):
+            seq = node_sequences.get(nid)
+            if not seq:
+                # Should not happen, because we filtered idx by allowed_nodes,
+                # but keep the guard.
+                continue
+
+            dat_entries = []
+            for file_idx, idx_map in enumerate(idx_maps):
+                if nid in idx_map:
+                    off, nrec = idx_map[nid]
+                    dat_entries.append((file_idx, off, nrec))
+
+            if not dat_entries:
+                continue
+
+            yield (
+                nid,
+                dat_entries,
+                args.min_af,
+                args.min_variants,
+                args.min_allele_bq,
+                args.variant_type,
+            )
+
     os.makedirs(args.output, exist_ok=True)
 
+    # share globals
     global GLOBAL_NODE_SEQS, GLOBAL_NODE_AF
     GLOBAL_NODE_SEQS, GLOBAL_NODE_AF = node_sequences, node_af_data
 
     need_view = (args.view is not None and args.view != 0)
-    total_json_nodes = len(node_sequences)
 
-    # keep a counter for nodes in JSON that have no entries in any idx file
-    missing_in_idx = 0
-
-    def iter_tasks():
-        nonlocal missing_in_idx
-        # iterate over JSON nodes (the ones we actually care about)
-        for nid in sorted(node_sequences.keys()):
-            dat_entries = []
-            for file_idx, idx_map in enumerate(idx_maps):
-                entry = idx_map.get(nid)
-                if entry is not None:
-                    off, nrec = entry
-                    dat_entries.append((file_idx, off, nrec))
-            if not dat_entries:
-                missing_in_idx += 1
-                continue
-            yield (nid, dat_entries,
-                   args.min_af, args.min_variants,
-                   args.min_allele_bq, args.variant_type)
-
-    task_iter = iter_tasks()
+    # Bounded in-flight tasks
+    if args.max_tasks_in_flight is None:
+        max_tasks_in_flight = max(1, args.num_workers * 4)
+    else:
+        max_tasks_in_flight = max(1, args.max_tasks_in_flight)
+    log(f"Using num_workers={args.num_workers}, max_tasks_in_flight={max_tasks_in_flight}")
 
     shard_size = max(1, int(args.shard_size))
     shard_idx = 0
@@ -831,17 +930,14 @@ def main():
 
     def flush_full_shard():
         nonlocal shard_idx, buffer_tensors, buffer_meta, total_variants
-
         if len(buffer_tensors) < shard_size:
             return
-
         chunk_tensors = buffer_tensors[:shard_size]
         chunk_meta = buffer_meta[:shard_size]
+        buffer_tensors[:] = buffer_tensors[shard_size:]
+        buffer_meta[:] = buffer_meta[shard_size:]
 
-        buffer_tensors = buffer_tensors[shard_size:]
-        buffer_meta = buffer_meta[shard_size:]
-
-        xs = np.stack(chunk_tensors, axis=0)  # (shard_size, 6, H, W)
+        xs = np.stack(chunk_tensors, axis=0)
         N = xs.shape[0]
         data_path = os.path.join(args.output, f"{args.shard_prefix}_{shard_idx:05d}_data.npy")
         log(f"Saving shard {shard_idx} data: {N} tensors -> {data_path}")
@@ -858,83 +954,115 @@ def main():
 
     def flush_remainder():
         nonlocal shard_idx, buffer_tensors, buffer_meta, total_variants
-
         if not buffer_tensors:
             return
-
         xs = np.stack(buffer_tensors, axis=0)
         N = xs.shape[0]
         data_path = os.path.join(args.output, f"{args.shard_prefix}_{shard_idx:05d}_data.npy")
         log(f"Saving FINAL shard {shard_idx} data: {N} tensors -> {data_path}")
         np.save(data_path, xs)
-
         for i, m in enumerate(buffer_meta):
             m_out = dict(m)
             m_out["shard_index"] = shard_idx
             m_out["index_within_shard"] = i
             summary_f.write(json.dumps(m_out) + "\n")
-
         total_variants += N
         shard_idx += 1
         buffer_tensors.clear()
         buffer_meta.clear()
 
     dat_paths = [d for d, _ in dat_idx_pairs]
-    log(f"Submitting JSON nodes (up to {total_json_nodes}) to {args.num_workers} workers "
-        f"via generator tasks...")
+    task_iter = task_generator()
 
-    with ProcessPoolExecutor(max_workers=args.num_workers,
-                             initializer=init_worker,
-                             initargs=(dat_paths, args.output, need_view)) as ex:
-        for nid, view_data, node_tensors, node_meta in ex.map(
-                process_single_node_for_pileup,
-                task_iter,
-                chunksize=max(1, args.chunksize)):
+    with ProcessPoolExecutor(
+        max_workers=args.num_workers,
+        initializer=init_worker,
+        initargs=(dat_paths, args.output, need_view)
+    ) as ex:
+        futures = {}
 
-            processed_nodes += 1
-            batch_nodes += 1
+        # Seed initial tasks
+        try:
+            for _ in range(max_tasks_in_flight):
+                task = next(task_iter)
+                f = ex.submit(process_single_node_for_pileup, task)
+                futures[f] = True
+        except StopIteration:
+            pass
 
-            if node_tensors:
-                buffer_tensors.extend(node_tensors)
-                buffer_meta.extend(node_meta)
-                n_new = len(node_tensors)
-                batch_variants += n_new
+        log(
+            f"Submitting JSON nodes via bounded queue "
+            f"(at most {max_tasks_in_flight} tasks in flight)..."
+        )
 
-            # Optional live view print
-            if need_view and view_data:
-                seq_for_view = GLOBAL_NODE_SEQS.get(nid, "")
-                display_pileup_data(view_data, str(nid), seq_for_view,
-                                    args.max_view_reads,
-                                    args.view if args.view != -1 else float('inf'))
+        try:
+            while futures:
+                for f in as_completed(list(futures.keys())):
+                    del futures[f]
+                    nid, view_data, node_tensors, node_meta = f.result()
 
-            # Flush any full shards from the buffer
-            while len(buffer_tensors) >= shard_size:
-                flush_full_shard()
+                    processed_nodes += 1
+                    batch_nodes += 1
 
-            # Progress logging
-            if (processed_nodes % args.log_every_nodes == 0):
-                dt = time.time() - t0
-                rate_nodes = batch_nodes / dt if dt > 0 else 0.0
-                rate_vars = batch_variants / dt if dt > 0 else 0.0
-                log(f"Batch: +{batch_nodes} nodes (+{batch_variants} variants) "
-                    f"in {dt:.2f}s → {rate_nodes:.1f} nodes/s, {rate_vars:.1f} vars/s. "
-                    f"[total {processed_nodes} nodes with data processed so far, "
-                    f"{total_variants} variants, {shard_idx} shards written]")
-                batch_nodes = 0
-                batch_variants = 0
-                t0 = time.time()
+                    if node_tensors:
+                        buffer_tensors.extend(node_tensors)
+                        buffer_meta.extend(node_meta)
+                        n_new = len(node_tensors)
+                        batch_variants += n_new
 
-    # Final shard flush for leftovers (may be < shard_size)
+                    if need_view and view_data:
+                        seq_for_view = GLOBAL_NODE_SEQS.get(nid, "")
+                        display_pileup_data(
+                            view_data, str(nid), seq_for_view,
+                            args.max_view_reads,
+                            args.view if args.view != -1 else float('inf')
+                        )
+
+                    # Flush any full shards
+                    while len(buffer_tensors) >= shard_size:
+                        flush_full_shard()
+
+                    # Progress logging
+                    if (batch_nodes >= args.log_every_nodes):
+                        dt = time.time() - t0
+                        rate_nodes = batch_nodes / dt if dt > 0 else 0.0
+                        rate_vars = batch_variants / dt if dt > 0 else 0.0
+                        log(
+                            f"Batch: +{batch_nodes} nodes (+{batch_variants} variants) "
+                            f"in {dt:.2f}s → {rate_nodes:.1f} nodes/s, {rate_vars:.1f} vars/s. "
+                            f"[total {processed_nodes} nodes, {total_variants} variants, "
+                            f"{shard_idx} shards written so far]"
+                        )
+                        batch_nodes = 0
+                        batch_variants = 0
+                        t0 = time.time()
+
+                    # Refill: submit new tasks to keep at most max_tasks_in_flight in flight
+                    try:
+                        while len(futures) < max_tasks_in_flight:
+                            task = next(task_iter)
+                            new_f = ex.submit(process_single_node_for_pileup, task)
+                            futures[new_f] = True
+                    except StopIteration:
+                        # no more tasks to submit
+                        pass
+
+                    if not futures:
+                        break
+
+        except KeyboardInterrupt:
+            log("KeyboardInterrupt detected, shutting down executor...")
+            raise
+
     flush_remainder()
     summary_f.close()
 
     log("Done.")
-    log(f"Total JSON nodes            : {total_json_nodes}")
-    log(f"JSON nodes missing in idx   : {missing_in_idx}")
-    log(f"Total nodes actually processed (with reads) : {processed_nodes}")
-    log(f"Total variant tensors       : {total_variants}")
-    log(f"Total shards written        : {shard_idx}")
-    log(f"Variant summary (NDJSON)    : {summary_path}")
+    log(f"Total nodes processed   : {processed_nodes}")
+    log(f"Total variant tensors   : {total_variants}")
+    log(f"Total shards written    : {shard_idx}")
+    log(f"Variant summary (NDJSON): {summary_path}")
+
 
 if __name__ == "__main__":
     main()
