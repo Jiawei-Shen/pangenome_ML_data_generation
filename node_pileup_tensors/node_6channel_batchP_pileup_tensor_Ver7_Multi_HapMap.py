@@ -806,7 +806,7 @@ def main():
     )
     parser.add_argument("--max_view_reads", type=int, default=20, help="Max reads per pileup in view mode")
     parser.add_argument("--min_af", type=float, default=0.007, help="Minimum allele frequency")
-    parser.add_argument("--min_variants", type=int, default=2, help="Minimum ALT-supporting reads")
+    parser.add_argument("--min_variants", type=int, default=3, help="Minimum ALT-supporting reads")
     parser.add_argument("--min_allele_bq", type=float, default=10.0, help="Minimum mean BQ for ALT")
     parser.add_argument(
         "--variant_type", choices=['snp', 'indel', 'all'], default='all',
