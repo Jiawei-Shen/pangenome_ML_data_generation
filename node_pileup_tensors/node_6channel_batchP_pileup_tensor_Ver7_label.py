@@ -5,6 +5,7 @@ import os
 import sys
 import time
 from collections import defaultdict
+import re  # <-- added
 
 import numpy as np
 import pysam
@@ -82,6 +83,39 @@ def load_node_positions(ref_json_path: str):
             pos[nid] = p
     return pos
 
+def detect_shard_bases(data_dir: str):
+    """
+    Scan data_dir for files like:
+      PREFIX00000_data.npy
+      shard_00000_data.npy
+      COLO829T_ONT_chr3_00000_data.npy
+    and build a mapping:
+      shard_idx (int) -> base path WITHOUT '_data.npy'/'_labels.npy'
+
+    Example:
+      'COLO829T_ONT_chr3_00000_data.npy'
+      -> idx = 0
+      -> base = '/.../COLO829T_ONT_chr3_00000'
+    """
+    pattern = re.compile(r"^(.*?)(\d{5})_data\.npy$")
+    mapping = {}
+    for fname in os.listdir(data_dir):
+        m = pattern.match(fname)
+        if not m:
+            continue
+        prefix, idx_str = m.group(1), m.group(2)
+        try:
+            idx = int(idx_str)
+        except ValueError:
+            continue
+        base = os.path.join(data_dir, prefix + idx_str)
+        if idx in mapping and mapping[idx] != base:
+            log(f"[WARN] Multiple data files found for shard {idx:05d}: "
+                f"{os.path.basename(mapping[idx])} vs {fname}; using {fname}")
+        mapping[idx] = base
+    log(f"Detected data prefixes for {len(mapping)} shard(s) in {data_dir}")
+    return mapping
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main classification stage
 
@@ -98,7 +132,7 @@ def main():
     ap.add_argument("--chr", required=True,
                     help="Chromosome name for VCF fetch (e.g., chr1)")
     ap.add_argument("--data-dir", required=True,
-                    help="Directory containing shard_XXXXX_data.npy; labels will be written here")
+                    help="Directory containing *data.npy; labels will be written here")
     ap.add_argument("--unknown-label", type=int, default=-1,
                     help="Integer label to assign when no decision can be made (default: -1)")
     args = ap.parse_args()
@@ -110,6 +144,8 @@ def main():
         sys.exit(f"ref_json not found: {args.ref_json}")
     if not os.path.isfile(args.vcf_file):
         sys.exit(f"VCF not found: {args.vcf_file}")
+    if not os.path.isdir(args.data_dir):
+        sys.exit(f"data-dir not found or not a directory: {args.data_dir}")
 
     log("Loading node positions from ref JSON...")
     node_pos = load_node_positions(args.ref_json)
@@ -217,15 +253,19 @@ def main():
             if total_lines % 100000 == 0:
                 dt = time.time() - start
                 rate = total_lines / dt if dt > 0 else 0.0
-                eta = "..."
-                log(f"Classified {total_lines:,} variants "
+                log(
+                    f"Classified {total_lines:,} variants "
                     f"(true={total_true:,}, false={total_false:,}, unknown={total_unknown:,}) "
-                    f"→ {rate:.1f} variants/s")
+                    f"→ {rate:.1f} variants/s"
+                )
 
     out_f.close()
     log(f"Classification NDJSON written to: {out_classified_path}")
 
-    # Now write shard_*_labels.npy for each shard
+    # Detect data prefixes from existing *_data.npy files
+    shard_bases = detect_shard_bases(args.data_dir)
+
+    # Now write *_labels.npy for each shard, matching the detected prefix
     log("Writing shard label arrays...")
     for shard_idx, labels_list in sorted(labels_by_shard.items()):
         # Ensure no None; replace with unknown_label if any
@@ -233,10 +273,17 @@ def main():
             [lbl if lbl is not None else args.unknown_label for lbl in labels_list],
             dtype=np.int8,
         )
-        labels_path = os.path.join(
-            args.data_dir,
-            f"shard_{shard_idx:05d}_labels.npy",
-        )
+
+        base = shard_bases.get(shard_idx)
+        if base is None:
+            # Fallback to old naming scheme
+            base = os.path.join(args.data_dir, f"shard_{shard_idx:05d}")
+            log(
+                f"[WARN] No data file detected for shard {shard_idx:05d}; "
+                f"using default base name {os.path.basename(base)}"
+            )
+
+        labels_path = base + "_labels.npy"
         log(f"  shard {shard_idx:05d}: {labels_array.shape[0]} labels -> {labels_path}")
         np.save(labels_path, labels_array)
 
