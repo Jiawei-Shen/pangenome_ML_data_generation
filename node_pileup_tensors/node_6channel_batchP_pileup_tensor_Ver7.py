@@ -490,13 +490,13 @@ def process_single_node_for_pileup(task_args):
 
         if alt < min_variants_threshold:
             continue
-        if v_type == 'X':
-            af_tmp = alt / cov if cov > 0 else 0.0
-            if af_tmp < min_af_threshold:
-                continue
-            bq_tmp = sum(alt_bqs) / len(alt_bqs) if alt_bqs else 0.0
-            if bq_tmp < min_allele_bq_threshold:
-                continue
+        # if v_type == 'X':
+        af_tmp = alt / cov if cov > 0 else 0.0
+        if af_tmp < min_af_threshold:
+            continue
+        bq_tmp = sum(alt_bqs) / len(alt_bqs) if alt_bqs else 0.0
+        if bq_tmp < min_allele_bq_threshold:
+            continue
 
         af = alt / cov if cov > 0 else 0.0
         mean_bq = sum(alt_bqs) / len(alt_bqs) if alt_bqs else 0.0
