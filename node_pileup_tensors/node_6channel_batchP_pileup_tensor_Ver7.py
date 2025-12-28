@@ -295,13 +295,13 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence,
         elif op == 'D':
             if npos <= target_node_pos < npos + L:
                 if expected_var_type == 'I':
-                    return "OTHER_FOR_INDEL", None
+                    return "OTHER_FOR_INDEL", 40
                 if expected_var_type == 'D':
                     if 0 <= npos < len(node_sequence) and npos + L <= len(node_sequence):
                         del_ref = node_sequence[npos: npos + L]
-                        return ("*" if del_ref == expected_ref_allele_for_indel else "OTHER_FOR_INDEL"), None
-                    return "OTHER_FOR_INDEL", None
-                return "*", None
+                        return ("*" if del_ref == expected_ref_allele_for_indel else "OTHER_FOR_INDEL"), 40
+                    return "OTHER_FOR_INDEL", 40
+                return "*", 40
             npos += L
         elif op == 'S':
             rpos += L
