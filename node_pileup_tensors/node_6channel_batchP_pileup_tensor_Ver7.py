@@ -262,8 +262,14 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence,
     rpos = 0
     saw_ins_anchor = False
     bq_anchor = None
+
+    # NEW: keep track of the last aligned base-quality before any deletion
+    last_aligned_bq = None
+    DEFAULT_DEL_ANCHOR_BQ = 50
+
     for L, op in read_cigar_ops_decoded:
         if op in ('M', '=', 'X'):
+            # If target is inside this match block, handle as before
             if npos <= target_node_pos < npos + L:
                 off = target_node_pos - npos
                 ridx = rpos + off
@@ -283,7 +289,18 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence,
                         bq_anchor = None
                     else:
                         return None, None
-            npos += L; rpos += L
+
+            # Update last_aligned_bq with the last base in this aligned stretch
+            if L > 0:
+                last_idx = rpos + L - 1
+                if 0 <= last_idx < len(read_quality_values):
+                    last_aligned_bq = read_quality_values[last_idx]
+                else:
+                    last_aligned_bq = None
+
+            npos += L
+            rpos += L
+
         elif op == 'I':
             if expected_var_type == 'I' and (npos - 1) == target_node_pos:
                 if rpos + L <= len(read_sequence):
@@ -292,23 +309,34 @@ def get_allele_from_read_at_node_pos(read_offset_on_node, read_sequence,
                     return read_sequence[rpos: rpos + L].upper(), mq
                 return None, None
             rpos += L
+
         elif op == 'D':
             if npos <= target_node_pos < npos + L:
+                # NEW: use anchor base BQ (last aligned base before this deletion), else default 50
+                del_anchor_bq = last_aligned_bq if last_aligned_bq is not None else DEFAULT_DEL_ANCHOR_BQ
+
                 if expected_var_type == 'I':
-                    return "OTHER_FOR_INDEL", 40
+                    return "OTHER_FOR_INDEL", del_anchor_bq
+
                 if expected_var_type == 'D':
                     if 0 <= npos < len(node_sequence) and npos + L <= len(node_sequence):
                         del_ref = node_sequence[npos: npos + L]
-                        return ("*" if del_ref == expected_ref_allele_for_indel else "OTHER_FOR_INDEL"), 40
-                    return "OTHER_FOR_INDEL", 40
-                return "*", 40
+                        return ("*" if del_ref == expected_ref_allele_for_indel else "OTHER_FOR_INDEL"), del_anchor_bq
+                    return "OTHER_FOR_INDEL", del_anchor_bq
+
+                return "*", del_anchor_bq
+
             npos += L
+
         elif op == 'S':
             rpos += L
+
         elif op == 'N':
             npos += L
+
         if npos > target_node_pos + 1 and not (expected_var_type == 'I' and (npos - 1) <= target_node_pos):
             break
+
     if expected_var_type == 'I' and saw_ins_anchor:
         return "REF_STATE_FOR_INDEL", bq_anchor
     return None, None
