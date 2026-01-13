@@ -1009,7 +1009,7 @@ def main():
             f"(wave_size={wave_size})")
 
         # Run this wave
-        max_tasks_in_flight = max(1, args.num_workers * 4)
+        max_tasks_in_flight = max(1, args.num_workers * 2)
         task_iter = iter(wave_tasks)
 
         with ProcessPoolExecutor(max_workers=args.num_workers,
