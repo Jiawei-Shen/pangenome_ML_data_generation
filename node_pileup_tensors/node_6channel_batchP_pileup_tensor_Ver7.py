@@ -28,6 +28,9 @@ def make_record_struct(R: int, C: int) -> struct.Struct:
 IDX_ENTRY_SIZE = 30
 IDX_ENTRY_PACK = struct.Struct("<I Q I I H I I")  # nid, offset, block_size, n_records, flags, R, C
 
+# NEW: drop INDELs longer than this (bp)
+MAX_INDEL_LEN = 50
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Encoding tables & tensor constants
 BASE_TO_INDEX = {'A': 20, 'C': 30, 'G': 50, 'T': 70,
@@ -150,6 +153,13 @@ def calculate_window_start(variant_pos, window_size):
     return variant_pos - (window_size // 2)
 
 def detect_variants_from_cigar(offset_on_node, cigar_ops_decoded, read_sequence, node_sequence):
+    """
+    Variant discovery with extra filters:
+      - Ignore SNVs if either ref/read base is 'N'
+      - Drop indels longer than MAX_INDEL_LEN
+      - Ignore indels if inserted/deleted sequence contains 'N'
+      - Ignore insertions if the anchor base is 'N'
+    """
     variants = []
     node_pos, read_pos = offset_on_node, 0
     node_seq_len, read_seq_len = len(node_sequence), len(read_sequence)
@@ -161,27 +171,61 @@ def detect_variants_from_cigar(offset_on_node, cigar_ops_decoded, read_sequence,
                 if npos < node_seq_len and rpos < read_seq_len:
                     nb = node_sequence[npos].upper()
                     rb = read_sequence[rpos].upper()
+
+                    # NEW: ignore SNVs involving N on either side
+                    if nb == 'N' or rb == 'N':
+                        continue
+
                     if nb != rb and op != '=':
                         variants.append((npos, 'X', rb, nb))
                 else:
                     break
             node_pos += L
             read_pos += L
+
         elif op == 'I':
+            # NEW: drop long insertions
+            if L > MAX_INDEL_LEN:
+                read_pos += L
+                continue
+
             ins = read_sequence[read_pos: read_pos + L].upper()
+
+            # NEW: ignore insertions containing N (or empty)
+            if not ins or 'N' in ins:
+                read_pos += L
+                continue
+
             ref_anchor = node_pos - 1 if node_pos > 0 else 0
-            ref_base = node_sequence[ref_anchor].upper() if 0 <= ref_anchor < node_seq_len else "*"
-            variants.append((ref_anchor, 'I', ins, ref_base))
+            anchor_base = node_sequence[ref_anchor].upper() if 0 <= ref_anchor < node_seq_len else "*"
+
+            # NEW: ignore insertions if anchor base is N
+            if anchor_base == 'N':
+                read_pos += L
+                continue
+
+            variants.append((ref_anchor, 'I', ins, anchor_base))
             read_pos += L
+
         elif op == 'D':
+            # NEW: drop long deletions
+            if L > MAX_INDEL_LEN:
+                node_pos += L
+                continue
+
             del_seq = node_sequence[node_pos: node_pos + L].upper() if node_pos + L <= node_seq_len else ""
-            if del_seq:
+
+            # NEW: ignore deletions containing N (or empty)
+            if del_seq and ('N' not in del_seq):
                 variants.append((node_pos, 'D', "*", del_seq))
+
             node_pos += L
+
         elif op == 'S':
             read_pos += L
         elif op == 'N':
             node_pos += L
+
     return variants
 
 def get_read_representation_in_window_for_view(cops, offset_on_node, read_seq,

@@ -874,7 +874,7 @@ def main():
     parser.add_argument("--variant_type", type=str, default='all', choices=['snp', 'indel', 'all'],
                         help="Which variants to output tensors for")
     parser.add_argument("--milestone", type=int, default=100000, help="The milestone to print logs")
-    parser.add_argument("--min_depth", type=int, default=30,
+    parser.add_argument("--min_depth", type=int, default=20,
                         help="Minimum locus coverage required to emit a tensor")
     args = parser.parse_args()
 
