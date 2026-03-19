@@ -35,6 +35,10 @@ import sys
 from typing import Dict, List, Set
 
 
+def log(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # I/O helpers
 
@@ -58,10 +62,11 @@ def load_index_ids(idx_path: str) -> List[str]:
     """Load node IDs from a binary .idx file, preserving file order."""
     ids: List[str] = []
     try:
+        log(f"[idx] reading: {idx_path}")
         with open(idx_path, "rb") as f:
             hdr = f.read(4)
             if len(hdr) != 4:
-                print(f"Error: Could not read blocks_num from {idx_path}.", file=sys.stderr)
+                log(f"Error: Could not read blocks_num from {idx_path}.")
                 return []
 
             (blocks_num,) = struct.unpack("<I", hdr)
@@ -72,10 +77,9 @@ def load_index_ids(idx_path: str) -> List[str]:
                 size = f.tell()
                 expected = 4 + blocks_num * IDX_ENTRY_SIZE_LATEST
                 if size != expected:
-                    print(
+                    log(
                         f"Error: IDX size mismatch for latest format: file={size}, expected={expected} "
-                        f"(count={blocks_num}, entry={IDX_ENTRY_SIZE_LATEST}) in {idx_path}.",
-                        file=sys.stderr,
+                        f"(count={blocks_num}, entry={IDX_ENTRY_SIZE_LATEST}) in {idx_path}."
                     )
                     return []
             except Exception:
@@ -85,16 +89,18 @@ def load_index_ids(idx_path: str) -> List[str]:
             for i in range(blocks_num):
                 rec = f.read(IDX_ENTRY_SIZE_LATEST)
                 if len(rec) != IDX_ENTRY_SIZE_LATEST:
-                    print(f"Error: Truncated IDX at entry {i+1} in {idx_path}.", file=sys.stderr)
+                    log(f"Error: Truncated IDX at entry {i+1} in {idx_path}.")
                     return []
                 block_id, _off, _blk_sz, _nrec, _flags, _R, _C = IDX_ENTRY_PACK_LATEST.unpack(rec)
                 ids.append(str(block_id))
 
+        log(f"[idx] done: {idx_path}  blocks={blocks_num} ids={len(ids)}")
+
     except FileNotFoundError:
-        print(f"Error: IDX file not found: {idx_path}", file=sys.stderr)
+        log(f"Error: IDX file not found: {idx_path}")
         return []
     except Exception as e:
-        print(f"Unexpected error while reading IDX file {idx_path}: {e}", file=sys.stderr)
+        log(f"Unexpected error while reading IDX file {idx_path}: {e}")
         return []
 
     return ids
@@ -110,12 +116,16 @@ def union_node_ids_from_multiple_idx(idx_paths: List[str]) -> List[str]:
     seen: Set[str] = set()
     out: List[str] = []
 
+    log(f"[idx] start loading {len(idx_paths)} idx file(s)")
     for idx_path in idx_paths:
         ids = load_index_ids(idx_path)
+        before = len(out)
         for nid in ids:
             if nid not in seen:
                 seen.add(nid)
                 out.append(nid)
+        added = len(out) - before
+        log(f"[idx] union updated: +{added} new ids, total={len(out)}")
 
     return out
 
@@ -132,6 +142,7 @@ def scan_gfa_for_sequences(gfa_path: str, wanted_ids: Set[str]) -> Dict[str, str
     if not wanted_ids:
         return seqs
 
+    log(f"[gfa] scanning: {gfa_path}  wanted_ids={len(wanted_ids)}")
     with open_maybe_gzip(gfa_path, "rt") as f:
         for line in f:
             if not line or line[0] != "S":
@@ -147,6 +158,7 @@ def scan_gfa_for_sequences(gfa_path: str, wanted_ids: Set[str]) -> Dict[str, str
                 if len(seqs) == len(wanted_ids):
                     break
 
+    log(f"[gfa] done: found_seq={len(seqs)} / {len(wanted_ids)}")
     return seqs
 
 
@@ -188,17 +200,17 @@ def main():
 
     args = ap.parse_args()
 
-    # 1) Load node IDs from idx files
+    log("[main] step 1/3: loading node IDs from idx")
     node_ids = union_node_ids_from_multiple_idx(args.idx)
     if not node_ids:
-        print("ERROR: No node IDs loaded from --idx inputs.", file=sys.stderr)
+        log("ERROR: No node IDs loaded from --idx inputs.")
         sys.exit(2)
 
-    # 2) Scan GFA once for all wanted node IDs
+    log(f"[main] step 2/3: scanning GFA for {len(node_ids)} unique node IDs")
     wanted_ids = set(node_ids)
     seqs = scan_gfa_for_sequences(args.gfa, wanted_ids)
 
-    # 3) Build output records in union order
+    log(f"[main] step 3/3: writing output JSON -> {args.out}")
     out_nodes = []
     for nid in node_ids:
         rec = {
@@ -209,15 +221,13 @@ def main():
             rec[args.chrom_key] = args.add_chrom
         out_nodes.append(rec)
 
-    # 4) Write JSON
     with open(args.out, "w", encoding="utf-8") as fo:
         json.dump(out_nodes, fo, ensure_ascii=False)
 
     found_seq = sum(1 for nid in node_ids if nid in seqs)
     missing_seq = len(node_ids) - found_seq
-    print(
-        f"[summary] total:{len(node_ids)} found_seq:{found_seq} missing_seq:{missing_seq}",
-        file=sys.stderr,
+    log(
+        f"[summary] total:{len(node_ids)} found_seq:{found_seq} missing_seq:{missing_seq}"
     )
 
 
