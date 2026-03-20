@@ -3,26 +3,35 @@
 Build a JSON list of nodes from:
   - GFA file
   - one or more binary .idx files
+  - optional input JSON containing richer node records
 
 Behavior:
   * Read node IDs from all --idx files
   * Take the UNION of node IDs, preserving first-seen order
   * Scan the GFA and collect sequence for every wanted node ID
-  * Output ONLY:
+  * If --input_json is provided and a node exists there:
+      - copy its full record
+      - remove excluded fields (default: genomead_af)
+      - if sequence is missing, fill from GFA
+      - if --add-chrom is set and chrom is missing, add it
+  * Otherwise output:
         {"node_id": "<id>", "sequence": "<seq>"}
     and, if requested:
         {"node_id": "<id>", "sequence": "<seq>", "chrom": "<chr>"}
 
 Notes:
-  * No merged JSON input is needed.
-  * No extra fields such as "genomead_af" are ever included.
   * If a node ID from idx is not found in the GFA, its sequence is set to "".
+  * input_json may be:
+      - a JSON list of node dicts
+      - a dict with key "nodes" -> list of node dicts
+  * genomead_af is excluded by default.
 
 Usage:
-  python build_nodes_from_idx_gfa_only.py \
-      --gfa graph.gfa[.gz] \
-      --idx nodes1.idx nodes2.idx \
-      --out new_nodes.json \
+  python build_nodes_from_idx_gfa_plus_json.py \
+      --gfa graph.gfa.gz \
+      --idx a.idx b.idx \
+      --input_json merged_nodes.json.gz \
+      --out out_nodes.json \
       --add-chrom chr1
 """
 
@@ -32,7 +41,7 @@ import json
 import os
 import struct
 import sys
-from typing import Dict, List, Set
+from typing import Any, Dict, List, Set
 
 
 def log(msg: str) -> None:
@@ -47,11 +56,50 @@ def open_maybe_gzip(path: str, mode: str = "rt"):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Input JSON loader
+
+def load_input_json_map(path: str, id_key: str = "node_id") -> Dict[str, Dict[str, Any]]:
+    """
+    Accept:
+      - a JSON list of node dicts
+      - a dict with key "nodes" -> list of node dicts
+
+    Return:
+      { str(node_id): node_record_dict }
+    """
+    log(f"[json] loading input_json: {path}")
+    with open_maybe_gzip(path, "rt") as f:
+        data = json.load(f)
+
+    if isinstance(data, dict):
+        nodes = data.get("nodes")
+    else:
+        nodes = data
+
+    if not isinstance(nodes, list):
+        raise ValueError("input_json must be a list of node dicts or a dict with key 'nodes'.")
+
+    out: Dict[str, Dict[str, Any]] = {}
+    skipped = 0
+    for rec in nodes:
+        if not isinstance(rec, dict):
+            skipped += 1
+            continue
+        if id_key not in rec:
+            skipped += 1
+            continue
+        out[str(rec[id_key])] = rec
+
+    log(f"[json] loaded records={len(out)} skipped={skipped}")
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # IDX loader
 #
 # Latest .idx entry (30B): <I Q I I H I I>
 #   nid, offset, block_size, n_records, flags, R, C
-# We only need nid, but we parse strictly and preserve file order.
+# We only need nid, but parse strictly and preserve file order.
 # ─────────────────────────────────────────────────────────────────────────────
 
 IDX_ENTRY_PACK_LATEST = struct.Struct("<I Q I I H I I")
@@ -71,7 +119,6 @@ def load_index_ids(idx_path: str) -> List[str]:
 
             (blocks_num,) = struct.unpack("<I", hdr)
 
-            # Strict size check
             try:
                 f.seek(0, os.SEEK_END)
                 size = f.tell()
@@ -108,10 +155,7 @@ def load_index_ids(idx_path: str) -> List[str]:
 
 def union_node_ids_from_multiple_idx(idx_paths: List[str]) -> List[str]:
     """
-    Union node IDs across multiple idx files, preserving first-seen order:
-      - iterate idx_paths in given order
-      - within each idx, preserve file order
-      - keep only first occurrence of each node ID
+    Union node IDs across multiple idx files, preserving first-seen order.
     """
     seen: Set[str] = set()
     out: List[str] = []
@@ -163,11 +207,66 @@ def scan_gfa_for_sequences(gfa_path: str, wanted_ids: Set[str]) -> Dict[str, str
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Record builder helpers
+
+def normalize_exclude_fields(raw_fields: List[str]) -> Set[str]:
+    return {x.strip() for x in raw_fields if x and x.strip()}
+
+
+def build_record(
+    nid: str,
+    seqs: Dict[str, str],
+    input_map: Dict[str, Dict[str, Any]],
+    id_key: str,
+    seq_key: str,
+    chrom_key: str,
+    add_chrom: str,
+    exclude_fields: Set[str],
+) -> Dict[str, Any]:
+    """
+    Build one output record.
+    """
+    gfa_seq = seqs.get(nid, "")
+
+    if nid in input_map:
+        # copy full record
+        src = input_map[nid]
+        rec = dict(src)
+
+        # remove excluded fields exactly by key name
+        for k in list(rec.keys()):
+            if k in exclude_fields:
+                rec.pop(k, None)
+
+        # ensure node_id key exists and matches requested output key
+        rec[id_key] = nid
+
+        # fill sequence if missing / null / empty
+        if seq_key not in rec or rec[seq_key] is None or rec[seq_key] == "":
+            rec[seq_key] = gfa_seq
+
+        # optionally add chrom if missing
+        if add_chrom is not None and chrom_key not in rec:
+            rec[chrom_key] = add_chrom
+
+        return rec
+
+    # fallback: GFA-only record
+    rec = {
+        id_key: nid,
+        seq_key: gfa_seq,
+    }
+    if add_chrom is not None:
+        rec[chrom_key] = add_chrom
+    return rec
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Build JSON node records from GFA using node IDs loaded from one or more .idx files."
+        description="Build JSON node records from GFA using node IDs loaded from one or more .idx files, optionally enriching from input_json."
     )
     ap.add_argument("--gfa", required=True, help="Input GFA file (.gfa or .gfa.gz)")
     ap.add_argument(
@@ -176,11 +275,16 @@ def main():
         nargs="+",
         help="One or more binary .idx files; node IDs are unioned in first-seen order",
     )
+    ap.add_argument(
+        "--input_json",
+        default=None,
+        help="Optional JSON/JSON.gz with richer node records (list or dict with 'nodes')",
+    )
     ap.add_argument("--out", required=True, help="Output JSON file")
     ap.add_argument(
         "--add-chrom",
         default=None,
-        help='If set (e.g. "chr1"), add {"chrom": "..."} to every output record',
+        help='If set (e.g. "chr1"), add {"chrom": "..."} to output records only when missing',
     )
     ap.add_argument(
         "--id-key",
@@ -197,37 +301,71 @@ def main():
         default="chrom",
         help='Output chrom key name when --add-chrom is used (default: "chrom")',
     )
+    ap.add_argument(
+        "--exclude-fields",
+        nargs="*",
+        default=["genomead_af"],
+        help='Fields to remove from copied input_json records (default: genomead_af)',
+    )
+    ap.add_argument(
+        "--indent",
+        type=int,
+        default=None,
+        help="Optional JSON indent for pretty output",
+    )
 
     args = ap.parse_args()
 
-    log("[main] step 1/3: loading node IDs from idx")
+    exclude_fields = normalize_exclude_fields(args.exclude_fields)
+
+    log("[main] step 1/4: loading node IDs from idx")
     node_ids = union_node_ids_from_multiple_idx(args.idx)
     if not node_ids:
         log("ERROR: No node IDs loaded from --idx inputs.")
         sys.exit(2)
 
-    log(f"[main] step 2/3: scanning GFA for {len(node_ids)} unique node IDs")
+    input_map: Dict[str, Dict[str, Any]] = {}
+    if args.input_json:
+        log("[main] step 2/4: loading input_json")
+        input_map = load_input_json_map(args.input_json, id_key=args.id_key)
+    else:
+        log("[main] step 2/4: no input_json provided; will build records from GFA only")
+
+    log(f"[main] step 3/4: scanning GFA for {len(node_ids)} unique node IDs")
     wanted_ids = set(node_ids)
     seqs = scan_gfa_for_sequences(args.gfa, wanted_ids)
 
-    log(f"[main] step 3/3: writing output JSON -> {args.out}")
-    out_nodes = []
+    log(f"[main] step 4/4: writing output JSON -> {args.out}")
+    out_nodes: List[Dict[str, Any]] = []
+    copied_from_input = 0
+    built_from_gfa_only = 0
+
     for nid in node_ids:
-        rec = {
-            args.id_key: nid,
-            args.seq_key: seqs.get(nid, ""),
-        }
-        if args.add_chrom is not None:
-            rec[args.chrom_key] = args.add_chrom
+        if nid in input_map:
+            copied_from_input += 1
+        else:
+            built_from_gfa_only += 1
+
+        rec = build_record(
+            nid=nid,
+            seqs=seqs,
+            input_map=input_map,
+            id_key=args.id_key,
+            seq_key=args.seq_key,
+            chrom_key=args.chrom_key,
+            add_chrom=args.add_chrom,
+            exclude_fields=exclude_fields,
+        )
         out_nodes.append(rec)
 
     with open(args.out, "w", encoding="utf-8") as fo:
-        json.dump(out_nodes, fo, ensure_ascii=False)
+        json.dump(out_nodes, fo, ensure_ascii=False, indent=args.indent)
 
     found_seq = sum(1 for nid in node_ids if nid in seqs)
     missing_seq = len(node_ids) - found_seq
     log(
-        f"[summary] total:{len(node_ids)} found_seq:{found_seq} missing_seq:{missing_seq}"
+        f"[summary] total:{len(node_ids)} copied_from_input:{copied_from_input} "
+        f"built_from_gfa_only:{built_from_gfa_only} found_seq:{found_seq} missing_seq:{missing_seq}"
     )
 
 
