@@ -2,10 +2,6 @@
 """
 Find where an assembly query position maps in an assembly-vs-reference BAM.
 
-Fixes the previous bug by mapping the query position to reference position
-using the exact aligned-pairs coordinates within the alignment, while correctly
-handling leading soft/hard clipping.
-
 Outputs for each matching alignment:
 1. local query sequence context around the target position
 2. the covering CIGAR fragment
@@ -98,8 +94,8 @@ def aligned_query_span_1based(rec: pysam.AlignedSegment) -> Optional[Tuple[int, 
 def get_query_sequence_offset(rec: pysam.AlignedSegment) -> int:
     """
     rec.query_sequence contains soft-clipped sequence but not hard-clipped sequence.
-    Return the number of left-side query coordinates that are absent from rec.query_sequence.
-    That is exactly the leading hard clipping count.
+    Return the number of left-side query coordinates absent from rec.query_sequence,
+    i.e. the leading hard clipping count.
     """
     cigartuples = rec.cigartuples
     if not cigartuples:
@@ -120,13 +116,20 @@ def get_query_context(
 ) -> Tuple[str, str, str]:
     """
     Return previous context, target base, next context from rec.query_sequence.
+
+    IMPORTANT:
+    The user's query position convention here behaves as if it points to the boundary
+    just before the target base in rec.query_sequence, so we shift forward by 1 bp
+    relative to the previous implementation.
     """
     seq = rec.query_sequence
     if seq is None:
         return ("", "", "")
 
     hard_offset = get_query_sequence_offset(rec)
-    seq_pos_1based = query_pos_1based - hard_offset
+
+    # Shift forward by 1 bp to match the observed expected base.
+    seq_pos_1based = query_pos_1based - hard_offset + 1
 
     if seq_pos_1based < 1 or seq_pos_1based > len(seq):
         return ("", "", "")
@@ -209,14 +212,12 @@ def query_pos_to_ref_pos(
     query_pos_1based: int,
 ) -> Optional[Tuple[str, int]]:
     """
-    Correctly map a global 1-based query position to a global 1-based reference position.
+    Map a global 1-based query position to a global 1-based reference position.
 
-    pysam aligned pairs uses query positions relative to rec.query_sequence
-    (which excludes hard-clipped bases but includes soft-clipped bases).
-    So we must subtract only the hard-clipped offset.
+    Shift forward by 1 bp to match the corrected query base convention.
     """
     hard_offset = get_query_sequence_offset(rec)
-    local_query_pos_1based = query_pos_1based - hard_offset
+    local_query_pos_1based = query_pos_1based - hard_offset + 1
     if local_query_pos_1based < 1:
         return None
 
@@ -298,11 +299,12 @@ def print_alignment_report(
         if left_anchor >= 1:
             print(f"insertion_anchor_reference\t{rec.reference_name}:{left_anchor}")
             print(f"insertion_anchor_between\t{rec.reference_name}:{left_anchor}|{rec.reference_name}:{right_anchor}")
+            print(f"query_pos_corresponding_hg38_position\t{rec.reference_name}:{left_anchor} (insertion anchor)")
         else:
             print("insertion_anchor_reference\tREFERENCE_START_BEFORE_1")
             print("insertion_anchor_between\tUNKNOWN")
+            print("query_pos_corresponding_hg38_position\tUNALIGNED_OR_INSERTION")
         print("mapped_reference_pos\tUNALIGNED_OR_INSERTION")
-        print(f"query_pos_corresponding_hg38_position\t{rec.reference_name}:{left_anchor} (insertion anchor)")
     else:
         if mapped is None:
             print("mapped_reference_pos\tUNALIGNED_OR_INSERTION")
