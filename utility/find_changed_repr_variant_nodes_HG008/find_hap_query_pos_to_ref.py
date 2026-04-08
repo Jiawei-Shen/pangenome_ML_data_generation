@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 """
-Find where an assembly query position maps in a BAM alignment, with extra context.
+Find where an assembly query position maps in an assembly-vs-reference BAM.
+
+Fixes the previous bug by mapping the query position to reference position
+using the exact aligned-pairs coordinates within the alignment, while correctly
+handling leading soft/hard clipping.
 
 Outputs for each matching alignment:
-1. the local query sequence context around the target position
-2. the local CIGAR fragment around the target position, plus the previous 20 bp of query context
-3. if the target falls inside an insertion/query-only segment, report the insertion anchor position on the reference
-4. the sequence at the target position (single base by default)
-
-Designed for assembly-to-reference BAMs like dipcall hap1/hap2 BAMs.
+1. local query sequence context around the target position
+2. the covering CIGAR fragment
+3. if the target is inside an insertion, the insertion anchor on the reference
+4. the target base
+5. the final hg38/reference position corresponding to the query position
 
 Example:
-    python find_hap_query_pos_to_ref_context.py \
+    python find_hap_query_pos_to_ref.py \
         --bam HG008N_curatedv6_250714_polished6.2.hap1.bam \
         --query-name chr1_hap1 \
         --query-pos 1195496
 """
 
 import argparse
+from typing import List, Optional, Tuple, Dict, Any
+
 import pysam
-from typing import List, Optional, Tuple
 
 
 # BAM CIGAR op codes
@@ -55,21 +59,21 @@ def parse_args() -> argparse.Namespace:
         "--context-bp",
         type=int,
         default=20,
-        help="Number of query bases to show before the target position (default: 20)",
+        help="Number of query bases to show before/after target (default: 20)",
     )
     return parser.parse_args()
 
 
 def leading_clipped_bases(cigartuples: Optional[List[Tuple[int, int]]]) -> int:
     """
-    Return total leading clipped bases on query from the left side.
-    Includes leading H and/or S if present in order.
+    Total leading clipped query bases from the left side.
+    Includes both H and S if present.
     """
     if not cigartuples:
         return 0
 
-    idx = 0
     total = 0
+    idx = 0
     while idx < len(cigartuples) and cigartuples[idx][0] in (CIGAR_H, CIGAR_S):
         total += cigartuples[idx][1]
         idx += 1
@@ -78,9 +82,8 @@ def leading_clipped_bases(cigartuples: Optional[List[Tuple[int, int]]]) -> int:
 
 def aligned_query_span_1based(rec: pysam.AlignedSegment) -> Optional[Tuple[int, int]]:
     """
-    Return the 1-based inclusive query span that is actually represented by this alignment record.
-    Leading hard/soft clipping shifts the query start.
-    Only aligned/query-consuming ops count toward the aligned span: M, I, =, X.
+    Return 1-based inclusive query span actually represented by aligned/query-consuming ops
+    in this alignment record.
     """
     cigartuples = rec.cigartuples
     if cigartuples is None:
@@ -92,18 +95,52 @@ def aligned_query_span_1based(rec: pysam.AlignedSegment) -> Optional[Tuple[int, 
     return qstart, qend
 
 
-def build_op_intervals(
-    rec: pysam.AlignedSegment,
-) -> List[dict]:
+def get_query_sequence_offset(rec: pysam.AlignedSegment) -> int:
     """
-    Walk through the CIGAR and build per-op intervals on query/reference.
+    rec.query_sequence contains soft-clipped sequence but not hard-clipped sequence.
+    Return the number of left-side query coordinates that are absent from rec.query_sequence.
+    That is exactly the leading hard clipping count.
+    """
+    cigartuples = rec.cigartuples
+    if not cigartuples:
+        return 0
 
-    Returns a list of dicts, each containing:
-      - op, op_char, length
-      - query_start, query_end (1-based, inclusive) if query-consuming else None
-      - ref_start, ref_end (1-based, inclusive) if ref-consuming else None
-      - insertion_anchor_ref (1-based reference anchor position for I, else None)
-      - insertion_anchor_between (tuple(left_anchor, right_anchor_or_None)) for I, else None
+    total_hard = 0
+    idx = 0
+    while idx < len(cigartuples) and cigartuples[idx][0] == CIGAR_H:
+        total_hard += cigartuples[idx][1]
+        idx += 1
+    return total_hard
+
+
+def get_query_context(
+    rec: pysam.AlignedSegment,
+    query_pos_1based: int,
+    context_bp: int,
+) -> Tuple[str, str, str]:
+    """
+    Return previous context, target base, next context from rec.query_sequence.
+    """
+    seq = rec.query_sequence
+    if seq is None:
+        return ("", "", "")
+
+    hard_offset = get_query_sequence_offset(rec)
+    seq_pos_1based = query_pos_1based - hard_offset
+
+    if seq_pos_1based < 1 or seq_pos_1based > len(seq):
+        return ("", "", "")
+
+    idx0 = seq_pos_1based - 1
+    prev_seq = seq[max(0, idx0 - context_bp): idx0]
+    target_base = seq[idx0]
+    next_seq = seq[idx0 + 1: idx0 + 1 + context_bp]
+    return (prev_seq, target_base, next_seq)
+
+
+def build_op_intervals(rec: pysam.AlignedSegment) -> List[Dict[str, Any]]:
+    """
+    Build query/reference intervals for each CIGAR op.
     """
     cigartuples = rec.cigartuples
     if cigartuples is None:
@@ -111,9 +148,9 @@ def build_op_intervals(
 
     ref_name = rec.reference_name
     ref_pos = rec.reference_start + 1  # 1-based
-    q_pos = leading_clipped_bases(cigartuples) + 1  # first aligned query position (1-based)
+    q_pos = leading_clipped_bases(cigartuples) + 1  # first aligned query coordinate
 
-    intervals = []
+    intervals: List[Dict[str, Any]] = []
 
     for op, length in cigartuples:
         op_char = CIGAR_CODE_TO_CHAR.get(op, "?")
@@ -158,11 +195,7 @@ def build_op_intervals(
     return intervals
 
 
-def find_target_interval(intervals: List[dict], query_pos_1based: int) -> Optional[dict]:
-    """
-    Return the CIGAR interval containing the query position.
-    Only intervals with query coverage are considered.
-    """
+def find_target_interval(intervals: List[Dict[str, Any]], query_pos_1based: int) -> Optional[Dict[str, Any]]:
     for item in intervals:
         q_start = item["query_start"]
         q_end = item["query_end"]
@@ -171,64 +204,33 @@ def find_target_interval(intervals: List[dict], query_pos_1based: int) -> Option
     return None
 
 
-def query_pos_to_ref_pos(rec: pysam.AlignedSegment, query_pos_1based: int) -> Optional[Tuple[str, int]]:
+def query_pos_to_ref_pos(
+    rec: pysam.AlignedSegment,
+    query_pos_1based: int,
+) -> Optional[Tuple[str, int]]:
     """
-    Map a single 1-based query position to a single 1-based reference position.
-    Returns None if the query base is query-only (e.g. insertion/softclip).
+    Correctly map a global 1-based query position to a global 1-based reference position.
+
+    pysam aligned pairs uses query positions relative to rec.query_sequence
+    (which excludes hard-clipped bases but includes soft-clipped bases).
+    So we must subtract only the hard-clipped offset.
     """
+    hard_offset = get_query_sequence_offset(rec)
+    local_query_pos_1based = query_pos_1based - hard_offset
+    if local_query_pos_1based < 1:
+        return None
+
+    target_qpos0 = local_query_pos_1based - 1
+
     for qpos0, rpos0 in rec.get_aligned_pairs(matches_only=False):
-        if qpos0 is not None and (qpos0 + 1) == query_pos_1based:
+        if qpos0 is not None and qpos0 == target_qpos0:
             if rpos0 is None:
                 return None
             return rec.reference_name, rpos0 + 1
     return None
 
 
-def get_query_context(
-    rec: pysam.AlignedSegment,
-    query_pos_1based: int,
-    context_bp: int,
-) -> Tuple[str, str, str]:
-    """
-    Return:
-      - previous up-to-context_bp query bases
-      - target base
-      - next up-to-context_bp query bases
-    Query positions are interpreted on the full query sequence represented by the BAM record:
-    aligned query bases plus leading soft clips if present.
-    Hard-clipped bases are not present in query_sequence and cannot be recovered.
-    """
-    seq = rec.query_sequence
-    cigartuples = rec.cigartuples
-    if seq is None or cigartuples is None:
-        return ("", "", "")
-
-    left_soft = 0
-    idx = 0
-    while idx < len(cigartuples) and cigartuples[idx][0] == CIGAR_H:
-        idx += 1
-    if idx < len(cigartuples) and cigartuples[idx][0] == CIGAR_S:
-        left_soft = cigartuples[idx][1]
-
-    # rec.query_sequence includes soft-clipped sequence but not hard-clipped sequence.
-    # So query coordinate inside rec.query_sequence starts at 1 + leading_soft.
-    seq_pos_1based = query_pos_1based - leading_clipped_bases(cigartuples) + left_soft
-
-    if seq_pos_1based < 1 or seq_pos_1based > len(seq):
-        return ("", "", "")
-
-    target_idx0 = seq_pos_1based - 1
-    prev_seq = seq[max(0, target_idx0 - context_bp): target_idx0]
-    target_base = seq[target_idx0]
-    next_seq = seq[target_idx0 + 1: target_idx0 + 1 + context_bp]
-    return (prev_seq, target_base, next_seq)
-
-
-def format_local_cigar_fragment(target_item: dict) -> str:
-    """
-    For the target position, return the specific covering CIGAR fragment only.
-    Example: 70I or 105M
-    """
+def format_local_cigar_fragment(target_item: Dict[str, Any]) -> str:
     return f"{target_item['length']}{target_item['op_char']}"
 
 
@@ -285,32 +287,30 @@ def print_alignment_report(
     if qspan is not None:
         print(f"query_span_1based\t{qspan[0]}-{qspan[1]}")
 
-    # 1. local context and corresponding CIGAR fragment
     print(f"target_query_pos_1based\t{query_pos_1based}")
     print(f"prev_{context_bp}bp_query_seq\t{prev_seq if prev_seq else '.'}")
     print(f"target_base_or_bp\t{target_base if target_base else '.'}")
     print(f"next_{context_bp}bp_query_seq\t{next_seq if next_seq else '.'}")
     print(f"covering_cigar_fragment\t{format_local_cigar_fragment(target_item)}")
 
-    # 2. if insertion, output insertion anchor position
     if target_item["op"] == CIGAR_I:
         left_anchor, right_anchor = target_item["insertion_anchor_between"]
         if left_anchor >= 1:
             print(f"insertion_anchor_reference\t{rec.reference_name}:{left_anchor}")
-        else:
-            print("insertion_anchor_reference\tREFERENCE_START_BEFORE_1")
-        if right_anchor is not None:
             print(f"insertion_anchor_between\t{rec.reference_name}:{left_anchor}|{rec.reference_name}:{right_anchor}")
         else:
+            print("insertion_anchor_reference\tREFERENCE_START_BEFORE_1")
             print("insertion_anchor_between\tUNKNOWN")
         print("mapped_reference_pos\tUNALIGNED_OR_INSERTION")
+        print(f"query_pos_corresponding_hg38_position\t{rec.reference_name}:{left_anchor} (insertion anchor)")
     else:
         if mapped is None:
             print("mapped_reference_pos\tUNALIGNED_OR_INSERTION")
+            print("query_pos_corresponding_hg38_position\tUNALIGNED_OR_INSERTION")
         else:
             print(f"mapped_reference_pos\t{mapped[0]}:{mapped[1]}")
+            print(f"query_pos_corresponding_hg38_position\t{mapped[0]}:{mapped[1]}")
 
-    # extra useful fields
     print(f"target_cigar_op\t{target_item['op_char']}")
     print(f"target_cigar_query_span\t{target_item['query_start']}-{target_item['query_end']}")
     if target_item["ref_start"] is not None and target_item["ref_end"] is not None:
