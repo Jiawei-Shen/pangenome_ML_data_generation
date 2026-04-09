@@ -1,97 +1,72 @@
 #!/usr/bin/env python3
 """
-Validate/project changed-representation variants against hap1/hap2 BAMs and optionally
-collect graph nodes around the GRCh38 position.
+Check all records in a changed-representation TSV efficiently.
 
-What it does for each TSV row:
-1. Parse FULL_ANNOTATION, e.g. chr1_hap1:1195496-C-CA
-2. Use the appropriate BAM (hap1 or hap2) to map the assembly query position to GRCh38
-   - returns exact mapped base position when available
-   - returns insertion anchor when the query base falls in an insertion/query-only segment
-3. Compare the mapped/anchored reference position to the TSV #CHROM/POS
-4. Optionally query graph nodes around the TSV GRCh38 position with vg find
+Features:
+- no pandas dependency
+- handles hap1 / hap2
+- handles multiple chromosomes
+- scans each BAM only once
+- maps assembly positions to hg38 positions from BAM
+- optional graph node lookup from XG using vg + jq
+- writes a full TSV and a summary JSON
 
-Designed to be efficient:
-- BAM is scanned only once per hap file
-- assembly positions are grouped by query contig
-- aligned-pair maps are built only for alignments that overlap requested positions
-- graph queries are deduplicated by unique (chrom, pos, flank)
+Input TSV expected columns include at least:
+#CHROM, POS, REF, ALT, FULL_ANNOTATION
 
-Example:
-python check_changed_repr_variants.py \
-  --tsv /mnt/data/changed_representation_variants.tsv \
-  --hap1-bam /scratch/jshen/tmp/rebuild_hprc_d9_plus_HG008N_curatedv6_250714_polished6.2_vg1660_268142/HG008N_curatedv6_250714_polished6.2.hap1.bam \
-  --hap2-bam /scratch/jshen/tmp/rebuild_hprc_d9_plus_HG008N_curatedv6_250714_polished6.2_vg1660_268142/HG008N_curatedv6_250714_polished6.2.hap2.bam \
-  --xg /scratch/jshen/data/HG008_GIAB/indexes_HG008N_curatedv6_250714_polished6.2_rebuild_hprc_d9_vg1660/hprc-v1.1-mc-grch38.d9.plus_HG008N_curatedv6_250714_polished6_2.xg \
-  --out-prefix /scratch/jshen/tmp/changed_repr_check \
-  --graph-flank 2 \
-  --workers 8
+Example FULL_ANNOTATION:
+    chr1_hap1:1195496-C-CA
+    chr7_hap2:12345-AT-A
+
+Usage:
+python check_changed_repr_variants_nopandas.py \
+  --tsv changed_representation_variants.tsv \
+  --hap1-bam HG008N_curatedv6_250714_polished6.2.hap1.bam \
+  --hap2-bam HG008N_curatedv6_250714_polished6.2.hap2.bam \
+  --xg /path/to/graph.xg \
+  --out-prefix changed_repr_check \
+  --graph-flank 2
 """
 
-from __future__ import annotations
-
 import argparse
-import concurrent.futures as cf
+import csv
 import json
 import re
 import subprocess
-from bisect import bisect_left
-from collections import defaultdict
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+import sys
+from collections import Counter, defaultdict
+from typing import Any, Dict, List, Optional, Tuple
 
-import pandas as pd
 import pysam
 
-# CIGAR op codes
+
+# BAM CIGAR op codes
 CIGAR_M = 0
 CIGAR_I = 1
 CIGAR_D = 2
 CIGAR_N = 3
 CIGAR_S = 4
 CIGAR_H = 5
+CIGAR_P = 6
 CIGAR_EQ = 7
 CIGAR_X = 8
 
-FULL_ANNOT_RE = re.compile(r"^(?P<contig>[^:]+):(?P<pos>\d+)-(?P<asm_ref>[^-]+)-(?P<asm_alt>.+)$")
+CIGAR_CODE_TO_CHAR = {
+    CIGAR_M: "M",
+    CIGAR_I: "I",
+    CIGAR_D: "D",
+    CIGAR_N: "N",
+    CIGAR_S: "S",
+    CIGAR_H: "H",
+    CIGAR_P: "P",
+    CIGAR_EQ: "=",
+    CIGAR_X: "X",
+}
 
 
-@dataclass(frozen=True)
-class QuerySite:
-    row_idx: int
-    qname: str
-    qpos: int
-    hap: str
-    chrom: str
-    pos: int
-    ref: str
-    alt: str
-    full_annotation: str
-
-
-@dataclass
-class SiteResult:
-    row_idx: int
-    qname: str
-    qpos: int
-    hap: str
-    graph_chrom: str
-    graph_pos: int
-    mapped_ref_chrom: Optional[str]
-    mapped_ref_pos: Optional[int]
-    map_kind: str  # exact_match / insertion_anchor / not_found / off_target
-    insertion_left_anchor: Optional[int]
-    insertion_right_anchor: Optional[int]
-    query_base: Optional[str]
-    query_context_left_20bp: Optional[str]
-    query_context_right_20bp: Optional[str]
-    covering_cigar_fragment: Optional[str]
-    covering_cigar_op: Optional[str]
-    covering_qspan_start: Optional[int]
-    covering_qspan_end: Optional[int]
-    covering_rspan_start: Optional[int]
-    covering_rspan_end: Optional[int]
+FULL_ANNOT_RE = re.compile(
+    r'^(?P<contig>[^:]+):(?P<pos>\d+)-(?P<asm_ref>[^-]+)-(?P<asm_alt>.+)$'
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -99,82 +74,71 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tsv", required=True)
     p.add_argument("--hap1-bam", required=True)
     p.add_argument("--hap2-bam", required=True)
-    p.add_argument("--xg", default=None, help="Optional .xg for graph node lookup")
+    p.add_argument("--xg", default=None)
     p.add_argument("--out-prefix", required=True)
-    p.add_argument("--graph-flank", type=int, default=0)
+    p.add_argument("--graph-flank", type=int, default=2)
     p.add_argument("--context-bp", type=int, default=20)
-    p.add_argument("--workers", type=int, default=4)
     return p.parse_args()
 
 
-def parse_full_annotation(value: str) -> Tuple[str, int, str, str, str]:
-    m = FULL_ANNOT_RE.match(value)
-    if not m:
-        raise ValueError(f"Could not parse FULL_ANNOTATION: {value}")
-    qname = m.group("contig")
-    qpos = int(m.group("pos"))
-    asm_ref = m.group("asm_ref")
-    asm_alt = m.group("asm_alt")
-    if qname.endswith("_hap1"):
-        hap = "hap1"
-    elif qname.endswith("_hap2"):
-        hap = "hap2"
-    else:
-        raise ValueError(f"FULL_ANNOTATION contig does not end with _hap1/_hap2: {value}")
-    return qname, qpos, asm_ref, asm_alt, hap
-
-
-def load_sites(tsv_path: str) -> Tuple[pd.DataFrame, List[QuerySite]]:
-    df = pd.read_csv(tsv_path, sep="\t", dtype={"#CHROM": str, "REF": str, "ALT": str, "FULL_ANNOTATION": str})
-    sites: List[QuerySite] = []
-    for idx, row in df.iterrows():
-        qname, qpos, _asm_ref, _asm_alt, hap = parse_full_annotation(row["FULL_ANNOTATION"])
-        sites.append(
-            QuerySite(
-                row_idx=int(idx),
-                qname=qname,
-                qpos=qpos,
-                hap=hap,
-                chrom=str(row["#CHROM"]),
-                pos=int(row["POS"]),
-                ref=str(row["REF"]),
-                alt=str(row["ALT"]),
-                full_annotation=str(row["FULL_ANNOTATION"]),
-            )
-        )
-    return df, sites
-
-
-def leading_hard_clipped_bases(cigartuples: Optional[List[Tuple[int, int]]]) -> int:
+def leading_clipped_bases(cigartuples: Optional[List[Tuple[int, int]]]) -> int:
     if not cigartuples:
         return 0
-    i = 0
     total = 0
-    while i < len(cigartuples) and cigartuples[i][0] == CIGAR_H:
-        total += cigartuples[i][1]
-        i += 1
-    return total
-
-
-def leading_total_clipped_bases(cigartuples: Optional[List[Tuple[int, int]]]) -> int:
-    if not cigartuples:
-        return 0
     i = 0
-    total = 0
     while i < len(cigartuples) and cigartuples[i][0] in (CIGAR_H, CIGAR_S):
         total += cigartuples[i][1]
         i += 1
     return total
 
 
-def aligned_query_span(rec: pysam.AlignedSegment) -> Optional[Tuple[int, int]]:
-    if rec.cigartuples is None:
+def leading_hard_clipped_bases(cigartuples: Optional[List[Tuple[int, int]]]) -> int:
+    if not cigartuples:
+        return 0
+    total = 0
+    i = 0
+    while i < len(cigartuples) and cigartuples[i][0] == CIGAR_H:
+        total += cigartuples[i][1]
+        i += 1
+    return total
+
+
+def aligned_query_span_1based(rec: pysam.AlignedSegment) -> Optional[Tuple[int, int]]:
+    cigartuples = rec.cigartuples
+    if cigartuples is None:
         return None
-    qstart = leading_total_clipped_bases(rec.cigartuples) + 1
-    qlen = sum(length for op, length in rec.cigartuples if op in (CIGAR_M, CIGAR_I, CIGAR_EQ, CIGAR_X))
-    if qlen <= 0:
-        return None
-    return qstart, qstart + qlen - 1
+    qstart = leading_clipped_bases(cigartuples) + 1
+    q_aligned_len = sum(length for op, length in cigartuples if op in (CIGAR_M, CIGAR_I, CIGAR_EQ, CIGAR_X))
+    qend = qstart + q_aligned_len - 1
+    return qstart, qend
+
+
+def get_query_sequence_offset(rec: pysam.AlignedSegment) -> int:
+    return leading_hard_clipped_bases(rec.cigartuples)
+
+
+def get_query_context(
+    rec: pysam.AlignedSegment,
+    query_pos_1based: int,
+    context_bp: int,
+) -> Tuple[str, str, str]:
+    seq = rec.query_sequence
+    if seq is None:
+        return ("", "", "")
+
+    hard_offset = get_query_sequence_offset(rec)
+
+    # keep the user's corrected convention: shift +1
+    seq_pos_1based = query_pos_1based - hard_offset + 1
+
+    if seq_pos_1based < 1 or seq_pos_1based > len(seq):
+        return ("", "", "")
+
+    idx0 = seq_pos_1based - 1
+    prev_seq = seq[max(0, idx0 - context_bp): idx0]
+    target_base = seq[idx0]
+    next_seq = seq[idx0 + 1: idx0 + 1 + context_bp]
+    return (prev_seq, target_base, next_seq)
 
 
 def build_op_intervals(rec: pysam.AlignedSegment) -> List[Dict[str, Any]]:
@@ -183,289 +147,384 @@ def build_op_intervals(rec: pysam.AlignedSegment) -> List[Dict[str, Any]]:
         return []
 
     ref_name = rec.reference_name
-    ref_pos = rec.reference_start + 1  # 1-based
-    q_pos = leading_total_clipped_bases(cigartuples) + 1
-    items: List[Dict[str, Any]] = []
+    ref_pos = rec.reference_start + 1
+    q_pos = leading_clipped_bases(cigartuples) + 1
 
+    intervals = []
     for op, length in cigartuples:
-        q_consume = op in (CIGAR_M, CIGAR_I, CIGAR_S, CIGAR_EQ, CIGAR_X)
-        r_consume = op in (CIGAR_M, CIGAR_D, CIGAR_N, CIGAR_EQ, CIGAR_X)
-        op_char = {0: "M", 1: "I", 2: "D", 3: "N", 4: "S", 5: "H", 7: "=", 8: "X"}.get(op, "?")
+        op_char = CIGAR_CODE_TO_CHAR.get(op, "?")
 
-        q_start = q_pos if q_consume and op != CIGAR_S else None
-        q_end = q_pos + length - 1 if q_consume and op != CIGAR_S else None
-        r_start = ref_pos if r_consume else None
-        r_end = ref_pos + length - 1 if r_consume else None
+        query_consuming = op in (CIGAR_M, CIGAR_I, CIGAR_S, CIGAR_EQ, CIGAR_X)
+        ref_consuming = op in (CIGAR_M, CIGAR_D, CIGAR_N, CIGAR_EQ, CIGAR_X)
 
-        left_anchor = right_anchor = None
+        q_start = q_pos if query_consuming and op != CIGAR_S else None
+        q_end = (q_pos + length - 1) if query_consuming and op != CIGAR_S else None
+
+        r_start = ref_pos if ref_consuming else None
+        r_end = (ref_pos + length - 1) if ref_consuming else None
+
+        insertion_anchor_ref = None
+        insertion_anchor_between = None
         if op == CIGAR_I:
             left_anchor = ref_pos - 1
             right_anchor = ref_pos
+            insertion_anchor_ref = left_anchor
+            insertion_anchor_between = (left_anchor, right_anchor)
 
-        items.append(
-            {
-                "op": op,
-                "op_char": op_char,
-                "length": length,
-                "query_start": q_start,
-                "query_end": q_end,
-                "ref_start": r_start,
-                "ref_end": r_end,
-                "ref_name": ref_name,
-                "left_anchor": left_anchor,
-                "right_anchor": right_anchor,
-            }
-        )
+        intervals.append({
+            "op": op,
+            "op_char": op_char,
+            "length": length,
+            "query_start": q_start,
+            "query_end": q_end,
+            "ref_start": r_start,
+            "ref_end": r_end,
+            "insertion_anchor_ref": insertion_anchor_ref,
+            "insertion_anchor_between": insertion_anchor_between,
+            "ref_name": ref_name,
+        })
 
-        if q_consume:
+        if query_consuming:
             q_pos += length
-        if r_consume:
+        if ref_consuming:
             ref_pos += length
 
-    return items
+    return intervals
 
 
-def find_covering_interval(items: List[Dict[str, Any]], qpos: int) -> Optional[Dict[str, Any]]:
-    for item in items:
-        qs = item["query_start"]
-        qe = item["query_end"]
-        if qs is not None and qe is not None and qs <= qpos <= qe:
-            return item
+def find_target_interval(intervals: List[Dict[str, Any]], query_pos_1based: int) -> Optional[Dict[str, Any]]:
+    for it in intervals:
+        qs = it["query_start"]
+        qe = it["query_end"]
+        if qs is not None and qe is not None and qs <= query_pos_1based <= qe:
+            return it
     return None
 
 
-def query_context_from_record(rec: pysam.AlignedSegment, qpos: int, context_bp: int) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    seq = rec.query_sequence
-    if seq is None:
-        return None, None, None
-    hard = leading_hard_clipped_bases(rec.cigartuples)
-    seq_pos = qpos - hard + 1  # user requested +1 correction from prior debugging
-    if seq_pos < 1 or seq_pos > len(seq):
-        return None, None, None
-    idx0 = seq_pos - 1
-    left = seq[max(0, idx0 - context_bp): idx0]
-    base = seq[idx0]
-    right = seq[idx0 + 1: idx0 + 1 + context_bp]
-    return left, base, right
+def query_pos_to_ref_pos(rec: pysam.AlignedSegment, query_pos_1based: int) -> Optional[Tuple[str, int]]:
+    hard_offset = get_query_sequence_offset(rec)
+    local_query_pos_1based = query_pos_1based - hard_offset + 1
+    if local_query_pos_1based < 1:
+        return None
+
+    target_qpos0 = local_query_pos_1based - 1
+    for qpos0, rpos0 in rec.get_aligned_pairs(matches_only=False):
+        if qpos0 is not None and qpos0 == target_qpos0:
+            if rpos0 is None:
+                return None
+            return rec.reference_name, rpos0 + 1
+    return None
 
 
-def map_query_pos_in_record(rec: pysam.AlignedSegment, qpos: int) -> Tuple[Optional[str], Optional[int], str]:
-    """
-    Map global 1-based query coordinate to global 1-based reference coordinate.
-    Returns (chrom, pos, kind), where kind is exact_match or query_only.
-    Uses the corrected +1 query-sequence convention from debugging.
-    """
-    hard = leading_hard_clipped_bases(rec.cigartuples)
-    local_qpos1 = qpos - hard + 1
-    if local_qpos1 < 1:
-        return None, None, "not_in_record"
-    target_q0 = local_qpos1 - 1
-
-    for q0, r0 in rec.get_aligned_pairs(matches_only=False):
-        if q0 is not None and q0 == target_q0:
-            if r0 is None:
-                return None, None, "query_only"
-            return rec.reference_name, r0 + 1, "exact_match"
-    return None, None, "not_in_record"
-
-
-def process_hap_bam(bam_path: str, sites: List[QuerySite], context_bp: int) -> List[SiteResult]:
-    needed_by_qname: Dict[str, List[QuerySite]] = defaultdict(list)
-    for s in sites:
-        needed_by_qname[s.qname].append(s)
-    for qname in needed_by_qname:
-        needed_by_qname[qname].sort(key=lambda x: x.qpos)
-
-    results: Dict[int, SiteResult] = {}
-
-    bam = pysam.AlignmentFile(bam_path, "rb")
-    try:
-        for rec in bam.fetch(until_eof=True):
-            qname = rec.query_name
-            if qname not in needed_by_qname:
-                continue
-            span = aligned_query_span(rec)
-            if span is None:
-                continue
-            qstart, qend = span
-
-            group = needed_by_qname[qname]
-            q_positions = [s.qpos for s in group]
-            lo = bisect_left(q_positions, qstart)
-            i = lo
-            if i >= len(group):
-                continue
-            if group[i].qpos > qend:
-                continue
-
-            intervals = build_op_intervals(rec)
-            while i < len(group) and group[i].qpos <= qend:
-                site = group[i]
-                if site.row_idx in results:
-                    i += 1
-                    continue
-
-                item = find_covering_interval(intervals, site.qpos)
-                if item is None:
-                    i += 1
-                    continue
-
-                left_ctx, base, right_ctx = query_context_from_record(rec, site.qpos, context_bp)
-                mapped_chrom, mapped_pos, kind = map_query_pos_in_record(rec, site.qpos)
-                left_anchor = item.get("left_anchor")
-                right_anchor = item.get("right_anchor")
-
-                if item["op"] == CIGAR_I:
-                    map_kind = "insertion_anchor"
-                    mapped_chrom = rec.reference_name
-                    mapped_pos = left_anchor
-                elif kind == "exact_match":
-                    map_kind = "exact_match"
-                elif kind == "query_only":
-                    map_kind = "query_only_nonI"
-                else:
-                    map_kind = "not_found"
-
-                results[site.row_idx] = SiteResult(
-                    row_idx=site.row_idx,
-                    qname=site.qname,
-                    qpos=site.qpos,
-                    hap=site.hap,
-                    graph_chrom=site.chrom,
-                    graph_pos=site.pos,
-                    mapped_ref_chrom=mapped_chrom,
-                    mapped_ref_pos=mapped_pos,
-                    map_kind=map_kind,
-                    insertion_left_anchor=left_anchor,
-                    insertion_right_anchor=right_anchor,
-                    query_base=base,
-                    query_context_left_20bp=left_ctx,
-                    query_context_right_20bp=right_ctx,
-                    covering_cigar_fragment=f"{item['length']}{item['op_char']}",
-                    covering_cigar_op=item["op_char"],
-                    covering_qspan_start=item["query_start"],
-                    covering_qspan_end=item["query_end"],
-                    covering_rspan_start=item["ref_start"],
-                    covering_rspan_end=item["ref_end"],
-                )
-                i += 1
-    finally:
-        bam.close()
-
-    out: List[SiteResult] = []
-    for s in sites:
-        if s.row_idx in results:
-            out.append(results[s.row_idx])
-        else:
-            out.append(
-                SiteResult(
-                    row_idx=s.row_idx,
-                    qname=s.qname,
-                    qpos=s.qpos,
-                    hap=s.hap,
-                    graph_chrom=s.chrom,
-                    graph_pos=s.pos,
-                    mapped_ref_chrom=None,
-                    mapped_ref_pos=None,
-                    map_kind="not_found",
-                    insertion_left_anchor=None,
-                    insertion_right_anchor=None,
-                    query_base=None,
-                    query_context_left_20bp=None,
-                    query_context_right_20bp=None,
-                    covering_cigar_fragment=None,
-                    covering_cigar_op=None,
-                    covering_qspan_start=None,
-                    covering_qspan_end=None,
-                    covering_rspan_start=None,
-                    covering_rspan_end=None,
-                )
-            )
-    return out
+def parse_full_annotation(s: str) -> Dict[str, Any]:
+    m = FULL_ANNOT_RE.match(s)
+    if not m:
+        return {
+            "asm_contig": "",
+            "asm_pos": "",
+            "asm_ref": "",
+            "asm_alt": "",
+            "hap": "",
+        }
+    contig = m.group("contig")
+    asm_pos = int(m.group("pos"))
+    asm_ref = m.group("asm_ref")
+    asm_alt = m.group("asm_alt")
+    hap = "hap1" if "_hap1" in contig else ("hap2" if "_hap2" in contig else "")
+    return {
+        "asm_contig": contig,
+        "asm_pos": asm_pos,
+        "asm_ref": asm_ref,
+        "asm_alt": asm_alt,
+        "hap": hap,
+    }
 
 
-def vg_find_one(xg: str, chrom: str, pos: int, flank: int) -> Tuple[str, int, int, List[Dict[str, Any]], Optional[str]]:
+def graph_lookup_nodes(xg: str, chrom: str, pos: int, flank: int) -> str:
     start = max(1, pos - flank)
     end = pos + flank
     region = f"GRCh38#0#{chrom}:{start}-{end}"
-    cmd = f"vg find -x {subprocess.list2cmdline([xg])} -p '{region}' | vg view -j -"
+
+    cmd = (
+        f"vg find -x {shell_quote(xg)} -p {shell_quote(region)} "
+        f"| vg view -j - "
+        f"| jq -c '[.node[] | {{id, sequence}}]'"
+    )
     try:
-        proc = subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
-        obj = json.loads(proc.stdout)
-        nodes = [{"id": n.get("id"), "sequence": n.get("sequence")} for n in obj.get("node", [])]
-        return chrom, pos, flank, nodes, None
-    except subprocess.CalledProcessError as e:
-        return chrom, pos, flank, [], e.stderr.strip() or str(e)
-    except json.JSONDecodeError as e:
-        return chrom, pos, flank, [], f"JSON decode failed: {e}"
+        out = subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.DEVNULL).strip()
+        return out if out else "[]"
+    except subprocess.CalledProcessError:
+        return "[]"
 
 
-def collect_graph_nodes(xg: str, sites: Iterable[QuerySite], flank: int, workers: int) -> Dict[Tuple[str, int, int], Dict[str, Any]]:
-    keys = sorted({(s.chrom, s.pos, flank) for s in sites})
-    out: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
-    with cf.ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(vg_find_one, xg, chrom, pos, flank) for chrom, pos, flank in keys]
-        for fut in cf.as_completed(futs):
-            chrom, pos, flank, nodes, err = fut.result()
-            out[(chrom, pos, flank)] = {
-                "graph_nodes_json": json.dumps(nodes, separators=(",", ":")),
-                "graph_node_count": len(nodes),
-                "graph_query_error": err,
+def shell_quote(s: str) -> str:
+    return "'" + s.replace("'", "'\"'\"'") + "'"
+
+
+def load_tsv(tsv_path: str) -> List[Dict[str, Any]]:
+    rows = []
+    with open(tsv_path, "r", newline="") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        for i, row in enumerate(reader):
+            row = dict(row)
+            row["_row_index"] = i
+            parsed = parse_full_annotation(row.get("FULL_ANNOTATION", ""))
+            row.update(parsed)
+            rows.append(row)
+    return rows
+
+
+def group_targets_by_hap_and_contig(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
+    grouped: Dict[str, Dict[str, List[Dict[str, Any]]]] = {"hap1": defaultdict(list), "hap2": defaultdict(list)}
+    for row in rows:
+        hap = row.get("hap", "")
+        contig = row.get("asm_contig", "")
+        asm_pos = row.get("asm_pos", "")
+        if hap in grouped and contig and isinstance(asm_pos, int):
+            grouped[hap][contig].append(row)
+
+    for hap in grouped:
+        for contig in grouped[hap]:
+            grouped[hap][contig].sort(key=lambda r: r["asm_pos"])
+    return grouped
+
+
+def scan_bam_for_targets(
+    bam_path: str,
+    grouped_targets: Dict[str, List[Dict[str, Any]]],
+    context_bp: int,
+) -> Dict[int, Dict[str, Any]]:
+    results: Dict[int, Dict[str, Any]] = {}
+
+    bam = pysam.AlignmentFile(bam_path, "rb")
+    targets_by_contig = grouped_targets
+
+    for rec in bam.fetch(until_eof=True):
+        qname = rec.query_name
+        if qname not in targets_by_contig:
+            continue
+
+        qspan = aligned_query_span_1based(rec)
+        if qspan is None:
+            continue
+        qstart, qend = qspan
+
+        target_list = targets_by_contig[qname]
+        if not target_list:
+            continue
+
+        intervals = build_op_intervals(rec)
+
+        for row in target_list:
+            idx = row["_row_index"]
+            if idx in results:
+                continue
+
+            qpos = row["asm_pos"]
+            if not (qstart <= qpos <= qend):
+                continue
+
+            target_item = find_target_interval(intervals, qpos)
+            if target_item is None:
+                continue
+
+            prev_seq, target_base, next_seq = get_query_context(rec, qpos, context_bp)
+            mapped = query_pos_to_ref_pos(rec, qpos)
+
+            result = {
+                "bam_query_name": rec.query_name,
+                "bam_flag": rec.flag,
+                "bam_flag_label": flag_labels(rec.flag),
+                "bam_reference": rec.reference_name,
+                "bam_reference_start_1based": rec.reference_start + 1,
+                "bam_mapping_quality": rec.mapping_quality,
+                "query_span_1based": f"{qstart}-{qend}",
+                "query_base": target_base,
+                "query_context_left_20bp": prev_seq,
+                "query_context_right_20bp": next_seq,
+                "covering_cigar_fragment": f"{target_item['length']}{target_item['op_char']}",
+                "covering_cigar_op": target_item["op_char"],
+                "covering_qspan_start": target_item["query_start"],
+                "covering_qspan_end": target_item["query_end"],
+                "covering_rspan_start": target_item["ref_start"],
+                "covering_rspan_end": target_item["ref_end"],
+                "map_kind": "",
+                "mapped_ref_chrom": "",
+                "mapped_ref_pos": "",
+                "insertion_left_anchor": "",
+                "insertion_right_anchor": "",
             }
-    return out
+
+            if target_item["op"] == CIGAR_I:
+                left_anchor, right_anchor = target_item["insertion_anchor_between"]
+                result["map_kind"] = "insertion_anchor"
+                result["mapped_ref_chrom"] = rec.reference_name
+                result["mapped_ref_pos"] = left_anchor
+                result["insertion_left_anchor"] = left_anchor
+                result["insertion_right_anchor"] = right_anchor
+            elif mapped is None:
+                result["map_kind"] = "unaligned_or_insertion"
+            else:
+                result["map_kind"] = "exact"
+                result["mapped_ref_chrom"] = mapped[0]
+                result["mapped_ref_pos"] = mapped[1]
+
+            results[idx] = result
+
+    bam.close()
+    return results
+
+
+def flag_labels(flag: int) -> str:
+    labels = []
+    if flag & 0x100:
+        labels.append("SECONDARY")
+    if flag & 0x800:
+        labels.append("SUPPLEMENTARY")
+    if not labels:
+        labels.append("PRIMARY")
+    return ",".join(labels)
+
+
+def safe_int(x: Any) -> Optional[int]:
+    try:
+        return int(x)
+    except Exception:
+        return None
+
+
+def build_output_rows(
+    rows: List[Dict[str, Any]],
+    hap1_results: Dict[int, Dict[str, Any]],
+    hap2_results: Dict[int, Dict[str, Any]],
+    xg: Optional[str],
+    graph_flank: int,
+) -> List[Dict[str, Any]]:
+    out_rows = []
+
+    for row in rows:
+        idx = row["_row_index"]
+        hap = row.get("hap", "")
+        bam_result = hap1_results.get(idx, {}) if hap == "hap1" else hap2_results.get(idx, {})
+
+        out = dict(row)
+        out.update(bam_result)
+
+        tsv_chrom = row.get("#CHROM", "")
+        tsv_pos = safe_int(row.get("POS", ""))
+
+        mapped_chrom = out.get("mapped_ref_chrom", "")
+        mapped_pos = safe_int(out.get("mapped_ref_pos", ""))
+
+        out["same_chrom_as_tsv"] = ""
+        out["pos_delta_vs_tsv"] = ""
+        if mapped_chrom and tsv_chrom:
+            out["same_chrom_as_tsv"] = str(mapped_chrom == tsv_chrom)
+        if mapped_pos is not None and tsv_pos is not None:
+            out["pos_delta_vs_tsv"] = mapped_pos - tsv_pos
+
+        if xg and tsv_chrom and tsv_pos is not None:
+            out["graph_nodes_json"] = graph_lookup_nodes(xg, tsv_chrom, tsv_pos, graph_flank)
+        else:
+            out["graph_nodes_json"] = ""
+
+        out_rows.append(out)
+
+    return out_rows
+
+
+def write_tsv(path: str, rows: List[Dict[str, Any]]) -> None:
+    if not rows:
+        with open(path, "w") as f:
+            f.write("")
+        return
+
+    fieldnames = []
+    seen = set()
+    for row in rows:
+        for k in row.keys():
+            if k not in seen and k != "_row_index":
+                seen.add(k)
+                fieldnames.append(k)
+
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="\t", extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            clean = {k: v for k, v in row.items() if k != "_row_index"}
+            writer.writerow(clean)
+
+
+def write_summary(path: str, rows: List[Dict[str, Any]]) -> None:
+    c_map_kind = Counter()
+    c_hap = Counter()
+    c_type_change = Counter()
+    same_chrom_true = 0
+    same_chrom_false = 0
+    exact_match_pos = 0
+
+    for r in rows:
+        c_map_kind[r.get("map_kind", "missing")] += 1
+        c_hap[r.get("hap", "unknown")] += 1
+        c_type_change[r.get("TYPE_CHANGE", "")] += 1
+
+        sc = r.get("same_chrom_as_tsv", "")
+        if sc == "True":
+            same_chrom_true += 1
+        elif sc == "False":
+            same_chrom_false += 1
+
+        delta = r.get("pos_delta_vs_tsv", "")
+        if str(delta) == "0":
+            exact_match_pos += 1
+
+    summary = {
+        "n_rows": len(rows),
+        "hap_counts": dict(c_hap),
+        "map_kind_counts": dict(c_map_kind),
+        "type_change_counts": dict(c_type_change),
+        "same_chrom_true": same_chrom_true,
+        "same_chrom_false": same_chrom_false,
+        "exact_position_match_count": exact_match_pos,
+    }
+
+    with open(path, "w") as f:
+        json.dump(summary, f, indent=2)
 
 
 def main() -> None:
     args = parse_args()
-    out_prefix = Path(args.out_prefix)
 
-    df, sites = load_sites(args.tsv)
-    hap1_sites = [s for s in sites if s.hap == "hap1"]
-    hap2_sites = [s for s in sites if s.hap == "hap2"]
+    rows = load_tsv(args.tsv)
+    grouped = group_targets_by_hap_and_contig(rows)
 
-    hap1_results = process_hap_bam(args.hap1_bam, hap1_sites, args.context_bp)
-    hap2_results = process_hap_bam(args.hap2_bam, hap2_sites, args.context_bp)
-    all_results = hap1_results + hap2_results
-
-    res_df = pd.DataFrame([r.__dict__ for r in all_results]).sort_values("row_idx")
-    merged = df.copy()
-    merged["row_idx"] = range(len(merged))
-    merged = merged.merge(res_df, on="row_idx", how="left", validate="one_to_one")
-
-    merged["pos_delta_vs_tsv"] = merged.apply(
-        lambda r: (int(r["mapped_ref_pos"]) - int(r["POS"])) if pd.notna(r["mapped_ref_pos"]) else pd.NA,
-        axis=1,
+    hap1_results = scan_bam_for_targets(
+        bam_path=args.hap1_bam,
+        grouped_targets=grouped["hap1"],
+        context_bp=args.context_bp,
     )
-    merged["same_chrom_as_tsv"] = merged.apply(
-        lambda r: (str(r["mapped_ref_chrom"]) == str(r["#CHROM"])) if pd.notna(r["mapped_ref_chrom"]) else pd.NA,
-        axis=1,
+    hap2_results = scan_bam_for_targets(
+        bam_path=args.hap2_bam,
+        grouped_targets=grouped["hap2"],
+        context_bp=args.context_bp,
     )
 
-    if args.xg:
-        graph_map = collect_graph_nodes(args.xg, sites, args.graph_flank, args.workers)
-        merged["graph_nodes_json"] = [graph_map[(s.chrom, s.pos, args.graph_flank)]["graph_nodes_json"] for s in sites]
-        merged["graph_node_count"] = [graph_map[(s.chrom, s.pos, args.graph_flank)]["graph_node_count"] for s in sites]
-        merged["graph_query_error"] = [graph_map[(s.chrom, s.pos, args.graph_flank)]["graph_query_error"] for s in sites]
+    out_rows = build_output_rows(
+        rows=rows,
+        hap1_results=hap1_results,
+        hap2_results=hap2_results,
+        xg=args.xg,
+        graph_flank=args.graph_flank,
+    )
 
-    merged.to_csv(f"{out_prefix}.full.tsv", sep="\t", index=False)
+    out_tsv = args.out_prefix + ".full.tsv"
+    out_json = args.out_prefix + ".summary.json"
 
-    summary = {
-        "n_rows": int(len(merged)),
-        "hap1_rows": int(len(hap1_sites)),
-        "hap2_rows": int(len(hap2_sites)),
-        "map_kind_counts": merged["map_kind"].value_counts(dropna=False).to_dict(),
-        "same_chrom_true": int((merged["same_chrom_as_tsv"] == True).sum()),
-        "same_chrom_false": int((merged["same_chrom_as_tsv"] == False).sum()),
-        "exact_pos_match": int((merged["pos_delta_vs_tsv"] == 0).sum()),
-        "pos_delta_min": None if merged["pos_delta_vs_tsv"].dropna().empty else int(merged["pos_delta_vs_tsv"].dropna().min()),
-        "pos_delta_max": None if merged["pos_delta_vs_tsv"].dropna().empty else int(merged["pos_delta_vs_tsv"].dropna().max()),
-    }
-    with open(f"{out_prefix}.summary.json", "w") as fh:
-        json.dump(summary, fh, indent=2)
+    write_tsv(out_tsv, out_rows)
+    write_summary(out_json, out_rows)
 
-    print(json.dumps(summary, indent=2))
-    print(f"[DONE] wrote {out_prefix}.full.tsv")
-    print(f"[DONE] wrote {out_prefix}.summary.json")
+    print(f"[DONE] Wrote: {out_tsv}")
+    print(f"[DONE] Wrote: {out_json}")
 
 
 if __name__ == "__main__":
