@@ -2,27 +2,20 @@
 
 import argparse
 import gzip
-import os
+import json
 from collections import Counter
 
 
-COMPLEMENT = str.maketrans("ACGTNacgtn", "TGCANtgcan")
-
-
-def open_maybe_gz(path):
+def open_maybe_gz(path, mode="rt"):
     if path.endswith(".gz"):
-        return gzip.open(path, "rt")
-    return open(path, "r")
-
-
-def revcomp(seq):
-    return seq.translate(COMPLEMENT)[::-1].upper()
+        return gzip.open(path, mode)
+    return open(path, mode)
 
 
 def parse_info(info_str):
     info = {}
     for item in info_str.split(";"):
-        if not item:
+        if not item or item == ".":
             continue
         if "=" in item:
             k, v = item.split("=", 1)
@@ -32,274 +25,154 @@ def parse_info(info_str):
     return info
 
 
-def parse_gfa_nodes(gfa_path):
-    """
-    Parse node sequences from GFA S lines.
+def info_to_str(info):
+    return ";".join(
+        f"{k}={v}" if v is not True else k
+        for k, v in info.items()
+    ) or "."
 
-    GFA format:
-        S   node_id   sequence
-    """
-    nodes = {}
 
-    with open_maybe_gz(gfa_path) as f:
+def first_present(d, keys, default=None):
+    for k in keys:
+        if k in d:
+            return d[k]
+    return default
+
+
+def to_int(x):
+    try:
+        return int(x)
+    except Exception:
+        return None
+
+
+def iter_node_map_records(json_path):
+    with open(json_path, "r") as f:
+        data = json.load(f)
+
+    if isinstance(data, list):
+        for x in data:
+            if isinstance(x, dict):
+                yield x
+    elif isinstance(data, dict):
+        for _, x in data.items():
+            if isinstance(x, dict):
+                yield x
+    else:
+        raise ValueError("Unsupported map_json format")
+
+
+def load_node_map(json_path, node_start_is_1_based=True):
+    """
+    Returns:
+        anchors[node_id] = (chrom, start0, strand, length)
+    """
+    anchors = {}
+
+    for rec in iter_node_map_records(json_path):
+        node_id = to_int(first_present(rec, ["node_id", "node", "id", "nid"]))
+        if node_id is None:
+            continue
+
+        chrom = first_present(rec, ["chrom", "chr", "chromosome", "contig"])
+        strand = str(first_present(rec, ["strand_in_path", "strand"], "+") or "+")
+        length = to_int(first_present(rec, ["length", "len", "node_length"]))
+
+        start0 = first_present(rec, ["start_0based", "pos0"])
+        start1 = first_present(rec, ["grch38_position_start", "start_1based", "pos1"])
+
+        if start0 is not None:
+            s0 = to_int(start0)
+        elif start1 is not None:
+            s1 = to_int(start1)
+            s0 = s1 - 1 if s1 is not None else None
+        else:
+            generic = first_present(rec, ["start", "pos", "start_pos"])
+            sg = to_int(generic)
+            if sg is None:
+                s0 = None
+            else:
+                s0 = sg - 1 if node_start_is_1_based else sg
+
+        if chrom is not None and s0 is not None and length is not None:
+            anchors[node_id] = (
+                str(chrom),
+                int(s0),
+                strand if strand in ("+", "-") else "+",
+                int(length),
+            )
+
+    return anchors
+
+
+def load_neighbor_map(path):
+    """
+    TSV format:
+
+    node_id    left_node    right_node
+
+    Missing neighbor can be "." or empty.
+    """
+    neighbor = {}
+
+    with open(path, "r") as f:
+        header = f.readline().rstrip("\n").split("\t")
+        header_lc = [h.lower() for h in header]
+
+        def idx(name):
+            if name not in header_lc:
+                raise ValueError(f"neighbor_map missing required column: {name}")
+            return header_lc.index(name)
+
+        i_node = idx("node_id")
+        i_left = idx("left_node")
+        i_right = idx("right_node")
+
         for line in f:
-            if not line.startswith("S\t"):
+            if not line.strip():
                 continue
 
             fields = line.rstrip("\n").split("\t")
-            if len(fields) < 3:
+            node_id = to_int(fields[i_node])
+            if node_id is None:
                 continue
 
-            node_id = fields[1]
-            seq = fields[2].upper()
+            left_raw = fields[i_left].strip() if i_left < len(fields) else "."
+            right_raw = fields[i_right].strip() if i_right < len(fields) else "."
 
-            if seq == "*":
-                continue
+            left = to_int(left_raw) if left_raw not in ("", ".") else None
+            right = to_int(right_raw) if right_raw not in ("", ".") else None
 
-            nodes[node_id] = seq
+            neighbor[node_id] = (left, right)
 
-    return nodes
-
-
-def all_sbs96_channels():
-    """
-    COSMIC/SigProfiler-style SBS96 order.
-
-    Output order:
-        A[C>A]A
-        A[C>A]C
-        A[C>A]G
-        A[C>A]T
-        A[C>G]A
-        ...
-        T[T>G]T
-
-    This matches the common COSMIC matrix style:
-        left base outer loop
-        mutation type middle loop
-        right base inner loop
-    """
-
-    bases = ["A", "C", "G", "T"]
-
-    mutation_types = [
-        ("C", "A"),
-        ("C", "G"),
-        ("C", "T"),
-        ("T", "A"),
-        ("T", "C"),
-        ("T", "G"),
-    ]
-
-    channels = []
-
-    for left in bases:
-        for ref, alt in mutation_types:
-            for right in bases:
-                channels.append(f"{left}[{ref}>{alt}]{right}")
-
-    return channels
+    return neighbor
 
 
-def get_graph_position(fields):
-    """
-    Return:
-        node_id, pos_1based
-
-    For your graph VCF:
-        CHROM is often node id
-        POS is node-local 1-based position
-        INFO may contain NID and NSO
-
-    Your examples:
-        POS=6, NSO=5
-
-    Therefore:
-        POS = NSO + 1
-    """
-
+def make_graph_key(fields, require_graph_key=True):
     chrom = fields[0]
     pos = fields[1]
+    ref = fields[3]
+    alt = fields[4]
     info = parse_info(fields[7])
 
-    if "NID" in info and "NSO" in info:
-        node_id = str(info["NID"])
-        pos_1based = int(info["NSO"]) + 1
-        return node_id, pos_1based
+    nid = info.get("NID")
+    nso = info.get("NSO")
+    vtype = info.get("TYPE", "")
 
-    node_id = str(chrom)
-    pos_1based = int(pos)
-    return node_id, pos_1based
+    if nid is not None and nso is not None:
+        return ("GRAPH", nid, nso, vtype, ref, alt)
 
-
-def get_context_same_node_only(nodes, node_id, pos_1based):
-    """
-    Strict version:
-    only use same-node trinucleotide context.
-
-    This avoids unsafe node_id +/- 1 assumptions.
-
-    If mutation is at node boundary, return unresolved.
-    """
-
-    node_id = str(node_id)
-
-    if node_id not in nodes:
-        return None, "missing_node"
-
-    seq = nodes[node_id]
-    idx = pos_1based - 1
-
-    if idx < 0 or idx >= len(seq):
-        return None, "position_out_of_range"
-
-    if idx == 0:
-        return None, "left_boundary_context_missing"
-
-    if idx == len(seq) - 1:
-        return None, "right_boundary_context_missing"
-
-    context = seq[idx - 1: idx + 2].upper()
-
-    if len(context) != 3:
-        return None, "bad_context_length"
-
-    if any(base not in "ACGT" for base in context):
-        return None, "non_acgt_context"
-
-    return context, "ok"
-
-
-def get_context_with_node_id_neighbor_rescue(nodes, node_id, pos_1based):
-    """
-    Relaxed/debug version:
-    use node_id - 1 or node_id + 1 only when boundary context is missing.
-
-    WARNING:
-    This is not graph-topology-safe unless node IDs are path ordered.
-    Use only if you intentionally want this heuristic.
-    """
-
-    node_id = str(node_id)
-
-    if node_id not in nodes:
-        return None, "missing_node"
-
-    seq = nodes[node_id]
-    idx = pos_1based - 1
-
-    if idx < 0 or idx >= len(seq):
-        return None, "position_out_of_range"
-
-    center = seq[idx]
-
-    # Left base
-    if idx > 0:
-        left = seq[idx - 1]
-    else:
-        try:
-            prev_node_id = str(int(node_id) - 1)
-        except ValueError:
-            return None, "left_boundary_no_numeric_node_id"
-
-        if prev_node_id in nodes and len(nodes[prev_node_id]) > 0:
-            left = nodes[prev_node_id][-1]
-        else:
-            return None, "left_boundary_neighbor_missing"
-
-    # Right base
-    if idx < len(seq) - 1:
-        right = seq[idx + 1]
-    else:
-        try:
-            next_node_id = str(int(node_id) + 1)
-        except ValueError:
-            return None, "right_boundary_no_numeric_node_id"
-
-        if next_node_id in nodes and len(nodes[next_node_id]) > 0:
-            right = nodes[next_node_id][0]
-        else:
-            return None, "right_boundary_neighbor_missing"
-
-    context = (left + center + right).upper()
-
-    if any(base not in "ACGT" for base in context):
-        return None, "non_acgt_context"
-
-    return context, "ok"
-
-
-def canonical_sbs96(context, ref, alt):
-    """
-    Convert SNV to canonical pyrimidine-centered SBS96 channel.
-
-    Example:
-        raw event:
-            T[G>A]C
-
-        reverse-complement canonical event:
-            G[C>T]A
-
-        output:
-            G[C>T]A
-    """
-
-    context = context.upper()
-    ref = ref.upper()
-    alt = alt.upper()
-
-    if len(context) != 3:
+    if require_graph_key:
         return None
 
-    if len(ref) != 1 or len(alt) != 1:
-        return None
-
-    if ref not in "ACGT" or alt not in "ACGT":
-        return None
-
-    if ref == alt:
-        return None
-
-    # Already canonical
-    if ref in {"C", "T"}:
-        left, center, right = context
-        return f"{left}[{ref}>{alt}]{right}"
-
-    # Reverse-complement to pyrimidine representation
-    rc_context = revcomp(context)
-    rc_ref = revcomp(ref)
-    rc_alt = revcomp(alt)
-
-    left, center, right = rc_context
-    return f"{left}[{rc_ref}>{rc_alt}]{right}"
+    return ("VCF", chrom, pos, ref, alt)
 
 
-def sample_name_from_path(path):
-    base = os.path.basename(path)
-
-    for suffix in [".vcf.gz", ".vcf", ".gz"]:
-        if base.endswith(suffix):
-            base = base[: -len(suffix)]
-
-    return base
-
-
-def count_sbs96_for_vcf(
-    vcf_path,
-    nodes,
-    min_prob=None,
-    min_af=None,
-    require_pass=True,
-    allow_node_id_neighbor_rescue=False,
-):
-    counts = Counter()
-    skipped = Counter()
-    mismatch_examples = []
-
-    if allow_node_id_neighbor_rescue:
-        get_context = get_context_with_node_id_neighbor_rescue
-    else:
-        get_context = get_context_same_node_only
+def load_keys_from_vcf(vcf_path, require_graph_key=True):
+    keys = set()
+    n_records = 0
+    malformed = 0
+    missing_graph_key = 0
 
     with open_maybe_gz(vcf_path) as f:
         for line in f:
@@ -308,249 +181,308 @@ def count_sbs96_for_vcf(
 
             fields = line.rstrip("\n").split("\t")
             if len(fields) < 8:
-                skipped["malformed_vcf_line"] += 1
+                malformed += 1
                 continue
 
-            ref = fields[3].upper()
-            alt = fields[4].upper()
-            filt = fields[6]
-            info = parse_info(fields[7])
-
-            if require_pass and filt != "PASS":
-                skipped["not_pass"] += 1
+            key = make_graph_key(fields, require_graph_key=require_graph_key)
+            if key is None:
+                missing_graph_key += 1
                 continue
 
-            # Your graph SNV type is TYPE=X.
-            vtype = info.get("TYPE")
-            if vtype is not None and vtype != "X":
-                skipped["not_type_x"] += 1
-                continue
+            keys.add(key)
+            n_records += 1
 
-            if len(ref) != 1 or len(alt) != 1:
-                skipped["not_snv"] += 1
-                continue
+    return keys, n_records, malformed, missing_graph_key
 
-            if "," in alt:
-                skipped["multi_allelic"] += 1
-                continue
 
-            # PROB filter:
-            # only keep variants with PROB > min_prob
-            # remove variants with PROB <= min_prob
-            if min_prob is not None:
-                if "PROB" not in info:
-                    skipped["missing_prob"] += 1
-                    continue
+def rescue_with_neighbor(
+    fields,
+    anchors,
+    neighbor_map,
+    offset_is_0_based=True,
+    prefer="left",
+    require_same_chrom_when_both=True,
+):
+    """
+    Rescue unanchored graph node using left/right anchored neighbor.
 
-                try:
-                    prob = float(info["PROB"])
-                except ValueError:
-                    skipped["bad_prob"] += 1
-                    continue
+    For left anchor:
+        rescued POS = left_start0 + left_length + offset0 + 1
 
-                if prob <= min_prob:
-                    skipped["low_or_equal_prob"] += 1
-                    continue
+    For right anchor:
+        rescued POS = right_start0 + offset0 + 1
 
-            # Optional AF filter:
-            # keep variants with AF >= min_af
-            if min_af is not None:
-                if "AF" not in info:
-                    skipped["missing_af"] += 1
-                    continue
+    This is approximate and should be marked as rescued.
+    """
+    chrom_node = fields[0]
+    ref = fields[3]
+    alt = fields[4]
+    info = parse_info(fields[7])
 
-                try:
-                    af = float(info["AF"])
-                except ValueError:
-                    skipped["bad_af"] += 1
-                    continue
+    node_id = to_int(info.get("NID", chrom_node))
+    offset = to_int(info.get("NSO"))
 
-                if af < min_af:
-                    skipped["low_af"] += 1
-                    continue
+    if node_id is None or offset is None:
+        return None
 
-            try:
-                node_id, pos_1based = get_graph_position(fields)
-            except Exception:
-                skipped["bad_graph_position"] += 1
-                continue
+    off0 = offset if offset_is_0_based else offset - 1
+    if off0 < 0:
+        return None
 
-            context, status = get_context(nodes, node_id, pos_1based)
-            if context is None:
-                skipped[status] += 1
-                continue
+    if node_id not in neighbor_map:
+        return None
 
-            # REF should match center base before canonicalization.
-            if context[1] != ref:
-                skipped["ref_context_mismatch"] += 1
+    left_node, right_node = neighbor_map[node_id]
 
-                if len(mismatch_examples) < 10:
-                    mismatch_examples.append(
-                        {
-                            "node_id": node_id,
-                            "pos_1based": pos_1based,
-                            "ref": ref,
-                            "alt": alt,
-                            "context": context,
-                            "center": context[1],
-                        }
+    left_anchor = anchors.get(left_node) if left_node is not None else None
+    right_anchor = anchors.get(right_node) if right_node is not None else None
+
+    if require_same_chrom_when_both and left_anchor and right_anchor:
+        if left_anchor[0] != right_anchor[0]:
+            return None
+
+    candidates = []
+
+    if left_anchor is not None:
+        chrom, start0, strand, length = left_anchor
+        if strand == "+":
+            pos = start0 + length + off0 + 1
+            candidates.append(("left", left_node, chrom, pos))
+
+    if right_anchor is not None:
+        chrom, start0, strand, length = right_anchor
+        if strand == "+":
+            pos = start0 + off0 + 1
+            candidates.append(("right", right_node, chrom, pos))
+
+    if not candidates:
+        return None
+
+    if prefer == "left":
+        chosen = next((x for x in candidates if x[0] == "left"), candidates[0])
+    elif prefer == "right":
+        chosen = next((x for x in candidates if x[0] == "right"), candidates[0])
+    else:
+        chosen = candidates[0]
+
+    side, neighbor_node, chrom, pos = chosen
+
+    new_info = info.copy()
+    new_info["RESCUED_BY_NEIGHBOR"] = side
+    new_info["RESCUE_NEIGHBOR_NODE"] = str(neighbor_node)
+    new_info["ORIGINAL_GRAPH_NODE"] = str(node_id)
+    new_info["ORIGINAL_GRAPH_OFFSET"] = str(offset)
+
+    new_fields = fields[:]
+    new_fields[0] = chrom
+    new_fields[1] = str(pos)
+    new_fields[2] = "."
+    new_fields[3] = ref
+    new_fields[4] = alt
+    new_fields[6] = "NeighborRescued"
+    new_fields[7] = info_to_str(new_info)
+
+    return new_fields
+
+
+def recover_and_rescue(
+    all_vcf,
+    linear_vcf,
+    out_dropped_graph_vcf,
+    out_rescued_linear_vcf,
+    map_json,
+    neighbor_map_path=None,
+    rescue_with_neighbor_nodes=False,
+    offset_is_0_based=True,
+    node_start_is_1_based=True,
+    prefer_neighbor="left",
+    require_graph_key=True,
+):
+    linear_keys, n_linear, malformed_linear, missing_linear_graph_key = load_keys_from_vcf(
+        linear_vcf,
+        require_graph_key=require_graph_key,
+    )
+
+    anchors = load_node_map(
+        map_json,
+        node_start_is_1_based=node_start_is_1_based,
+    )
+
+    neighbor_map = {}
+    if rescue_with_neighbor_nodes:
+        if not neighbor_map_path:
+            raise ValueError("--rescue_with_neighbor_nodes requires --neighbor_map")
+        neighbor_map = load_neighbor_map(neighbor_map_path)
+
+    n_all = 0
+    n_kept_in_linear = 0
+    n_dropped = 0
+    n_rescued = 0
+    n_unrescued = 0
+    malformed_all = 0
+    missing_all_graph_key = 0
+
+    key_counter_all = Counter()
+
+    with open_maybe_gz(all_vcf) as fin, \
+         open(out_dropped_graph_vcf, "w") as fout_drop, \
+         open(out_rescued_linear_vcf, "w") as fout_rescue:
+
+        for line in fin:
+            if line.startswith("#"):
+                fout_drop.write(line)
+
+                if line.startswith("##"):
+                    fout_rescue.write(line)
+                elif line.startswith("#CHROM"):
+                    fout_rescue.write(
+                        '##FILTER=<ID=NeighborRescued,Description="Graph record rescued to approximate linear coordinate using anchored neighbor node">\n'
                     )
+                    fout_rescue.write(
+                        '##INFO=<ID=RESCUED_BY_NEIGHBOR,Number=1,Type=String,Description="Neighbor side used for rescue: left or right">\n'
+                    )
+                    fout_rescue.write(
+                        '##INFO=<ID=RESCUE_NEIGHBOR_NODE,Number=1,Type=String,Description="Anchored neighbor node used for rescue">\n'
+                    )
+                    fout_rescue.write(
+                        '##INFO=<ID=ORIGINAL_GRAPH_NODE,Number=1,Type=String,Description="Original unanchored graph node">\n'
+                    )
+                    fout_rescue.write(
+                        '##INFO=<ID=ORIGINAL_GRAPH_OFFSET,Number=1,Type=String,Description="Original graph offset before rescue">\n'
+                    )
+                    fout_rescue.write(line)
 
                 continue
 
-            channel = canonical_sbs96(context, ref, alt)
-
-            if channel is None:
-                skipped["cannot_canonicalize"] += 1
+            if not line.strip():
                 continue
 
-            counts[channel] += 1
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 8:
+                malformed_all += 1
+                continue
 
-    return counts, skipped, mismatch_examples
+            key = make_graph_key(fields, require_graph_key=require_graph_key)
+            if key is None:
+                missing_all_graph_key += 1
+                continue
 
+            key_counter_all[key] += 1
+            n_all += 1
 
-def write_cosmic_matrix(sample_to_counts, out_path):
-    """
-    Write COSMIC-like SBS96 matrix:
+            if key in linear_keys:
+                n_kept_in_linear += 1
+                continue
 
-        Mutation Types    Sample_1    Sample_2
-        A[C>A]A           10          2
-        ...
-    """
+            fout_drop.write(line)
+            n_dropped += 1
 
-    channels = all_sbs96_channels()
-    sample_names = list(sample_to_counts.keys())
+            if rescue_with_neighbor_nodes:
+                rescued_fields = rescue_with_neighbor(
+                    fields=fields,
+                    anchors=anchors,
+                    neighbor_map=neighbor_map,
+                    offset_is_0_based=offset_is_0_based,
+                    prefer=prefer_neighbor,
+                    require_same_chrom_when_both=True,
+                )
 
-    with open(out_path, "w") as out:
-        out.write("Mutation Types\t" + "\t".join(sample_names) + "\n")
+                if rescued_fields is not None:
+                    fout_rescue.write("\t".join(rescued_fields) + "\n")
+                    n_rescued += 1
+                else:
+                    n_unrescued += 1
+            else:
+                n_unrescued += 1
 
-        for channel in channels:
-            row = [channel]
-            for sample in sample_names:
-                row.append(str(sample_to_counts[sample].get(channel, 0)))
-            out.write("\t".join(row) + "\n")
+    print("[INFO] Done")
+    print(f"[INFO] rescue_with_neighbor_nodes: {rescue_with_neighbor_nodes}")
+    print(f"[INFO] all records: {n_all:,}")
+    print(f"[INFO] linear records with graph key: {n_linear:,}")
+    print(f"[INFO] records from all found in linear by graph key: {n_kept_in_linear:,}")
+    print(f"[INFO] dropped/unconverted records: {n_dropped:,}")
+    print(f"[INFO] neighbor-rescued records: {n_rescued:,}")
+    print(f"[INFO] still-unrescued records: {n_unrescued:,}")
+    print(f"[INFO] anchors loaded: {len(anchors):,}")
+    print(f"[INFO] neighbor map records: {len(neighbor_map):,}")
+    print(f"[INFO] malformed all records: {malformed_all:,}")
+    print(f"[INFO] malformed linear records: {malformed_linear:,}")
+    print(f"[INFO] missing graph key in all: {missing_all_graph_key:,}")
+    print(f"[INFO] missing graph key in linear: {missing_linear_graph_key:,}")
+    print(f"[INFO] dropped graph VCF: {out_dropped_graph_vcf}")
+    print(f"[INFO] rescued linear VCF: {out_rescued_linear_vcf}")
+
+    duplicated_all = sum(1 for _, v in key_counter_all.items() if v > 1)
+    if duplicated_all:
+        print(f"[WARNING] duplicated graph keys in all VCF: {duplicated_all:,}")
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Convert graph VCF(s) + GFA into COSMIC-style SBS96 mutation matrix."
+    p = argparse.ArgumentParser(
+        description="Recover dropped graph records. Neighbor-node rescue is OFF by default."
     )
 
-    parser.add_argument(
-        "--gfa",
-        required=True,
-        help="GFA file containing node sequences"
-    )
+    p.add_argument("--all", required=True, help="All graph/node-form VCF")
+    p.add_argument("--linear", required=True, help="Linear converted VCF")
+    p.add_argument("--map_json", required=True, help="Node map JSON with GRCh38 anchors")
 
-    parser.add_argument(
-        "--vcf",
-        nargs="+",
-        required=True,
-        help="One or more graph VCF/VCF.GZ files"
-    )
+    p.add_argument("--out_dropped_graph", required=True, help="Output dropped graph-format VCF")
+    p.add_argument("--out_rescued_linear", required=True, help="Output rescued linear-coordinate VCF")
 
-    parser.add_argument(
-        "--sample-names",
-        nargs="+",
+    p.add_argument(
+        "--neighbor_map",
         default=None,
-        help="Optional sample names, same number/order as --vcf"
+        help="Optional TSV with columns: node_id, left_node, right_node",
     )
 
-    parser.add_argument(
-        "--out",
-        required=True,
-        help="Output COSMIC-style SBS96 matrix TSV"
-    )
-
-    parser.add_argument(
-        "--min-prob",
-        type=float,
-        default=None,
-        help="Only keep variants with PROB > this value"
-    )
-
-    parser.add_argument(
-        "--min-af",
-        type=float,
-        default=None,
-        help="Only keep variants with AF >= this value"
-    )
-
-    parser.add_argument(
-        "--allow-non-pass",
+    p.add_argument(
+        "--rescue_with_neighbor_nodes",
         action="store_true",
-        help="Do not require FILTER=PASS"
+        help="Enable rescue of dropped graph records using anchored left/right neighbor nodes. Default: OFF.",
     )
 
-    parser.add_argument(
-        "--allow-node-id-neighbor-rescue",
+    p.add_argument(
+        "--offset_is_0_based",
+        type=lambda s: str(s).lower() in ("1", "true", "t", "yes", "y"),
+        default=True,
+        help="Whether NSO/v_pos offset is 0-based. Default: true.",
+    )
+
+    p.add_argument(
+        "--node_start_is_1_based",
+        type=lambda s: str(s).lower() in ("1", "true", "t", "yes", "y"),
+        default=True,
+        help="Whether grch38_position_start in map_json is 1-based. Default: true.",
+    )
+
+    p.add_argument(
+        "--prefer_neighbor",
+        choices=["left", "right", "any"],
+        default="left",
+        help="Which anchored neighbor to prefer when both left and right are available. Default: left.",
+    )
+
+    p.add_argument(
+        "--allow_vcf_pos_fallback",
         action="store_true",
-        help=(
-            "Use node_id-1/node_id+1 to rescue boundary trinucleotide context. "
-            "Not recommended for final analysis unless node IDs are path ordered."
-        )
+        help="Allow fallback to CHROM/POS/REF/ALT if NID/NSO missing. Not recommended.",
     )
 
-    args = parser.parse_args()
+    args = p.parse_args()
 
-    if args.sample_names is not None and len(args.sample_names) != len(args.vcf):
-        raise ValueError("--sample-names must have the same number of entries as --vcf")
-
-    print(f"[INFO] Loading GFA nodes: {args.gfa}")
-    nodes = parse_gfa_nodes(args.gfa)
-    print(f"[INFO] Loaded nodes: {len(nodes):,}")
-
-    sample_to_counts = {}
-
-    for i, vcf_path in enumerate(args.vcf):
-        if args.sample_names is not None:
-            sample = args.sample_names[i]
-        else:
-            sample = sample_name_from_path(vcf_path)
-
-        print("============================================================")
-        print(f"[INFO] Sample: {sample}")
-        print(f"[INFO] VCF: {vcf_path}")
-
-        if args.min_prob is not None:
-            print(f"[INFO] Applying PROB filter: PROB > {args.min_prob}")
-
-        if args.min_af is not None:
-            print(f"[INFO] Applying AF filter: AF >= {args.min_af}")
-
-        counts, skipped, mismatch_examples = count_sbs96_for_vcf(
-            vcf_path=vcf_path,
-            nodes=nodes,
-            min_prob=args.min_prob,
-            min_af=args.min_af,
-            require_pass=not args.allow_non_pass,
-            allow_node_id_neighbor_rescue=args.allow_node_id_neighbor_rescue,
-        )
-
-        sample_to_counts[sample] = counts
-
-        print(f"[INFO] Counted SBS96 SNVs: {sum(counts.values()):,}")
-
-        if skipped:
-            print("[INFO] Skipped records:")
-            for k, v in skipped.most_common():
-                print(f"  {k}: {v:,}")
-
-        if mismatch_examples:
-            print("[WARNING] First REF/context mismatch examples:")
-            for ex in mismatch_examples:
-                print(
-                    f"  node={ex['node_id']} pos={ex['pos_1based']} "
-                    f"REF={ex['ref']} ALT={ex['alt']} "
-                    f"context={ex['context']} center={ex['center']}"
-                )
-
-    write_cosmic_matrix(sample_to_counts, args.out)
-
-    print("============================================================")
-    print(f"[INFO] Wrote COSMIC-style SBS96 matrix: {args.out}")
-    print(f"[INFO] Samples: {len(sample_to_counts)}")
-    print("[INFO] Rows: 96")
+    recover_and_rescue(
+        all_vcf=args.all,
+        linear_vcf=args.linear,
+        out_dropped_graph_vcf=args.out_dropped_graph,
+        out_rescued_linear_vcf=args.out_rescued_linear,
+        map_json=args.map_json,
+        neighbor_map_path=args.neighbor_map,
+        rescue_with_neighbor_nodes=args.rescue_with_neighbor_nodes,
+        offset_is_0_based=args.offset_is_0_based,
+        node_start_is_1_based=args.node_start_is_1_based,
+        prefer_neighbor=args.prefer_neighbor,
+        require_graph_key=not args.allow_vcf_pos_fallback,
+    )
 
 
 if __name__ == "__main__":
