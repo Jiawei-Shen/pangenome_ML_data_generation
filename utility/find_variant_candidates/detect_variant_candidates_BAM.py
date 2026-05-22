@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 
 import argparse
+import time
 from collections import Counter
 import pysam
+
+
+def log(msg):
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now}] {msg}", flush=True)
 
 
 def detect_candidates(
@@ -14,18 +20,38 @@ def detect_candidates(
     min_count,
     min_bq,
     min_mq,
+    log_interval,
 ):
+    log("Starting variant candidate detection")
+    log(f"Input BAM: {bam_path}")
+    log(f"Input FASTA: {fasta_path}")
+    log(f"Output TSV: {out_tsv}")
+    log(f"Output summary: {summary_txt}")
+    log(f"Threshold: AF > {min_af}, count > {min_count}")
+    log(f"Filters: min base quality = {min_bq}, min mapping quality = {min_mq}")
+
     bam = pysam.AlignmentFile(bam_path, "rb")
     fasta = pysam.FastaFile(fasta_path)
 
     snv_n = 0
     indel_n = 0
+    total_pileup_positions = 0
+
+    start_time = time.time()
 
     with open(out_tsv, "w") as out:
         out.write("chrom\tpos\tvariant_type\tref\talt\tdepth\talt_count\tAF\n")
 
         for chrom in bam.references:
             chrom_len = bam.get_reference_length(chrom)
+            chrom_start_time = time.time()
+            chrom_pileup_positions = 0
+
+            log("=" * 80)
+            log(f"Processing chromosome: {chrom}")
+            log(f"Chromosome length: {chrom_len:,} bp")
+
+            last_logged_pos = 0
 
             for col in bam.pileup(
                 chrom,
@@ -38,6 +64,22 @@ def detect_candidates(
             ):
                 pos0 = col.reference_pos
                 pos1 = pos0 + 1
+
+                total_pileup_positions += 1
+                chrom_pileup_positions += 1
+
+                if pos1 - last_logged_pos >= log_interval:
+                    pct = (pos1 / chrom_len) * 100 if chrom_len > 0 else 0
+                    elapsed = time.time() - chrom_start_time
+
+                    log(
+                        f"{chrom}: position {pos1:,}/{chrom_len:,} "
+                        f"({pct:.2f}%), pileup sites scanned: {chrom_pileup_positions:,}, "
+                        f"SNV: {snv_n:,}, INDEL: {indel_n:,}, "
+                        f"elapsed: {elapsed / 60:.2f} min"
+                    )
+
+                    last_logged_pos = pos1
 
                 ref_base = fasta.fetch(chrom, pos0, pos0 + 1).upper()
                 if ref_base not in {"A", "C", "G", "T"}:
@@ -61,6 +103,7 @@ def detect_candidates(
                     if aln.mapping_quality < min_mq:
                         continue
 
+                    # SNV counting
                     if not pr.is_del and not pr.is_refskip and pr.query_position is not None:
                         qpos = pr.query_position
 
@@ -74,6 +117,7 @@ def detect_candidates(
                             if base != ref_base:
                                 snv_counts[base] += 1
 
+                    # INDEL counting
                     if pr.indel != 0 and pr.query_position is not None:
                         qpos = pr.query_position
 
@@ -98,6 +142,7 @@ def detect_candidates(
                             key = ("DEL", ref, alt)
                             indel_counts[key] += 1
 
+                # Output SNVs
                 for alt, count in snv_counts.items():
                     af = count / depth if depth > 0 else 0
 
@@ -108,6 +153,7 @@ def detect_candidates(
                         )
                         snv_n += 1
 
+                # Output INDELs
                 for (indel_type, ref, alt), count in indel_counts.items():
                     af = count / depth if depth > 0 else 0
 
@@ -118,10 +164,19 @@ def detect_candidates(
                         )
                         indel_n += 1
 
+            chrom_elapsed = time.time() - chrom_start_time
+
+            log(
+                f"Finished {chrom}: scanned {chrom_pileup_positions:,} pileup sites, "
+                f"elapsed {chrom_elapsed / 60:.2f} min"
+            )
+            log(f"Candidates so far: SNV={snv_n:,}, INDEL={indel_n:,}")
+
     bam.close()
     fasta.close()
 
     total_n = snv_n + indel_n
+    total_elapsed = time.time() - start_time
 
     with open(summary_txt, "w") as s:
         s.write(f"Input BAM: {bam_path}\n")
@@ -131,15 +186,22 @@ def detect_candidates(
         s.write(f"Minimum alt count: {min_count}\n")
         s.write(f"Minimum base quality: {min_bq}\n")
         s.write(f"Minimum mapping quality: {min_mq}\n")
+        s.write(f"Log interval: {log_interval}\n")
         s.write("\n")
+        s.write(f"Pileup positions scanned: {total_pileup_positions}\n")
         s.write(f"SNV candidates: {snv_n}\n")
         s.write(f"INDEL candidates: {indel_n}\n")
         s.write(f"Total candidates: {total_n}\n")
+        s.write(f"Total elapsed minutes: {total_elapsed / 60:.2f}\n")
 
-    print(f"SNV candidates:   {snv_n}")
-    print(f"INDEL candidates: {indel_n}")
-    print(f"Total candidates: {total_n}")
-    print(f"Summary written to: {summary_txt}")
+    log("=" * 80)
+    log("Finished variant candidate detection")
+    log(f"Pileup positions scanned: {total_pileup_positions:,}")
+    log(f"SNV candidates: {snv_n:,}")
+    log(f"INDEL candidates: {indel_n:,}")
+    log(f"Total candidates: {total_n:,}")
+    log(f"Total elapsed: {total_elapsed / 60:.2f} min")
+    log(f"Summary written to: {summary_txt}")
 
 
 def main():
@@ -185,6 +247,13 @@ def main():
         help="Minimum mapping quality. Default: 20",
     )
 
+    parser.add_argument(
+        "--log-interval",
+        type=int,
+        default=1_000_000,
+        help="Print progress every N reference bases per chromosome. Default: 1,000,000",
+    )
+
     args = parser.parse_args()
 
     summary_txt = args.summary
@@ -200,6 +269,7 @@ def main():
         min_count=args.min_count,
         min_bq=args.min_bq,
         min_mq=args.min_mq,
+        log_interval=args.log_interval,
     )
 
 
