@@ -11,10 +11,67 @@ def log(msg):
     print(f"[{now}] {msg}", flush=True)
 
 
+def write_header(summary_txt, args):
+    with open(summary_txt, "w") as s:
+        s.write("Variant candidate summary by chromosome\n")
+        s.write("=" * 80 + "\n")
+        s.write(f"Input BAM: {args.bam}\n")
+        s.write(f"Input FASTA: {args.fasta}\n")
+        s.write(f"Minimum AF: {args.min_af}\n")
+        s.write(f"Minimum alt count: {args.min_count}\n")
+        s.write(f"Minimum base quality: {args.min_bq}\n")
+        s.write(f"Minimum mapping quality: {args.min_mq}\n")
+        s.write(f"Log interval: {args.log_interval}\n")
+        s.write("=" * 80 + "\n\n")
+        s.write(
+            "chrom\tchrom_length\tpileup_positions_scanned\tSNV_candidates\t"
+            "INDEL_candidates\tTOTAL_candidates\telapsed_minutes\n"
+        )
+
+
+def append_chrom_summary(
+    summary_txt,
+    chrom,
+    chrom_len,
+    pileup_sites,
+    snv_n,
+    indel_n,
+    elapsed_min,
+):
+    total_n = snv_n + indel_n
+
+    with open(summary_txt, "a") as s:
+        s.write(
+            f"{chrom}\t{chrom_len}\t{pileup_sites}\t{snv_n}\t"
+            f"{indel_n}\t{total_n}\t{elapsed_min:.2f}\n"
+        )
+        s.flush()
+
+
+def append_final_summary(
+    summary_txt,
+    total_pileup_sites,
+    total_snv,
+    total_indel,
+    total_elapsed_min,
+):
+    total_n = total_snv + total_indel
+
+    with open(summary_txt, "a") as s:
+        s.write("\n")
+        s.write("=" * 80 + "\n")
+        s.write("Final total summary\n")
+        s.write("=" * 80 + "\n")
+        s.write(f"Total pileup positions scanned: {total_pileup_sites}\n")
+        s.write(f"Total SNV candidates: {total_snv}\n")
+        s.write(f"Total INDEL candidates: {total_indel}\n")
+        s.write(f"Total candidates: {total_n}\n")
+        s.write(f"Total elapsed minutes: {total_elapsed_min:.2f}\n")
+
+
 def detect_candidates(
     bam_path,
     fasta_path,
-    out_tsv,
     summary_txt,
     min_af,
     min_count,
@@ -22,201 +79,191 @@ def detect_candidates(
     min_mq,
     log_interval,
 ):
-    log("Starting variant candidate detection")
+    log("Starting variant candidate counting")
     log(f"Input BAM: {bam_path}")
     log(f"Input FASTA: {fasta_path}")
-    log(f"Output TSV: {out_tsv}")
-    log(f"Output summary: {summary_txt}")
+    log(f"Output summary TXT: {summary_txt}")
     log(f"Threshold: AF > {min_af}, count > {min_count}")
-    log(f"Filters: min base quality = {min_bq}, min mapping quality = {min_mq}")
 
     bam = pysam.AlignmentFile(bam_path, "rb")
     fasta = pysam.FastaFile(fasta_path)
 
-    snv_n = 0
-    indel_n = 0
-    total_pileup_positions = 0
+    total_snv = 0
+    total_indel = 0
+    total_pileup_sites = 0
 
     start_time = time.time()
 
-    with open(out_tsv, "w") as out:
-        out.write("chrom\tpos\tvariant_type\tref\talt\tdepth\talt_count\tAF\n")
+    for chrom in bam.references:
+        chrom_len = bam.get_reference_length(chrom)
+        chrom_start_time = time.time()
 
-        for chrom in bam.references:
-            chrom_len = bam.get_reference_length(chrom)
-            chrom_start_time = time.time()
-            chrom_pileup_positions = 0
+        chrom_snv = 0
+        chrom_indel = 0
+        chrom_pileup_sites = 0
 
-            log("=" * 80)
-            log(f"Processing chromosome: {chrom}")
-            log(f"Chromosome length: {chrom_len:,} bp")
+        log("=" * 80)
+        log(f"Processing chromosome: {chrom}")
+        log(f"Chromosome length: {chrom_len:,} bp")
 
-            last_logged_pos = 0
+        last_logged_pos = 0
 
-            for col in bam.pileup(
-                chrom,
-                0,
-                chrom_len,
-                truncate=True,
-                stepper="samtools",
-                min_base_quality=min_bq,
-                min_mapping_quality=min_mq,
-            ):
-                pos0 = col.reference_pos
-                pos1 = pos0 + 1
+        for col in bam.pileup(
+            chrom,
+            0,
+            chrom_len,
+            truncate=True,
+            stepper="samtools",
+            min_base_quality=min_bq,
+            min_mapping_quality=min_mq,
+        ):
+            pos0 = col.reference_pos
+            pos1 = pos0 + 1
 
-                total_pileup_positions += 1
-                chrom_pileup_positions += 1
+            chrom_pileup_sites += 1
+            total_pileup_sites += 1
 
-                if pos1 - last_logged_pos >= log_interval:
-                    pct = (pos1 / chrom_len) * 100 if chrom_len > 0 else 0
-                    elapsed = time.time() - chrom_start_time
+            if pos1 - last_logged_pos >= log_interval:
+                pct = (pos1 / chrom_len) * 100 if chrom_len > 0 else 0
+                elapsed = time.time() - chrom_start_time
 
-                    log(
-                        f"{chrom}: position {pos1:,}/{chrom_len:,} "
-                        f"({pct:.2f}%), pileup sites scanned: {chrom_pileup_positions:,}, "
-                        f"SNV: {snv_n:,}, INDEL: {indel_n:,}, "
-                        f"elapsed: {elapsed / 60:.2f} min"
-                    )
+                log(
+                    f"{chrom}: position {pos1:,}/{chrom_len:,} "
+                    f"({pct:.2f}%), scanned={chrom_pileup_sites:,}, "
+                    f"SNV={chrom_snv:,}, INDEL={chrom_indel:,}, "
+                    f"elapsed={elapsed / 60:.2f} min"
+                )
 
-                    last_logged_pos = pos1
+                last_logged_pos = pos1
 
-                ref_base = fasta.fetch(chrom, pos0, pos0 + 1).upper()
-                if ref_base not in {"A", "C", "G", "T"}:
+            ref_base = fasta.fetch(chrom, pos0, pos0 + 1).upper()
+            if ref_base not in {"A", "C", "G", "T"}:
+                continue
+
+            depth = 0
+            snv_counts = Counter()
+            indel_counts = Counter()
+
+            for pr in col.pileups:
+                aln = pr.alignment
+
+                if (
+                    aln.is_unmapped
+                    or aln.is_duplicate
+                    or aln.is_secondary
+                    or aln.is_supplementary
+                ):
                     continue
 
-                depth = 0
-                snv_counts = Counter()
-                indel_counts = Counter()
+                if aln.mapping_quality < min_mq:
+                    continue
 
-                for pr in col.pileups:
-                    aln = pr.alignment
+                if not pr.is_del and not pr.is_refskip and pr.query_position is not None:
+                    qpos = pr.query_position
 
-                    if (
-                        aln.is_unmapped
-                        or aln.is_duplicate
-                        or aln.is_secondary
-                        or aln.is_supplementary
-                    ):
+                    if aln.query_qualities and aln.query_qualities[qpos] < min_bq:
                         continue
 
-                    if aln.mapping_quality < min_mq:
-                        continue
+                    base = aln.query_sequence[qpos].upper()
 
-                    # SNV counting
-                    if not pr.is_del and not pr.is_refskip and pr.query_position is not None:
-                        qpos = pr.query_position
+                    if base in {"A", "C", "G", "T"}:
+                        depth += 1
+                        if base != ref_base:
+                            snv_counts[base] += 1
 
-                        if aln.query_qualities and aln.query_qualities[qpos] < min_bq:
-                            continue
+                if pr.indel != 0 and pr.query_position is not None:
+                    qpos = pr.query_position
 
-                        base = aln.query_sequence[qpos].upper()
+                    if pr.indel > 0:
+                        ins_seq = aln.query_sequence[
+                            qpos + 1 : qpos + 1 + pr.indel
+                        ].upper()
 
-                        if base in {"A", "C", "G", "T"}:
-                            depth += 1
-                            if base != ref_base:
-                                snv_counts[base] += 1
+                        ref = ref_base
+                        alt = ref_base + ins_seq
+                        indel_counts[("INS", ref, alt)] += 1
 
-                    # INDEL counting
-                    if pr.indel != 0 and pr.query_position is not None:
-                        qpos = pr.query_position
+                    elif pr.indel < 0:
+                        del_len = abs(pr.indel)
+                        deleted_seq = fasta.fetch(
+                            chrom,
+                            pos0 + 1,
+                            pos0 + 1 + del_len,
+                        ).upper()
 
-                        if pr.indel > 0:
-                            ins_seq = aln.query_sequence[
-                                qpos + 1 : qpos + 1 + pr.indel
-                            ].upper()
+                        ref = ref_base + deleted_seq
+                        alt = ref_base
+                        indel_counts[("DEL", ref, alt)] += 1
 
-                            ref = ref_base
-                            alt = ref_base + ins_seq
-                            key = ("INS", ref, alt)
-                            indel_counts[key] += 1
+            for alt, count in snv_counts.items():
+                af = count / depth if depth > 0 else 0
 
-                        elif pr.indel < 0:
-                            del_len = abs(pr.indel)
-                            deleted_seq = fasta.fetch(
-                                chrom, pos0 + 1, pos0 + 1 + del_len
-                            ).upper()
+                if af > min_af and count > min_count:
+                    chrom_snv += 1
 
-                            ref = ref_base + deleted_seq
-                            alt = ref_base
-                            key = ("DEL", ref, alt)
-                            indel_counts[key] += 1
+            for key, count in indel_counts.items():
+                af = count / depth if depth > 0 else 0
 
-                # Output SNVs
-                for alt, count in snv_counts.items():
-                    af = count / depth if depth > 0 else 0
+                if af > min_af and count > min_count:
+                    chrom_indel += 1
 
-                    if af > min_af and count > min_count:
-                        out.write(
-                            f"{chrom}\t{pos1}\tSNV\t{ref_base}\t{alt}\t"
-                            f"{depth}\t{count}\t{af:.6f}\n"
-                        )
-                        snv_n += 1
+        chrom_elapsed_min = (time.time() - chrom_start_time) / 60
 
-                # Output INDELs
-                for (indel_type, ref, alt), count in indel_counts.items():
-                    af = count / depth if depth > 0 else 0
+        total_snv += chrom_snv
+        total_indel += chrom_indel
 
-                    if af > min_af and count > min_count:
-                        out.write(
-                            f"{chrom}\t{pos1}\t{indel_type}\t{ref}\t{alt}\t"
-                            f"{depth}\t{count}\t{af:.6f}\n"
-                        )
-                        indel_n += 1
+        append_chrom_summary(
+            summary_txt=summary_txt,
+            chrom=chrom,
+            chrom_len=chrom_len,
+            pileup_sites=chrom_pileup_sites,
+            snv_n=chrom_snv,
+            indel_n=chrom_indel,
+            elapsed_min=chrom_elapsed_min,
+        )
 
-            chrom_elapsed = time.time() - chrom_start_time
-
-            log(
-                f"Finished {chrom}: scanned {chrom_pileup_positions:,} pileup sites, "
-                f"elapsed {chrom_elapsed / 60:.2f} min"
-            )
-            log(f"Candidates so far: SNV={snv_n:,}, INDEL={indel_n:,}")
+        log(
+            f"Finished {chrom}: scanned={chrom_pileup_sites:,}, "
+            f"SNV={chrom_snv:,}, INDEL={chrom_indel:,}, "
+            f"elapsed={chrom_elapsed_min:.2f} min"
+        )
+        log(f"Updated summary TXT: {summary_txt}")
 
     bam.close()
     fasta.close()
 
-    total_n = snv_n + indel_n
-    total_elapsed = time.time() - start_time
+    total_elapsed_min = (time.time() - start_time) / 60
 
-    with open(summary_txt, "w") as s:
-        s.write(f"Input BAM: {bam_path}\n")
-        s.write(f"Input FASTA: {fasta_path}\n")
-        s.write(f"Output TSV: {out_tsv}\n")
-        s.write(f"Minimum AF: {min_af}\n")
-        s.write(f"Minimum alt count: {min_count}\n")
-        s.write(f"Minimum base quality: {min_bq}\n")
-        s.write(f"Minimum mapping quality: {min_mq}\n")
-        s.write(f"Log interval: {log_interval}\n")
-        s.write("\n")
-        s.write(f"Pileup positions scanned: {total_pileup_positions}\n")
-        s.write(f"SNV candidates: {snv_n}\n")
-        s.write(f"INDEL candidates: {indel_n}\n")
-        s.write(f"Total candidates: {total_n}\n")
-        s.write(f"Total elapsed minutes: {total_elapsed / 60:.2f}\n")
+    append_final_summary(
+        summary_txt=summary_txt,
+        total_pileup_sites=total_pileup_sites,
+        total_snv=total_snv,
+        total_indel=total_indel,
+        total_elapsed_min=total_elapsed_min,
+    )
 
     log("=" * 80)
-    log("Finished variant candidate detection")
-    log(f"Pileup positions scanned: {total_pileup_positions:,}")
-    log(f"SNV candidates: {snv_n:,}")
-    log(f"INDEL candidates: {indel_n:,}")
-    log(f"Total candidates: {total_n:,}")
-    log(f"Total elapsed: {total_elapsed / 60:.2f} min")
-    log(f"Summary written to: {summary_txt}")
+    log("Finished all chromosomes")
+    log(f"Total pileup positions scanned: {total_pileup_sites:,}")
+    log(f"Total SNV candidates: {total_snv:,}")
+    log(f"Total INDEL candidates: {total_indel:,}")
+    log(f"Total candidates: {total_snv + total_indel:,}")
+    log(f"Final summary written to: {summary_txt}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Detect SNV and INDEL candidates from BAM using AF and count thresholds."
+        description="Count SNV and INDEL candidates from BAM by chromosome."
     )
 
     parser.add_argument("-b", "--bam", required=True, help="Input BAM file")
     parser.add_argument("-f", "--fasta", required=True, help="Reference FASTA file")
-    parser.add_argument("-o", "--out", required=True, help="Output candidate TSV file")
 
     parser.add_argument(
-        "--summary",
-        default=None,
-        help="Output summary TXT file. Default: <out>.summary.txt",
+        "-o",
+        "--out",
+        required=True,
+        help="Output summary TXT file",
     )
 
     parser.add_argument(
@@ -256,15 +303,12 @@ def main():
 
     args = parser.parse_args()
 
-    summary_txt = args.summary
-    if summary_txt is None:
-        summary_txt = args.out + ".summary.txt"
+    write_header(args.out, args)
 
     detect_candidates(
         bam_path=args.bam,
         fasta_path=args.fasta,
-        out_tsv=args.out,
-        summary_txt=summary_txt,
+        summary_txt=args.out,
         min_af=args.min_af,
         min_count=args.min_count,
         min_bq=args.min_bq,
