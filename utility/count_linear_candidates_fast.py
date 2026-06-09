@@ -8,7 +8,6 @@ from collections import defaultdict
 
 import pysam
 
-
 MD_TOKEN_RE = re.compile(r"(\d+|\^[A-Z]+|[A-Z])")
 
 
@@ -35,12 +34,40 @@ def setup_logger(log_file=None):
 
 
 def parse_region(region):
-    if region is None:
-        return None, None, None
-
+    if ":" not in region:
+        raise ValueError(
+            f"Invalid region: {region}. Use autosomes, all, or chr1:1-248956422"
+        )
     chrom, rest = region.split(":")
     start, end = rest.replace(",", "").split("-")
     return chrom, int(start) - 1, int(end)
+
+
+def get_fetch_regions(bam, region_arg):
+    if region_arg == "autosomes":
+        regions = []
+        for i in range(1, 23):
+            c1 = f"chr{i}"
+            c2 = str(i)
+
+            if c1 in bam.references:
+                chrom = c1
+            elif c2 in bam.references:
+                chrom = c2
+            else:
+                continue
+
+            regions.append((chrom, 0, bam.get_reference_length(chrom)))
+
+        if not regions:
+            raise RuntimeError("No autosomes chr1-chr22 or 1-22 found in BAM header")
+
+        return regions
+
+    if region_arg == "all":
+        return [(c, 0, bam.get_reference_length(c)) for c in bam.references]
+
+    return [parse_region(region_arg)]
 
 
 def passes_read_filters(read, min_mapq):
@@ -56,11 +83,6 @@ def passes_read_filters(read, min_mapq):
 
 
 def parse_md_mismatches_and_deletions(read, ref_name, min_baseq):
-    """
-    Use MD tag to identify mismatches and deletions inside M/=/X CIGAR blocks.
-    Returns:
-        list of (chrom, pos0, ref, alt, type)
-    """
     events = []
 
     if not read.has_tag("MD"):
@@ -73,27 +95,27 @@ def parse_md_mismatches_and_deletions(read, ref_name, min_baseq):
     query_pos = 0
 
     cigartuples = read.cigartuples or []
-    cigar_index = 0
-    cigar_remaining = cigartuples[0][1] if cigartuples else 0
-    cigar_op = cigartuples[0][0] if cigartuples else None
+    if not cigartuples:
+        return events
 
-    def advance_cigar_to_ref_base():
-        nonlocal cigar_index, cigar_remaining, cigar_op, query_pos, ref_pos
+    cigar_index = 0
+    cigar_op = cigartuples[0][0]
+    cigar_remaining = cigartuples[0][1]
+
+    def advance_to_match_block():
+        nonlocal cigar_index, cigar_op, cigar_remaining, query_pos, ref_pos
 
         while cigar_index < len(cigartuples):
-            # 0 M, 7 =, 8 X consume both query and ref
             if cigar_op in (0, 7, 8) and cigar_remaining > 0:
                 return True
 
-            # 1 I, 4 soft clip consume query only
             if cigar_op in (1, 4):
                 query_pos += cigar_remaining
-
-            # 2 D, 3 N consume ref only
             elif cigar_op in (2, 3):
                 ref_pos += cigar_remaining
 
             cigar_index += 1
+
             if cigar_index >= len(cigartuples):
                 return False
 
@@ -105,9 +127,11 @@ def parse_md_mismatches_and_deletions(read, ref_name, min_baseq):
     for tok in tokens:
         if tok.isdigit():
             n = int(tok)
+
             while n > 0:
-                if not advance_cigar_to_ref_base():
+                if not advance_to_match_block():
                     return events
+
                 step = min(n, cigar_remaining)
                 ref_pos += step
                 query_pos += step
@@ -116,16 +140,18 @@ def parse_md_mismatches_and_deletions(read, ref_name, min_baseq):
 
         elif tok.startswith("^"):
             deleted = tok[1:]
-            del_start = ref_pos
+            events.append((ref_name, ref_pos, deleted, "-", "DEL"))
             ref_pos += len(deleted)
-            events.append((ref_name, del_start, deleted, "-", "DEL"))
 
         else:
-            if not advance_cigar_to_ref_base():
+            if not advance_to_match_block():
                 return events
 
             ref_base = tok
+
             if query_pos >= read.query_length:
+                ref_pos += 1
+                cigar_remaining -= 1
                 continue
 
             if read.query_qualities is not None:
@@ -157,36 +183,31 @@ def parse_insertions_from_cigar(read, ref_name, min_baseq):
     query_pos = 0
 
     for op, length in read.cigartuples:
-        # M, =, X
         if op in (0, 7, 8):
             ref_pos += length
             query_pos += length
 
-        # insertion
         elif op == 1:
             ins_seq = read.query_sequence[query_pos: query_pos + length].upper()
-            quals_ok = True
+            ok = True
 
             if read.query_qualities is not None:
                 qs = read.query_qualities[query_pos: query_pos + length]
                 if len(qs) == 0 or min(qs) < min_baseq:
-                    quals_ok = False
+                    ok = False
 
-            if quals_ok and ins_seq:
+            if ok and ins_seq:
                 anchor_pos = max(ref_pos - 1, read.reference_start)
                 events.append((ref_name, anchor_pos, "-", ins_seq, "INS"))
 
             query_pos += length
 
-        # deletion / skipped region consumes reference
         elif op in (2, 3):
             ref_pos += length
 
-        # soft clip consumes query
         elif op == 4:
             query_pos += length
 
-        # hard clip / pad consumes neither
         elif op in (5, 6):
             pass
 
@@ -195,60 +216,83 @@ def parse_insertions_from_cigar(read, ref_name, min_baseq):
 
 def collect_alt_events(args, logger):
     bam = pysam.AlignmentFile(args.bam, "rb")
-    region = parse_region(args.region)
+    fetch_regions = get_fetch_regions(bam, args.region)
+
+    logger.info(f"Fetch regions: {len(fetch_regions)}")
+    for chrom, start, end in fetch_regions:
+        logger.info(f"  {chrom}:{start + 1}-{end}")
 
     alt_counts = defaultdict(int)
     candidate_positions = set()
 
     total_reads = 0
     used_reads = 0
-    skipped_perfect = 0
+    skipped_nm0 = 0
+    reads_without_md = 0
 
     t0 = time.time()
 
-    fetch_iter = bam.fetch(*region) if region else bam.fetch()
+    for chrom, start, end in fetch_regions:
+        logger.info(f"Scanning region: {chrom}:{start + 1}-{end}")
 
-    for read in fetch_iter:
-        total_reads += 1
+        for read in bam.fetch(chrom, start, end):
+            total_reads += 1
 
-        if not passes_read_filters(read, args.min_mapq):
-            continue
+            if not passes_read_filters(read, args.min_mapq):
+                continue
 
-        if args.skip_nm0 and read.has_tag("NM") and read.get_tag("NM") == 0:
-            skipped_perfect += 1
-            continue
+            if args.skip_nm0 and read.has_tag("NM") and read.get_tag("NM") == 0:
+                skipped_nm0 += 1
+                continue
 
-        used_reads += 1
+            used_reads += 1
+            read_chrom = bam.get_reference_name(read.reference_id)
 
-        chrom = bam.get_reference_name(read.reference_id)
+            events = []
 
-        events = []
-        events.extend(parse_md_mismatches_and_deletions(read, chrom, args.min_baseq))
-        events.extend(parse_insertions_from_cigar(read, chrom, args.min_baseq))
+            if read.has_tag("MD"):
+                events.extend(
+                    parse_md_mismatches_and_deletions(
+                        read, read_chrom, args.min_baseq
+                    )
+                )
+            else:
+                reads_without_md += 1
 
-        for chrom, pos0, ref, alt, typ in events:
-            key = (chrom, pos0, ref, alt, typ)
-            alt_counts[key] += 1
-            candidate_positions.add((chrom, pos0))
+            events.extend(parse_insertions_from_cigar(read, read_chrom, args.min_baseq))
 
-        if total_reads % args.log_every_reads == 0:
-            elapsed = time.time() - t0
-            rate = total_reads / elapsed if elapsed > 0 else 0
-            logger.info(
-                f"Event scan progress: reads={total_reads:,}, "
-                f"used_reads={used_reads:,}, skipped_NM0={skipped_perfect:,}, "
-                f"raw_alt_alleles={len(alt_counts):,}, "
-                f"candidate_positions={len(candidate_positions):,}, "
-                f"rate={rate:,.1f} reads/sec, elapsed={elapsed/60:.2f} min"
-            )
+            for event_chrom, pos0, ref, alt, typ in events:
+                alt_counts[(event_chrom, pos0, ref, alt, typ)] += 1
+                candidate_positions.add((event_chrom, pos0))
+
+            if total_reads % args.log_every_reads == 0:
+                elapsed = time.time() - t0
+                rate = total_reads / elapsed if elapsed > 0 else 0
+
+                logger.info(
+                    f"Event scan progress: reads={total_reads:,}, "
+                    f"used_reads={used_reads:,}, skipped_NM0={skipped_nm0:,}, "
+                    f"reads_without_MD={reads_without_md:,}, "
+                    f"raw_alt_alleles={len(alt_counts):,}, "
+                    f"candidate_positions={len(candidate_positions):,}, "
+                    f"rate={rate:,.1f} reads/sec, elapsed={elapsed/60:.2f} min"
+                )
 
     bam.close()
 
     logger.info(
-        f"Event scan finished: reads={total_reads:,}, used_reads={used_reads:,}, "
-        f"skipped_NM0={skipped_perfect:,}, raw_alt_alleles={len(alt_counts):,}, "
+        f"Event scan finished: reads={total_reads:,}, "
+        f"used_reads={used_reads:,}, skipped_NM0={skipped_nm0:,}, "
+        f"reads_without_MD={reads_without_md:,}, "
+        f"raw_alt_alleles={len(alt_counts):,}, "
         f"candidate_positions={len(candidate_positions):,}"
     )
+
+    if reads_without_md > 0:
+        logger.warning(
+            "Some reads do not have MD tags. SNV/DEL detection may be incomplete. "
+            "Run: samtools calmd -b input.bam ref.fa > input.MD.bam"
+        )
 
     return alt_counts, candidate_positions
 
@@ -256,18 +300,18 @@ def collect_alt_events(args, logger):
 def count_depths_at_positions(args, candidate_positions, logger):
     bam = pysam.AlignmentFile(args.bam, "rb")
 
-    depth_counts = {}
     positions_by_chrom = defaultdict(list)
-
     for chrom, pos0 in candidate_positions:
         positions_by_chrom[chrom].append(pos0)
 
-    t0 = time.time()
+    depth_counts = {}
     done = 0
     total = len(candidate_positions)
+    t0 = time.time()
 
-    for chrom, positions in positions_by_chrom.items():
-        positions = sorted(set(positions))
+    for chrom in sorted(positions_by_chrom.keys()):
+        positions = sorted(set(positions_by_chrom[chrom]))
+        logger.info(f"Depth calculation for {chrom}: {len(positions):,} positions")
 
         for pos0 in positions:
             depth = 0
@@ -291,7 +335,6 @@ def count_depths_at_positions(args, candidate_positions, logger):
 
                     if not passes_read_filters(read, args.min_mapq):
                         continue
-
                     if pr.is_refskip:
                         continue
 
@@ -316,31 +359,28 @@ def count_depths_at_positions(args, candidate_positions, logger):
                 elapsed = time.time() - t0
                 rate = done / elapsed if elapsed > 0 else 0
                 eta = (total - done) / rate if rate > 0 else 0
+
                 logger.info(
                     f"Depth progress: positions={done:,}/{total:,}, "
-                    f"rate={rate:,.1f} pos/sec, ETA={eta/60:.2f} min, "
-                    f"elapsed={elapsed/60:.2f} min"
+                    f"rate={rate:,.1f} pos/sec, "
+                    f"ETA={eta/60:.2f} min, elapsed={elapsed/60:.2f} min"
                 )
 
     bam.close()
-
-    logger.info(f"Depth calculation finished for {len(depth_counts):,} positions")
+    logger.info(f"Depth calculation finished: {len(depth_counts):,} positions")
     return depth_counts
 
 
 def summarize_candidates(args, alt_counts, depth_counts, logger):
-    candidate_sites_set = set()
-
+    candidate_sites = set()
     candidate_examples = 0
     snv_examples = 0
     indel_examples = 0
-
     raw_snv_alleles = 0
     raw_indel_alleles = 0
 
-    out = None
-    if args.output_tsv:
-        out = open(args.output_tsv, "w")
+    out = open(args.output_tsv, "w") if args.output_tsv else None
+    if out:
         out.write("chrom\tpos\tref\talt\ttype\tdepth\talt_count\tvaf\n")
 
     for (chrom, pos0, ref, alt, typ), alt_count in alt_counts.items():
@@ -361,7 +401,7 @@ def summarize_candidates(args, alt_counts, depth_counts, logger):
             continue
 
         candidate_examples += 1
-        candidate_sites_set.add((chrom, pos0))
+        candidate_sites.add((chrom, pos0))
 
         if typ == "SNV":
             snv_examples += 1
@@ -377,21 +417,20 @@ def summarize_candidates(args, alt_counts, depth_counts, logger):
     if out:
         out.close()
 
-    logger.info(f"raw_snv_alleles:    {raw_snv_alleles:,}")
-    logger.info(f"raw_indel_alleles:  {raw_indel_alleles:,}")
-    logger.info(f"candidate_sites:    {len(candidate_sites_set):,}")
-    logger.info(f"candidate_examples: {candidate_examples:,}")
-    logger.info(f"SNV_examples:       {snv_examples:,}")
-    logger.info(f"INDEL_examples:     {indel_examples:,}")
-
-    return {
-        "candidate_sites": len(candidate_sites_set),
+    summary = {
+        "candidate_sites": len(candidate_sites),
         "candidate_examples": candidate_examples,
         "SNV_examples": snv_examples,
         "INDEL_examples": indel_examples,
         "raw_snv_alleles": raw_snv_alleles,
         "raw_indel_alleles": raw_indel_alleles,
     }
+
+    logger.info("Candidate summary")
+    for k, v in summary.items():
+        logger.info(f"{k}: {v:,}")
+
+    return summary
 
 
 def run(args):
@@ -401,20 +440,18 @@ def run(args):
     logger.info("Starting fast linear tumor-only candidate counting")
     logger.info(f"Reference FASTA: {args.ref}")
     logger.info(f"Tumor BAM/CRAM:  {args.bam}")
-    logger.info(f"Region:          {args.region if args.region else 'all'}")
+    logger.info(f"Region:          {args.region}")
     logger.info(
         f"Parameters: min_mapq={args.min_mapq}, min_baseq={args.min_baseq}, "
         f"min_depth={args.min_depth}, min_alt_reads={args.min_alt_reads}, "
         f"min_af={args.min_af}, skip_nm0={args.skip_nm0}"
     )
 
-    # Keep --ref for matching your previous interface and possible future checks.
-    _ = pysam.FastaFile(args.ref)
+    fasta = pysam.FastaFile(args.ref)
+    fasta.close()
 
     alt_counts, candidate_positions = collect_alt_events(args, logger)
-
     depth_counts = count_depths_at_positions(args, candidate_positions, logger)
-
     summary = summarize_candidates(args, alt_counts, depth_counts, logger)
 
     elapsed = time.time() - t0
@@ -439,7 +476,12 @@ def main():
 
     parser.add_argument("--ref", required=True, help="Reference FASTA")
     parser.add_argument("--bam", required=True, help="Tumor BAM/CRAM")
-    parser.add_argument("--region", default=None, help="Example: chr1:1-248956422")
+
+    parser.add_argument(
+        "--region",
+        default="autosomes",
+        help='Default: autosomes = chr1-chr22. Use "all" for all references, or chr1:1-248956422.',
+    )
 
     parser.add_argument("--min-mapq", type=int, default=5)
     parser.add_argument("--min-baseq", type=int, default=10)
