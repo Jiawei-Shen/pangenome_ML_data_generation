@@ -7,5 +7,7 @@ GRCh38_references/
 vg/
 .idea/
 __pycache__/
+tensor_figures/
+node_pileup_tensors/npy_single_vis/
 ./HG005_variants.json
 ./.gitignore
