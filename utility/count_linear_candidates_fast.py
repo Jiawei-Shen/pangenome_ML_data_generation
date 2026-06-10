@@ -160,6 +160,7 @@ def parse_insertions(read, chrom, min_baseq):
         elif op == 1:
             ins_seq = read.query_sequence[query_pos: query_pos + length].upper()
             ok = True
+
             if read.query_qualities is not None:
                 qs = read.query_qualities[query_pos: query_pos + length]
                 if len(qs) == 0 or min(qs) < min_baseq:
@@ -205,6 +206,7 @@ def collect_alt_events_one_region(args, chrom, start, end, logger):
         read_chrom = bam.get_reference_name(read.reference_id)
 
         events = []
+
         if read.has_tag("MD"):
             events.extend(parse_md_events(read, read_chrom, args.min_baseq))
         else:
@@ -237,67 +239,98 @@ def collect_alt_events_one_region(args, chrom, start, end, logger):
 
 
 def count_depths_one_region(args, candidate_positions, logger, chrom_label):
+    """
+    Fast depth counting:
+    Do NOT call bam.pileup() once per candidate position.
+    Instead, stream one pileup over the min-max region and only record depths
+    for positions in candidate_positions.
+    """
     bam = pysam.AlignmentFile(args.bam, "rb")
-    depth_counts = {}
 
-    positions_by_chrom = defaultdict(list)
+    positions_by_chrom = defaultdict(set)
     for chrom, pos0 in candidate_positions:
-        positions_by_chrom[chrom].append(pos0)
+        positions_by_chrom[chrom].add(pos0)
 
-    total = sum(len(set(v)) for v in positions_by_chrom.values())
-    done = 0
+    depth_counts = {}
+    total_targets = sum(len(v) for v in positions_by_chrom.values())
+    total_done = 0
     t0 = time.time()
 
     for chrom, positions in positions_by_chrom.items():
-        for pos0 in sorted(set(positions)):
+        if not positions:
+            continue
+
+        start = min(positions)
+        end = max(positions) + 1
+
+        logger.info(
+            f"{chrom_label} depth streaming pileup: "
+            f"{chrom}:{start + 1}-{end}, target_positions={len(positions):,}"
+        )
+
+        seen = 0
+
+        for col in bam.pileup(
+            chrom,
+            start,
+            end,
+            truncate=True,
+            stepper="samtools",
+            min_mapping_quality=args.min_mapq,
+            ignore_overlaps=False,
+            ignore_orphans=False,
+            max_depth=args.max_depth,
+        ):
+            pos0 = col.reference_pos
+
+            if pos0 not in positions:
+                continue
+
             depth = 0
 
-            for col in bam.pileup(
-                chrom,
-                pos0,
-                pos0 + 1,
-                truncate=True,
-                stepper="samtools",
-                min_mapping_quality=args.min_mapq,
-                ignore_overlaps=False,
-                ignore_orphans=False,
-                max_depth=args.max_depth,
-            ):
-                if col.reference_pos != pos0:
+            for pr in col.pileups:
+                read = pr.alignment
+
+                if not passes_read_filters(read, args.min_mapq):
+                    continue
+                if pr.is_refskip:
                     continue
 
-                for pr in col.pileups:
-                    read = pr.alignment
-
-                    if not passes_read_filters(read, args.min_mapq):
-                        continue
-                    if pr.is_refskip:
-                        continue
-
-                    if pr.is_del:
-                        depth += 1
-                        continue
-
-                    qpos = pr.query_position
-                    if qpos is None:
-                        continue
-
-                    if read.query_qualities is not None and read.query_qualities[qpos] < args.min_baseq:
-                        continue
-
+                if pr.is_del:
                     depth += 1
+                    continue
+
+                qpos = pr.query_position
+                if qpos is None:
+                    continue
+
+                if read.query_qualities is not None and read.query_qualities[qpos] < args.min_baseq:
+                    continue
+
+                depth += 1
 
             depth_counts[(chrom, pos0)] = depth
-            done += 1
+            seen += 1
+            total_done += 1
 
-            if done % args.log_every_positions == 0:
+            if total_done % args.log_every_positions == 0:
                 elapsed = time.time() - t0
-                rate = done / elapsed if elapsed > 0 else 0
-                eta = (total - done) / rate if rate > 0 else 0
+                rate = total_done / elapsed if elapsed > 0 else 0
+                eta = (total_targets - total_done) / rate if rate > 0 else 0
+
                 logger.info(
-                    f"{chrom_label} depth: {done:,}/{total:,}, "
-                    f"rate={rate:,.1f} pos/sec, ETA={eta/60:.2f} min"
+                    f"{chrom_label} depth: {total_done:,}/{total_targets:,}, "
+                    f"rate={rate:,.1f} target pos/sec, "
+                    f"ETA={eta/60:.2f} min, elapsed={elapsed/60:.2f} min"
                 )
+
+        missing = len(positions) - seen
+        if missing > 0:
+            logger.warning(
+                f"{chrom_label} depth: {missing:,} target positions not seen in pileup; set depth=0"
+            )
+            for pos0 in positions:
+                depth_counts.setdefault((chrom, pos0), 0)
 
     bam.close()
     return depth_counts
@@ -356,6 +389,11 @@ def run(args):
     logger.info(f"Reference FASTA: {args.ref}")
     logger.info(f"Tumor BAM/CRAM:  {args.bam}")
     logger.info(f"Region:          {args.region}")
+    logger.info(
+        f"Parameters: min_mapq={args.min_mapq}, min_baseq={args.min_baseq}, "
+        f"min_depth={args.min_depth}, min_alt_reads={args.min_alt_reads}, "
+        f"min_af={args.min_af}, skip_nm0={args.skip_nm0}"
+    )
 
     pysam.FastaFile(args.ref).close()
 
@@ -375,11 +413,24 @@ def run(args):
             args, chrom, start, end, logger
         )
 
-        depth_counts = count_depths_one_region(
-            args, candidate_positions, logger, chrom
-        )
+        if len(candidate_positions) == 0:
+            logger.info(f"{chrom}: no candidate positions found; skipping depth")
+            summary = {
+                "candidate_sites": 0,
+                "candidate_examples": 0,
+                "SNV_examples": 0,
+                "INDEL_examples": 0,
+                "raw_snv_alleles": 0,
+                "raw_indel_alleles": 0,
+            }
+        else:
+            depth_counts = count_depths_one_region(
+                args, candidate_positions, logger, chrom
+            )
 
-        summary = summarize_one_region(args, alt_counts, depth_counts)
+            summary = summarize_one_region(args, alt_counts, depth_counts)
+            del depth_counts
+
         add_summary(total_summary, summary)
 
         logger.info(
@@ -388,12 +439,13 @@ def run(args):
             f"candidate_examples={summary['candidate_examples']:,}, "
             f"SNV={summary['SNV_examples']:,}, "
             f"INDEL={summary['INDEL_examples']:,}, "
+            f"raw_snv={summary['raw_snv_alleles']:,}, "
+            f"raw_indel={summary['raw_indel_alleles']:,}, "
             f"time={(time.time() - chr_t0)/60:.2f} min"
         )
 
         del alt_counts
         del candidate_positions
-        del depth_counts
         gc.collect()
 
     elapsed = time.time() - t0
