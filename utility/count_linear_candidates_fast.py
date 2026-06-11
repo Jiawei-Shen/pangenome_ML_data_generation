@@ -16,11 +16,8 @@ def setup_logger(log_file=None):
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
 
-    fmt = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
+                            datefmt="%Y-%m-%d %H:%M:%S")
     sh = logging.StreamHandler()
     sh.setFormatter(fmt)
     logger.addHandler(sh)
@@ -43,17 +40,17 @@ def parse_region(region):
 
 def get_fetch_regions(bam, region_arg):
     if region_arg == "autosomes":
-        regions = []
+        out = []
         for i in range(1, 23):
             c1, c2 = f"chr{i}", str(i)
             if c1 in bam.references:
-                chrom = c1
+                c = c1
             elif c2 in bam.references:
-                chrom = c2
+                c = c2
             else:
                 continue
-            regions.append((chrom, 0, bam.get_reference_length(chrom)))
-        return regions
+            out.append((c, 0, bam.get_reference_length(c)))
+        return out
 
     if region_arg == "all":
         return [(c, 0, bam.get_reference_length(c)) for c in bam.references]
@@ -71,7 +68,41 @@ def passes_read_filters(read, min_mapq):
     )
 
 
-def parse_md_events(read, chrom, min_baseq):
+def add_depth_from_cigar(read, chrom, depth_counts, min_baseq):
+    ref_pos = read.reference_start
+    query_pos = 0
+
+    if read.cigartuples is None:
+        return
+
+    for op, length in read.cigartuples:
+        if op in (0, 7, 8):  # M, =, X
+            for i in range(length):
+                qpos = query_pos + i
+                if qpos >= read.query_length:
+                    continue
+                if read.query_qualities is not None and read.query_qualities[qpos] < min_baseq:
+                    continue
+                depth_counts[(chrom, ref_pos + i)] += 1
+            ref_pos += length
+            query_pos += length
+
+        elif op == 1:  # insertion
+            query_pos += length
+
+        elif op == 2:  # deletion
+            for i in range(length):
+                depth_counts[(chrom, ref_pos + i)] += 1
+            ref_pos += length
+
+        elif op == 3:  # N
+            ref_pos += length
+
+        elif op == 4:  # soft clip
+            query_pos += length
+
+
+def parse_md_alt_events(read, chrom, min_baseq):
     events = []
     if not read.has_tag("MD") or not read.cigartuples:
         return events
@@ -86,17 +117,21 @@ def parse_md_events(read, chrom, min_baseq):
 
     def advance_to_match():
         nonlocal ci, op, rem, ref_pos, query_pos
+
         while ci < len(cigartuples):
             if op in (0, 7, 8) and rem > 0:
                 return True
+
             if op in (1, 4):
                 query_pos += rem
             elif op in (2, 3):
                 ref_pos += rem
+
             ci += 1
             if ci >= len(cigartuples):
                 return False
             op, rem = cigartuples[ci]
+
         return False
 
     for tok in tokens:
@@ -105,6 +140,7 @@ def parse_md_events(read, chrom, min_baseq):
             while n > 0:
                 if not advance_to_match():
                     return events
+
                 step = min(n, rem)
                 ref_pos += step
                 query_pos += step
@@ -159,8 +195,8 @@ def parse_insertions(read, chrom, min_baseq):
 
         elif op == 1:
             ins_seq = read.query_sequence[query_pos: query_pos + length].upper()
-            ok = True
 
+            ok = True
             if read.query_qualities is not None:
                 qs = read.query_qualities[query_pos: query_pos + length]
                 if len(qs) == 0 or min(qs) < min_baseq:
@@ -174,22 +210,24 @@ def parse_insertions(read, chrom, min_baseq):
 
         elif op in (2, 3):
             ref_pos += length
+
         elif op == 4:
             query_pos += length
 
     return events
 
 
-def collect_alt_events_one_region(args, chrom, start, end, logger):
+def process_one_region(args, chrom, start, end, logger):
     bam = pysam.AlignmentFile(args.bam, "rb")
 
+    depth_counts = defaultdict(int)
     alt_counts = defaultdict(int)
-    candidate_positions = set()
 
     total_reads = 0
     used_reads = 0
     skipped_nm0 = 0
     no_md = 0
+
     t0 = time.time()
 
     for read in bam.fetch(chrom, start, end):
@@ -198,145 +236,38 @@ def collect_alt_events_one_region(args, chrom, start, end, logger):
         if not passes_read_filters(read, args.min_mapq):
             continue
 
+        used_reads += 1
+        read_chrom = bam.get_reference_name(read.reference_id)
+
+        # depth always includes perfect reads
+        add_depth_from_cigar(read, read_chrom, depth_counts, args.min_baseq)
+
+        # alt evidence can skip NM=0 reads
         if args.skip_nm0 and read.has_tag("NM") and read.get_tag("NM") == 0:
             skipped_nm0 += 1
             continue
 
-        used_reads += 1
-        read_chrom = bam.get_reference_name(read.reference_id)
-
-        events = []
-
         if read.has_tag("MD"):
-            events.extend(parse_md_events(read, read_chrom, args.min_baseq))
+            for event in parse_md_alt_events(read, read_chrom, args.min_baseq):
+                alt_counts[event] += 1
         else:
             no_md += 1
 
-        events.extend(parse_insertions(read, read_chrom, args.min_baseq))
-
-        for e_chrom, pos0, ref, alt, typ in events:
-            alt_counts[(e_chrom, pos0, ref, alt, typ)] += 1
-            candidate_positions.add((e_chrom, pos0))
+        for event in parse_insertions(read, read_chrom, args.min_baseq):
+            alt_counts[event] += 1
 
         if total_reads % args.log_every_reads == 0:
             elapsed = time.time() - t0
+            rate = total_reads / elapsed if elapsed > 0 else 0
             logger.info(
-                f"{chrom} event scan: reads={total_reads:,}, used={used_reads:,}, "
+                f"{chrom} scan: reads={total_reads:,}, used={used_reads:,}, "
                 f"skipped_NM0={skipped_nm0:,}, no_MD={no_md:,}, "
-                f"raw_alt_alleles={len(alt_counts):,}, positions={len(candidate_positions):,}, "
-                f"elapsed={elapsed/60:.2f} min"
+                f"depth_positions={len(depth_counts):,}, raw_alt_alleles={len(alt_counts):,}, "
+                f"rate={rate:,.1f} reads/sec, elapsed={elapsed/60:.2f} min"
             )
 
     bam.close()
 
-    logger.info(
-        f"{chrom} event scan done: reads={total_reads:,}, used={used_reads:,}, "
-        f"skipped_NM0={skipped_nm0:,}, no_MD={no_md:,}, "
-        f"raw_alt_alleles={len(alt_counts):,}, positions={len(candidate_positions):,}"
-    )
-
-    return alt_counts, candidate_positions
-
-
-def count_depths_one_region(args, candidate_positions, logger, chrom_label):
-    """
-    Fast depth counting:
-    Do NOT call bam.pileup() once per candidate position.
-    Instead, stream one pileup over the min-max region and only record depths
-    for positions in candidate_positions.
-    """
-    bam = pysam.AlignmentFile(args.bam, "rb")
-
-    positions_by_chrom = defaultdict(set)
-    for chrom, pos0 in candidate_positions:
-        positions_by_chrom[chrom].add(pos0)
-
-    depth_counts = {}
-    total_targets = sum(len(v) for v in positions_by_chrom.values())
-    total_done = 0
-    t0 = time.time()
-
-    for chrom, positions in positions_by_chrom.items():
-        if not positions:
-            continue
-
-        start = min(positions)
-        end = max(positions) + 1
-
-        logger.info(
-            f"{chrom_label} depth streaming pileup: "
-            f"{chrom}:{start + 1}-{end}, target_positions={len(positions):,}"
-        )
-
-        seen = 0
-
-        for col in bam.pileup(
-            chrom,
-            start,
-            end,
-            truncate=True,
-            stepper="samtools",
-            min_mapping_quality=args.min_mapq,
-            ignore_overlaps=False,
-            ignore_orphans=False,
-            max_depth=args.max_depth,
-        ):
-            pos0 = col.reference_pos
-
-            if pos0 not in positions:
-                continue
-
-            depth = 0
-
-            for pr in col.pileups:
-                read = pr.alignment
-
-                if not passes_read_filters(read, args.min_mapq):
-                    continue
-                if pr.is_refskip:
-                    continue
-
-                if pr.is_del:
-                    depth += 1
-                    continue
-
-                qpos = pr.query_position
-                if qpos is None:
-                    continue
-
-                if read.query_qualities is not None and read.query_qualities[qpos] < args.min_baseq:
-                    continue
-
-                depth += 1
-
-            depth_counts[(chrom, pos0)] = depth
-            seen += 1
-            total_done += 1
-
-            if total_done % args.log_every_positions == 0:
-                elapsed = time.time() - t0
-                rate = total_done / elapsed if elapsed > 0 else 0
-                eta = (total_targets - total_done) / rate if rate > 0 else 0
-
-                logger.info(
-                    f"{chrom_label} depth: {total_done:,}/{total_targets:,}, "
-                    f"rate={rate:,.1f} target pos/sec, "
-                    f"ETA={eta/60:.2f} min, elapsed={elapsed/60:.2f} min"
-                )
-
-        missing = len(positions) - seen
-        if missing > 0:
-            logger.warning(
-                f"{chrom_label} depth: {missing:,} target positions not seen in pileup; set depth=0"
-            )
-            for pos0 in positions:
-                depth_counts.setdefault((chrom, pos0), 0)
-
-    bam.close()
-    return depth_counts
-
-
-def summarize_one_region(args, alt_counts, depth_counts):
     candidate_sites = set()
     candidate_examples = 0
     snv_examples = 0
@@ -344,48 +275,67 @@ def summarize_one_region(args, alt_counts, depth_counts):
     raw_snv_alleles = 0
     raw_indel_alleles = 0
 
-    for (chrom, pos0, ref, alt, typ), alt_count in alt_counts.items():
+    for (e_chrom, pos0, ref, alt, typ), alt_count in alt_counts.items():
         if typ == "SNV":
             raw_snv_alleles += 1
         else:
             raw_indel_alleles += 1
 
-        depth = depth_counts.get((chrom, pos0), 0)
+        depth = depth_counts.get((e_chrom, pos0), 0)
         if depth < args.min_depth:
             continue
 
         vaf = alt_count / depth if depth > 0 else 0.0
-        if alt_count < args.min_alt_reads or vaf < args.min_af:
+
+        if alt_count < args.min_alt_reads:
+            continue
+        if vaf < args.min_af:
             continue
 
         candidate_examples += 1
-        candidate_sites.add((chrom, pos0))
+        candidate_sites.add((e_chrom, pos0))
 
         if typ == "SNV":
             snv_examples += 1
         else:
             indel_examples += 1
 
-    return {
+    elapsed = time.time() - t0
+
+    summary = {
         "candidate_sites": len(candidate_sites),
         "candidate_examples": candidate_examples,
         "SNV_examples": snv_examples,
         "INDEL_examples": indel_examples,
         "raw_snv_alleles": raw_snv_alleles,
         "raw_indel_alleles": raw_indel_alleles,
+        "reads": total_reads,
+        "used_reads": used_reads,
+        "skipped_NM0": skipped_nm0,
+        "no_MD": no_md,
+        "time_min": elapsed / 60,
     }
 
+    logger.info(
+        f"{chrom} summary: candidate_sites={summary['candidate_sites']:,}, "
+        f"candidate_examples={summary['candidate_examples']:,}, "
+        f"SNV={summary['SNV_examples']:,}, INDEL={summary['INDEL_examples']:,}, "
+        f"raw_snv={summary['raw_snv_alleles']:,}, raw_indel={summary['raw_indel_alleles']:,}, "
+        f"time={summary['time_min']:.2f} min"
+    )
 
-def add_summary(total, part):
-    for k, v in part.items():
-        total[k] += v
+    del depth_counts
+    del alt_counts
+    gc.collect()
+
+    return summary
 
 
 def run(args):
     logger = setup_logger(args.log_file)
     t0 = time.time()
 
-    logger.info("Starting memory-optimized linear candidate counting")
+    logger.info("Starting single-pass linear candidate counting")
     logger.info(f"Reference FASTA: {args.ref}")
     logger.info(f"Tumor BAM/CRAM:  {args.bam}")
     logger.info(f"Region:          {args.region}")
@@ -401,52 +351,25 @@ def run(args):
     regions = get_fetch_regions(bam_tmp, args.region)
     bam_tmp.close()
 
-    total_summary = defaultdict(int)
-
-    logger.info(f"Total regions: {len(regions)}")
+    total = defaultdict(int)
 
     for idx, (chrom, start, end) in enumerate(regions, 1):
-        chr_t0 = time.time()
         logger.info(f"Processing region {idx}/{len(regions)}: {chrom}:{start + 1}-{end}")
+        s = process_one_region(args, chrom, start, end, logger)
 
-        alt_counts, candidate_positions = collect_alt_events_one_region(
-            args, chrom, start, end, logger
-        )
-
-        if len(candidate_positions) == 0:
-            logger.info(f"{chrom}: no candidate positions found; skipping depth")
-            summary = {
-                "candidate_sites": 0,
-                "candidate_examples": 0,
-                "SNV_examples": 0,
-                "INDEL_examples": 0,
-                "raw_snv_alleles": 0,
-                "raw_indel_alleles": 0,
-            }
-        else:
-            depth_counts = count_depths_one_region(
-                args, candidate_positions, logger, chrom
-            )
-
-            summary = summarize_one_region(args, alt_counts, depth_counts)
-            del depth_counts
-
-        add_summary(total_summary, summary)
-
-        logger.info(
-            f"Region summary {chrom}: "
-            f"candidate_sites={summary['candidate_sites']:,}, "
-            f"candidate_examples={summary['candidate_examples']:,}, "
-            f"SNV={summary['SNV_examples']:,}, "
-            f"INDEL={summary['INDEL_examples']:,}, "
-            f"raw_snv={summary['raw_snv_alleles']:,}, "
-            f"raw_indel={summary['raw_indel_alleles']:,}, "
-            f"time={(time.time() - chr_t0)/60:.2f} min"
-        )
-
-        del alt_counts
-        del candidate_positions
-        gc.collect()
+        for k in [
+            "candidate_sites",
+            "candidate_examples",
+            "SNV_examples",
+            "INDEL_examples",
+            "raw_snv_alleles",
+            "raw_indel_alleles",
+            "reads",
+            "used_reads",
+            "skipped_NM0",
+            "no_MD",
+        ]:
+            total[k] += s[k]
 
     elapsed = time.time() - t0
 
@@ -458,25 +381,33 @@ def run(args):
         "INDEL_examples",
         "raw_snv_alleles",
         "raw_indel_alleles",
+        "reads",
+        "used_reads",
+        "skipped_NM0",
+        "no_MD",
     ]:
-        logger.info(f"{k}: {total_summary[k]:,}")
+        logger.info(f"{k}: {total[k]:,}")
     logger.info(f"total_time_min: {elapsed/60:.2f}")
 
     print()
-    print("Memory-optimized linear tumor-only candidate summary")
-    print("----------------------------------------------------")
-    print(f"candidate_sites:    {total_summary['candidate_sites']}")
-    print(f"candidate_examples: {total_summary['candidate_examples']}")
-    print(f"SNV_examples:       {total_summary['SNV_examples']}")
-    print(f"INDEL_examples:     {total_summary['INDEL_examples']}")
-    print(f"raw_snv_alleles:    {total_summary['raw_snv_alleles']}")
-    print(f"raw_indel_alleles:  {total_summary['raw_indel_alleles']}")
+    print("Single-pass linear tumor-only candidate summary")
+    print("-----------------------------------------------")
+    print(f"candidate_sites:    {total['candidate_sites']}")
+    print(f"candidate_examples: {total['candidate_examples']}")
+    print(f"SNV_examples:       {total['SNV_examples']}")
+    print(f"INDEL_examples:     {total['INDEL_examples']}")
+    print(f"raw_snv_alleles:    {total['raw_snv_alleles']}")
+    print(f"raw_indel_alleles:  {total['raw_indel_alleles']}")
+    print(f"reads:              {total['reads']}")
+    print(f"used_reads:         {total['used_reads']}")
+    print(f"skipped_NM0:        {total['skipped_NM0']}")
+    print(f"no_MD:              {total['no_MD']}")
     print(f"total_time_min:     {elapsed/60:.2f}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Memory-optimized DeepSomatic-style tumor-only linear candidate counter."
+        description="Single-pass DeepSomatic-style tumor-only linear candidate counter."
     )
 
     parser.add_argument("--ref", required=True)
@@ -492,14 +423,12 @@ def main():
     parser.add_argument("--min-depth", type=int, default=1)
     parser.add_argument("--min-alt-reads", type=int, default=3)
     parser.add_argument("--min-af", type=float, default=0.10)
-    parser.add_argument("--max-depth", type=int, default=1000000)
 
     parser.add_argument("--skip-nm0", action="store_true", default=True)
     parser.add_argument("--no-skip-nm0", dest="skip_nm0", action="store_false")
 
     parser.add_argument("--log-file", default=None)
     parser.add_argument("--log-every-reads", type=int, default=1000000)
-    parser.add_argument("--log-every-positions", type=int, default=100000)
 
     args = parser.parse_args()
     run(args)
